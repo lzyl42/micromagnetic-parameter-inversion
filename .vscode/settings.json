@@ -1,0 +1,12 @@
+{
+  // Interpreter: rely on the Python extension's automatic discovery of the
+  // workspace `.venv` (cross-platform; no hard-coded executable path, which
+  // would differ between Linux `.venv/bin/python` and Windows
+  // `.venv\\Scripts\\python.exe`). If discovery does not pick it up, select
+  // `.venv` manually via "Python: Select Interpreter".
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["tests"],
+  "ruff.enable": true,
+  "ruff.lint.run": "onSave",
+  "ruff.format.enable": true
+}

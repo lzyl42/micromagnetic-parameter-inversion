@@ -1,0 +1,60 @@
+[project]
+name = "micromagnetic-parameter-inversion"
+version = "0.1.0"
+description = "Inverse identification of micromagnetic material parameters (alpha, Ku) from multi-excitation magnetization dynamics using MLP / 1D CNN / Temporal Transformer"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "python-dotenv",
+    "pyyaml",
+    "scikit-learn",
+    "scipy",
+    "tensorboard",
+    "torch",
+    "tqdm",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel",
+    "pre-commit",
+    "pyright",
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+# PyTorch comes from the official CUDA 12.8 wheel index on both supported
+# platforms (x86_64 Linux and Windows). No OS-specific paths are hard-coded;
+# the same uv.lock covers both platforms. On any other platform torch falls
+# back to PyPI (unsupported for this project).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"

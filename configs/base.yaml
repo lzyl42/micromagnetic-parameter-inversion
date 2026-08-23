@@ -1,0 +1,14 @@
+# Base configuration shared across experiments.
+# Only certain, machine-independent settings live here.
+#
+# Research-specific values (alpha/Ku ranges, geometry, excitation
+# definitions, model hyperparameters) are intentionally NOT invented here;
+# they come from the research plan and per-experiment configs.
+
+seed: 42            # global random seed for reproducibility
+device: auto        # "auto" | "cuda" | "cpu"; auto = CUDA when available, else CPU
+
+# Data and output locations are resolved at runtime, never hard-coded:
+#   MICROMAG_DATA_ROOT    overrides the default <project>/data
+#   MICROMAG_OUTPUT_ROOT  overrides the default <project>/artifacts
+# See src/micromagnetic_parameter_inversion/paths.py

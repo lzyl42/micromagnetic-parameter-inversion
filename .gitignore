@@ -1,0 +1,50 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+# Environment files (secrets / machine-specific)
+.env
+.env.*
+!.env.example
+
+# Full datasets never enter Git; only data/README.md and data/samples/ are tracked
+data/raw/
+data/processed/
+!data/README.md
+!data/samples/
+
+# Outputs: artifacts (default output root), checkpoints, TensorBoard runs/cache
+artifacts/
+checkpoints/
+runs/
+tensorboard/
+*.log
+
+# Results policy: final figures/tables are tracked (see results/figures, results/tables)
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.hypothesis/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/*.log
