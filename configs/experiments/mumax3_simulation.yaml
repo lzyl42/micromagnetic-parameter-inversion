@@ -1,141 +1,31 @@
-# =============================================================================
-# MuMax3 单 case 多脉冲实验配置 —— 架构审查骨架（纯注释模板，非可运行配置）
-# =============================================================================
-# 状态声明：
-#   - 本文件当前每一行均为注释。注意：整份注释文件本身仍是"可解析的 YAML"
-#     （解析结果为 null），因此正确表述是：当前结构校验必然失败、不可用于
-#     运行；而不是"不可解析"。未来启用时去掉对应行的注释符号并填入数值。
-#   - 范围（首版）：一份配置 = 一个物理 case（单组材料 / 椭圆几何 / 一对
-#     alpha+Ku 反演目标）× 多个短脉冲激励。这不是多参数 campaign；
-#     多 alpha-Ku 扫描是后续独立层（见 ARCHITECTURE.md）。
-#   - 物理流程（首版，仓库真实流程）：
-#       initialization（初始磁化）-> equilibration（弛豫/最小化）
-#       -> pulse（短矩形脉冲）-> field off（精确关场）
-#       -> free-decay recording（自由衰减记录）
-#   - 本模板不包含任何研究参数数值：alpha、Ku、几何、网格、脉冲的具体取值
-#     一律来自研究计划或显式实验配置（配置先于实验）。
-#
-# 单位政策（硬约束）：
-#   - 传给 MuMax3 的一切数值均为 SI 单位，字段注释显式标注单位。
-#   - 唯一例外：外场幅值以 mT 作为"人类配置单位"书写，字段名固定为
-#     b_ext_amplitude_mT；内部换算为 b_ext_amplitude_T（1 mT = 1e-3 T）。
-#     这是 MuMax3 的 B_ext（单位 T），不是 H_ext（单位 A/m）——命名严格区分。
-#   - 输出 CSV 列名携带单位（固定 schema，见 mumax3_results.py 注释）。
-#
-# 身份与划分（硬约束）：
-#   - parameter_set_id：由规范化后的反演目标 alpha+Ku 生成；绝不包含激励、
-#     执行或输出信息。
-#   - case_id：由完整物理 case（材料、椭圆几何、mesh、初态/平衡策略）规范化
-#     生成；绝不包含激励、执行、输出和 run 顺序。
-#   - 数据集层 split 仅按 parameter_set_id 分组：同一参数组的所有激励必须
-#     同 split；激励定义不写入参数组合。
-#
-# 未来解析方：src/micromagnetic_parameter_inversion/mumax3_config.py
-# =============================================================================
+# MuMax3 模拟配置：一份配置 = 一个 (alpha, Ku) parameter set 的多脉冲实验。
+# 硬约束：所有研究值为 null 占位，运行前必须全部填写为真实数值；
+# load_config 会拒绝任何仍为 null 的必填研究值。本文件不提供任何默认数值。
+# 单位：一律 SI；唯一例外是外场幅值以 mT 书写（b_ext_amplitude_mT，
+# 内部换算为 T）。不设 seed/description/equilibration/execution/output 等字段。
 
+dataset_name: null # 数据集名；输出根 data/raw/<dataset_name>/
 
-# -----------------------------------------------------------------------------
-# 层级一：experiment —— 实验元信息
-# -----------------------------------------------------------------------------
-# experiment:
-#   name: <str>          # 必填；实验名称，用于输出目录 data/raw/<name>/<case_id>/
-#   description: <str>   # 可选；人类可读描述，仅写入 manifest.json
-#   seed: <int>          # 必填；随机种子，保证可复现；应与 configs/base.yaml 对齐
+material: # 单一均匀材料（0 K，无热噪声）
+  ms_a_per_m: null # 饱和磁化强度，A/m
+  aex_j_per_m: null # 交换刚度常数，J/m
+  alpha: null # Gilbert 阻尼系数（反演目标），无量纲
+  ku_j_per_m3: null # 单轴各向异性常数（反演目标），J/m^3
+  anisotropy_axis: null # 易轴单位向量 [x, y, z]，无量纲
 
+geometry: # 椭圆薄纳米磁体的包围盒与网格
+  size_m: null # 包围盒尺寸 [x, y, z]，m
+  cells: null # 网格单元数 [nx, ny, nz]
+  # cell_size[i] = size_m[i] / cells[i] 由代码派生（单一真值），此处不填。
 
-# -----------------------------------------------------------------------------
-# 层级二：case —— 单个物理 case（case_id 的来源；不含任何激励信息）
-# -----------------------------------------------------------------------------
-# case:
-#   material:                          # 材料（MaterialConfig，全部 SI 单位）
-#     Ms: <float>                      # 必填；饱和磁化强度，A/m，须 > 0
-#     Aex: <float>                     # 必填；交换刚度常数，J/m，须 > 0
-#     alpha: <float>                   # 必填；Gilbert 阻尼系数，无量纲，须 > 0（反演目标之一）
-#     Ku: <float>                      # 必填；单轴磁各向异性常数，J/m^3，须 >= 0（反演目标之一）
-#     anisotropy_axis: [<x>, <y>, <z>] # 必填；易轴方向单位向量，无量纲，模长须为 1（容差内）
-#
-#   geometry:                          # 椭圆几何（EllipseGeometryConfig；首版仅支持 ellipse）
-#     shape: ellipse                   # 必填；首版固定枚举值 ellipse，其他值校验失败
-#     semi_major_m: <float>            # 必填；长半轴，m，须 > 0
-#     semi_minor_m: <float>            # 必填；短半轴，m，须 > 0 且 <= semi_major_m
-#     thickness_m: <float>             # 必填；厚度，m，须 > 0
-#
-#   mesh:                              # 网格（MeshConfig；与几何分离，extent 由几何派生）
-#     cells: [<nx>, <ny>, <nz>]        # 必填；网格单元数，正整数三元组
-#     cell_size: [<x>, <y>, <z>]       # 必填；单元尺寸，m，各分量须 > 0
-#     # mesh extent 不在此填写：由椭圆几何 + 厚度派生（physics.py / 渲染层计算），
-#     # size/grid/cell 不再是三个独立真值。
-#     # 分辨率充分性（cell 尺寸 vs 交换长度）由 CaseDerivedPhysics 给出诊断。
-#
-#   initial_state:                     # 初态（InitialStateConfig）
-#     direction: [<x>, <y>, <z>]       # 必填；初始磁化方向单位向量，无量纲，模长须为 1
-#     uniform: true                    # 必填；首版仅支持均匀初态（单畴/宏自旋式起点）
-#     # 具体初始化命令实现前以 MuMax3 官方文档核实，不在此虚构。
-#
-#   equilibration:                     # 平衡（EquilibrationConfig）
-#     strategy: <str>                  # 必填；枚举（弛豫/能量最小化；拟议集合实现前核定）
-#     duration_s: <float> | null       # 条件必填；弛豫时长，s（strategy=relax 时）
-#     convergence: <object> | null     # 条件必填；收敛判据（strategy=minimize 时；
-#                                      # 具体求解器与容差实现前依据官方文档/验证确定，不虚构）
-#     # 硬规则：平衡阶段可使用辅助（较大）阻尼加速收敛，但平衡结束后必须
-#     # 恢复实验真实 alpha 再进入脉冲与记录阶段。
-#     # 平衡态（及其哈希）作为 provenance 保留在 manifest 中。
-#
-#   recording:                         # 自由衰减记录（RecordingConfig）
-#     total_duration_s: <float>        # 必填；关场后记录总时长，s，须 > 0
-#     sample_interval_s: <float>       # 必填；标称采样间隔，s，须 > 0
-#     # 采样时刻由 Python 显式构造（sample_times_s，见 physics.py）：
-#     # 脉冲关闭边界必须精确落在采样网格上（pulse_duration_s 须为
-#     # sample_interval_s 的整数倍，校验失败即拒绝配置）。
-#     # 不依赖 TableAutoSave 的隐式等距性。
+initial_m: null # 均匀初态方向 [x, y, z]，无量纲单位向量
 
+recording: # 关场后自由衰减采样（固定行数）
+  sample_interval_s: null # 采样间隔，s
+  sample_count: null # 采样点数；关场后首点为 sample_index=0、t_s=0
 
-# -----------------------------------------------------------------------------
-# 层级三：excitations —— 短脉冲激励列表（一项 = 一次 run；不属于 case 身份）
-# -----------------------------------------------------------------------------
-# excitations:
-#   - pulse_id: <str>                  # 必填；脉冲唯一标识（实验内不得重复）
-#     b_ext_amplitude_mT: <float>      # 必填；脉冲幅值，人类配置单位 mT，须 > 0；
-#                                      # 内部换算为 b_ext_amplitude_T（MuMax3 B_ext，单位 T）
-#     field_direction: [<x>, <y>, <z>] # 必填；脉冲方向单位向量，无量纲，模长须为 1
-#     pulse_duration_s: <float>        # 必填；脉冲时长，s，须 > 0，且为 sample_interval_s 整数倍
-#     # 语义（首版固定）：t=0 为记录时间起点，脉冲从 t=0 开始施加，
-#     # 在 pulse_duration_s 时刻精确关场（B_ext 置 0），此后自由衰减记录。
-#     # 不存在 frequency_hz / 泛化 waveform 字段——首版只有短矩形脉冲。
-
-
-# -----------------------------------------------------------------------------
-# 层级四：execution —— 执行参数（ExecutionConfig）
-# -----------------------------------------------------------------------------
-# execution:
-#   timeout_s: <float>                 # 必填；单 run 进程超时，s，须 > 0；经 external.py 传入
-#   gpu_index: <int> | null            # 可选；GPU 索引；未来只经 external.py 白名单参数
-#                                      # 传递（当前 external.py 不改，null = 默认）。
-#                                      # 不声称 CPU MuMax3：MuMax3 是 GPU 求解器。
-#   # 无 workdir 字段：工作目录由 pipeline 固定为该 run 的 staging 目录。
-#   # 无 device=auto/cuda/cpu 字段：那是 PyTorch 语义，不适用于 MuMax3。
-
-
-# -----------------------------------------------------------------------------
-# 层级五：output —— 输出布局（OutputConfig）
-# -----------------------------------------------------------------------------
-# output:
-#   cleanup_ovf_snapshots: <bool>      # 可选；是否清理大型 OVF 快照以节省空间；
-#                                      # 这是唯一提供的清理开关。
-#   # 数据根目录政策：原始模拟数据属 data/raw，经 paths.data_root() 解析
-#   # （MICROMAG_DATA_ROOT 或 <project>/data），绝不放 artifacts/。
-#   # 最终目录：data/raw/<experiment_name>/<case_id>/；已存在则拒绝隐式覆盖。
-#   # manifest/index 中一律写相对路径（相对数据根），不写机器绝对路径。
-#   # rendered script、原始 table、stdout/stderr 日志、配置快照、manifest、
-#   # index 始终保留；无笼统 keep_intermediate / copy_rendered_mx3 开关。
-
-
-# -----------------------------------------------------------------------------
-# 边界声明（不属于本配置层）
-# -----------------------------------------------------------------------------
-# - 按参数组合划分数据（train/val/test）、同参数组所有激励同 split、防止
-#   标准化/特征拟合泄漏：属于后续"数据集层"，以 index.csv 的
-#   parameter_set_id 为分组键；不在本配置与单次模拟骨架中实现。
-# - campaign / 多 alpha-Ku 扫描：后续独立层，以多个单 case 配置（或规范化
-#   case spec）为输入；本文件一个文件只描述一个 case。
-# - 本文件不承载任何模型（MLP/1D CNN/Transformer）超参数。
+pulses: # 短矩形脉冲列表（模板示例一项，可按当前实验追加多个 pulse；每项一次独立 run）
+  - pulse_id: null # 脉冲唯一标识
+    b_ext_amplitude_mT: null # 脉冲幅值，mT（内部换算为 T）
+    direction: null # 脉冲方向单位向量 [x, y, z]，无量纲
+    duration_s: null # 脉冲时长，s；关场后 B_ext 恒为 0

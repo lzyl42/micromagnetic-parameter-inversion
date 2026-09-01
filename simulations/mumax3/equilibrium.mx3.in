@@ -1,0 +1,29 @@
+// =============================================================================
+// equilibrium.mx3.in —— 平衡态模板（结构骨架，未经真实 MuMax3 验证，
+// 不可直接运行）。占位符由 mumax3_script.render_equilibrium_script 填入；
+// 每个 parameter set 渲染并执行一次：进程工作目录 = equilibrium/，渲染
+// 脚本固定名 equilibrium.mx3；MuMax3 默认原生输出目录 equilibrium.out/
+// （equilibrium.ovf、log.txt、references.bib）；run.log 由 pipeline 写在
+// equilibrium/ 根。产出供全部 pulse 共享的 equilibrium.ovf。
+// 物理假设见 simulations/mumax3/README.md：0 K、单一均匀材料、椭圆薄纳米
+// 磁体、demag 开启、开放边界无 PBC、无 DMI、无 STT、无静态偏置场。
+// =============================================================================
+
+// 1. 固定模型与网格（包围盒 {{SIZE_M}} m、单元数 {{CELLS}}；
+//    cell_size 由 size_m/cells 派生后填入）
+// TODO: SetGridSize/SetCellSize 与椭圆几何的确切命令及写法，
+//       实现前以 MuMax3 官方文档核实，不在此虚构数值。
+
+// 2. 材料（单一均匀材料；易轴 {{ANIS_AXIS}}）
+// TODO: Msat={{MS}} A/m、Aex={{AEX}} J/m、Ku1={{KU}} J/m^3 与 demag
+//       开启的确切命令待核实后固定。
+
+// 3. 均匀初态（固定初态方向 {{INIT_M}}，此后不再改初态）
+// TODO: 均匀磁化设置命令待核实。
+
+// 4. 无外场平衡（仅一次；无静态偏置场，B_ext 恒 0）
+// TODO: Relax 与 Minimize 二选一，及 gammaLL/MaxErr/MaxDt/EdgeSmooth 等
+//       数值，待真实 MuMax3 单 cell 验证后固定在模板，不进入 YAML。
+
+// 5. 保存共享平衡态（默认原生输出目录 equilibrium.out/ 内）
+// TODO: 保存命令与输出名（equilibrium.out/equilibrium.ovf）待核实。
