@@ -1,8 +1,9 @@
 # MuMax3 模拟配置：一份配置 = 一个 (alpha, Ku) parameter set 的多脉冲实验。
 # 硬约束：所有研究值为 null 占位，运行前必须全部填写为真实数值；
 # load_config 会拒绝任何仍为 null 的必填研究值。本文件不提供任何默认数值。
-# 单位：一律 SI；唯一例外是外场幅值以 mT 书写（b_ext_amplitude_mT，
-# 内部换算为 T）。不设 seed/description/equilibration/execution/output 等字段。
+# 单位：一律 SI；唯一例外是外场幅值以 mT 书写（b_ext_amplitude_mT），
+# load_config 边界内立即乘 1e-3；运行时模型与计算只使用 T。
+# 不设 seed/description/equilibration/execution/output 等字段。
 
 dataset_name: null # 数据集名；输出根 data/raw/<dataset_name>/
 
@@ -26,6 +27,6 @@ recording: # 关场后自由衰减采样（固定行数）
 
 pulses: # 短矩形脉冲列表（模板示例一项，可按当前实验追加多个 pulse；每项一次独立 run）
   - pulse_id: null # 脉冲唯一标识
-    b_ext_amplitude_mT: null # 脉冲幅值，mT（内部换算为 T）
+    b_ext_amplitude_mT: null # 脉冲幅值，mT（load_config 边界内立即乘 1e-3 存为运行时 T）
     direction: null # 脉冲方向单位向量 [x, y, z]，无量纲
     duration_s: null # 脉冲时长，s；关场后 B_ext 恒为 0

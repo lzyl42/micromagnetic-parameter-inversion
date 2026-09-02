@@ -4,11 +4,13 @@
 // 渲染脚本固定名 simulation.mx3；MuMax3 默认原生输出目录 simulation.out/
 // （table.txt、m_t0.ovf、m_tfinal.ovf、log.txt、references.bib）；run.log 与
 // trajectory.csv 由 pipeline 写在 pulse 目录根。
-// 与 equilibrium.mx3.in 渲染自同一 config（同一网格/材料/几何，保证一致）。
+// 与 equilibrium.mx3.in 渲染自同一 config（公共模型段逐字节一致）。
 // =============================================================================
 
-// 1. 固定模型、网格与材料（与 equilibrium.mx3.in 区段 1-2 完全一致，
-//    由同一 config 渲染；TODO: 确切命令待核实后固定）
+// 1. 公共模型段：与 equilibrium.mx3.in 区段 1 完全相同（唯一渲染器
+//    _render_model_setup，保证网格/椭圆几何/材料不漂移；alpha 不属于
+//    公共段）。
+{{MODEL_SETUP}}
 
 // 2. 加载共享平衡态（固定相对路径，相对 runs/<pulse_id>/）
 // TODO: LoadFile("../../equilibrium/equilibrium.out/equilibrium.ovf")
@@ -18,13 +20,15 @@
 // TODO: alpha = {{ALPHA}} 的设置命令待核实。
 
 // 4. 矩形脉冲与精确关场
-// TODO: t=0 起施加 B_ext（{{B_EXT_T}} 与方向 {{DIRECTION}} 逐分量相乘，
-//       单位 T），持续 {{PULSE_DURATION_S}} s 后精确置 0；Run() 步进与
-//       关场写法待核实后固定。
+// TODO: t=0 起施加 B_ext = ({{B_EXT_X_T}}, {{B_EXT_Y_T}}, {{B_EXT_Z_T}})
+//       （渲染器已由幅值与方向算得的三个运行时 SI 分量，单位 T），持续
+//       {{PULSE_DURATION_S}} s 后精确置 0；Run() 步进与关场写法待核实
+//       后固定。
 
-// 5. 关场后状态即训练时间零点（sample_index=0、t_s=0）：
-//    保存 m_t0.ovf（QC）-> 固定间隔（{{SAMPLE_INTERVAL_S}} s）自由衰减，
-//    记录 {{SAMPLE_COUNT}} 个样本 -> 保存 m_tfinal.ovf（QC）；三者均落在
-//    simulation.out/ 内，table.txt 为原生采样表。
-// TODO: TableAutoSave 与显式 Run(dt)+TableSave 二选一，待真实单 cell
-//       对比后只固定一种；不引入 YAML 开关。
+// 5. 采样静态契约（待真实 single-cell MuMax3 pilot 验证，不可视为已正确）：
+//    运行脉冲 -> 关场 -> 立即 TableSave（sample_index=0、t_s=0）并保存
+//    m_t0.ovf（QC）-> 再执行 {{SAMPLE_COUNT}}-1 次
+//    Run({{SAMPLE_INTERVAL_S}})+TableSave -> 末点保存 m_tfinal.ovf（QC）；
+//    table.txt 行按采样顺序对应整数索引。
+// TODO: 关场时刻、首行/原生时间、TableSave 行为、LoadFile 共享 OVF 均
+//       必须经真实单 cell pilot 验证后固定；不引入 YAML 开关。

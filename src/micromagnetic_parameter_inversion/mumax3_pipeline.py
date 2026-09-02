@@ -1,10 +1,13 @@
 """MuMax3 模拟流水线（vertical slice）。
 
 最小调用流（run_parameter_set）：
-1. load_config(config_path)          # 拒绝仍为 null 的必填研究值
+1. load_config(config_path)          # 严格校验并将脉冲 mT 换算为运行时 T
 2. parameter_set_id(alpha, ku)       # 参数组身份
-3. 固定输出目录 data/raw/<dataset_name>/<parameter_set_id>/
-   （已存在 -> FileExistsError，不隐式覆盖）
+3. 固定输出目录 data/raw/<dataset_name>/<parameter_set_id>/（唯一性 =
+   (dataset_name, parameter_set_id)；已存在 -> FileExistsError，不隐式
+   覆盖）。dataset_name 是固定协议（材料/几何/模拟）的命名约定，协议
+   改变必须换新 dataset_name；parameter_set_id 只代表 alpha+Ku（split
+   key）。首版不自动验证同 dataset 跨 parameter_set_id 的协议一致性
 4. 渲染/执行 equilibrium 模板一次，保存共享 equilibrium.ovf
 5. 对每个 pulse：从同一平衡态渲染/执行 simulation 模板
    -> parse_table -> write_trajectory_csv

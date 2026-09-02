@@ -8,11 +8,20 @@ MuMax3 是每台机器自行安装的外部依赖，不入库：加入 `PATH` �
 ## 定位
 
 - 一份 `configs/experiments/*.yaml` = 一个 `(alpha, Ku)` parameter set 的
-  多脉冲实验；`parameter_set_id` 仅由 alpha 与 Ku 生成，是数据集 split 的
-  唯一分组键（同一参数组的所有激励必须同组）。
+  多脉冲实验；同一参数组的所有激励必须同 split 组。
+- 输出身份：`dataset_name` 是固定材料/几何/模拟协议的命名约定——协议改变
+  必须使用新的 dataset_name；`parameter_set_id` 只由 alpha+Ku 生成，是数据
+  集 split 的唯一分组键；目录唯一性 = `(dataset_name, parameter_set_id)`，
+  `FileExistsError` 仅在复用同一已有目录时拒绝覆盖。首版不自动验证同一
+  dataset 下跨不同 parameter_set_id 的协议一致性。
+- 单位边界：mT 只存在于 YAML（`b_ext_amplitude_mT`），load_config 边界内
+  立即乘 1e-3 存为 `PulseConfig.b_ext_amplitude_t`，运行时渲染全用 T。
 - 平衡态每个 parameter set 只算一次，全部 pulse 共享同一 `equilibrium.ovf`。
-- 关场后首个状态定义为训练时间零点：`sample_index=0`、`t_s=0`，其后取
-  整数索引，`t_s = sample_index * sample_interval_s`，固定 `sample_count` 行。
+- 采样静态契约（待真实 single-cell MuMax3 pilot 验证）：运行脉冲 -> 关场
+  -> 立即 TableSave（`sample_index=0`、`t_s=0`）并保存 `m_t0.ovf` -> 再执行
+  `sample_count-1` 次 `Run(sample_interval_s)+TableSave` -> 末点保存
+  `m_tfinal.ovf`；其后取整数索引，`t_s = sample_index * sample_interval_s`，
+  固定 `sample_count` 行。
 
 ## 固定物理假设（不是配置项）
 
@@ -67,9 +76,9 @@ data/raw/<dataset_name>/<parameter_set_id>/
 ## 待真实 MuMax3 单 cell 验证后固定（不进 YAML）
 
 solver 选择（Relax vs Minimize）、MaxErr/MaxDt、gammaLL、EdgeSmooth、
-TableAutoSave vs 显式 Run+TableSave：先在单 cell 最小用例上对比验证，
-之后固定在模板内；YAML 不提供开关。两个 `.mx3.in` 模板当前为结构骨架，
-未经真实 MuMax3 验证，不可直接运行。
+TableSave 行为与时序（关场时刻、首行/原生时间）、LoadFile 共享 OVF：
+先在单 cell 最小用例上 pilot 验证，之后固定在模板内；YAML 不提供开关。
+两个 `.mx3.in` 模板当前为结构骨架，未经真实 MuMax3 验证，不可直接运行。
 
 ## 验证策略
 
