@@ -59,13 +59,15 @@ def _render_model_setup(config: SimulationConfig) -> str:
     """公共模型段 {{MODEL_SETUP}} 的唯一渲染器（防两脚本漂移）。
 
     固定顺序：网格、cell size（size_m/cells 派生，单一真值）、PBC（开放
-    边界）、椭圆几何（z 厚度由网格/单元尺寸体现）、demag、材料参数
-    （Msat/Aex/Ku1/易轴）。alpha 是 per-run 参数，不属于公共段；输出不含
-    路径与占位符。
+    边界）、椭球几何（SetGeom 恒取三轴全直径，均来自 size_m，不对 nz 做
+    条件分支：nz=1 时单层体素离散自然表现为恒厚椭圆截面薄片，nz>1 时逐层
+    解析椭球 z 表面）、demag、材料参数（Msat/Aex/Ku1/易轴）。alpha 是
+    per-run 参数，不属于公共段；输出不含路径与占位符。
     """
     material = config.material
     geometry = config.geometry
-    size_x, size_y, _ = geometry.size_m
+    size_x, size_y, size_z = geometry.size_m
+    geom_line = f"SetGeom(Ellipsoid({_fmt_vector3((size_x, size_y, size_z))}))"
     return "\n".join(
         (
             "// 网格与单元尺寸：cell_size = size_m / cells（唯一派生真值），单位 m",
@@ -73,8 +75,8 @@ def _render_model_setup(config: SimulationConfig) -> str:
             f"SetCellSize({_fmt_vector3(derive_cell_size_m(geometry))})",
             "// 开放边界：不启用周期性镜像",
             "SetPBC(0, 0, 0)",
-            "// 椭圆薄纳米磁体：SetGeom 只取面内尺寸，z 厚度由网格/单元尺寸体现",
-            f"SetGeom(Ellipse({_fmt_number(size_x)}, {_fmt_number(size_y)}))",
+            "// 扁椭球薄纳米磁体：三轴全直径 dx, dy, dz 均来自 size_m（= 包围盒尺寸）",
+            geom_line,
             "// 退磁场开启",
             "EnableDemag = true",
             "// 单一均匀材料（SI 单位：Msat A/m；Aex J/m；Ku1 J/m^3）与易轴单位向量",

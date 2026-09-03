@@ -14,10 +14,11 @@ material: # 单一均匀材料（0 K，无热噪声）
   ku_j_per_m3: null # 单轴各向异性常数（反演目标），J/m^3
   anisotropy_axis: null # 易轴单位向量 [x, y, z]，无量纲
 
-geometry: # 椭圆薄纳米磁体的包围盒与网格
-  size_m: null # 包围盒尺寸 [x, y, z]，m
-  cells: null # 网格单元数 [nx, ny, nz]
+geometry: # 扁椭球薄纳米磁体（三轴椭球）的尺寸与网格
+  size_m: null # 椭球三轴全直径 [dx, dy, dz]，m（= 包围盒尺寸）
+  cells: null # 网格单元数 [nx, ny, nz]，任意正整数；nz=1 单层体素近似，nz>1 解析 z 曲面
   # cell_size[i] = size_m[i] / cells[i] 由代码派生（单一真值），此处不填。
+  # 正式研究须通过网格收敛测试确定 cells。
 
 initial_m: null # 均匀初态方向 [x, y, z]，无量纲单位向量
 

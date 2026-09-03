@@ -23,6 +23,10 @@ MuMax3 是每台机器自行安装的外部依赖，不入库：加入 `PATH` �
   `dataset_name`/`pulse_id` 须为安全单路径段。
 - 单位边界：mT 只存在于 YAML（`b_ext_amplitude_mT`），load_config 边界内
   立即乘 1e-3 存为 `PulseConfig.b_ext_amplitude_t`，运行时渲染全用 T。
+- 几何语义：`size_m=[dx,dy,dz]` 是椭球三轴全直径（= 包围盒尺寸），
+  `cells=[nx,ny,nz]` 各分量为任意正整数：`nz=1` 时单层体素离散自然表现
+  为恒厚椭圆截面薄片，`nz>1` 时才逐层解析 z 方向椭球表面；正式研究须
+  通过网格收敛测试确定 cells。
 - 平衡态每个 parameter set 只算一次，全部 pulse 共享同一 `equilibrium.ovf`。
 - 采样静态契约（已经短 test-only pilot 基础执行验证；正式数值协议仍待研究
   配置与收敛/QC 验证）：运行脉冲 -> 关场
@@ -33,10 +37,11 @@ MuMax3 是每台机器自行安装的外部依赖，不入库：加入 `PATH` �
 
 ## 固定物理假设（不是配置项）
 
-0 K 无热噪声；单一均匀材料；椭圆薄纳米磁体；能量项只有交换 + 单轴各向
-异性 + 退磁 + Zeeman（demag 开启）；开放边界、无 PBC；无 DMI；无 STT/
-电流；无缺陷/晶粒/空间涨落；无静态偏置场；关场后 `B_ext=0`；固定初态与
-平衡算法。
+0 K 无热噪声；单一均匀材料；扁椭球薄纳米磁体（公共模型段恒渲染完整三轴
+`SetGeom(Ellipsoid(dx, dy, dz))`，不对 nz 做条件分支）；能量项只有交换 +
+单轴各向异性 + 退磁 + Zeeman（demag 开启）；开放边界、无 PBC；无 DMI；无
+STT/电流；无缺陷/晶粒/空间涨落；无静态偏置场；关场后 `B_ext=0`；固定初
+态与平衡算法。
 
 ## 输出布局（固定，不进 YAML）
 

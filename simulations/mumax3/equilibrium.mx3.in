@@ -8,11 +8,11 @@
 // 命令写法依据 MuMax3 3.12 官方 API 文档；执行链已经短 test-only pilot
 // （8×4×1、1 pulse、3 samples）基础验证，但正式数值协议（solver/弛豫收敛
 // 行为）仍待研究配置与收敛/QC 验证，验证完成前不得用于正式科研数据。
-// 物理假设见 simulations/mumax3/README.md：0 K、单一均匀材料、椭圆薄纳米
-// 磁体、demag 开启、开放边界无 PBC、无 DMI、无 STT、无静态偏置场。
+// 物理假设见 simulations/mumax3/README.md：0 K、单一均匀材料、扁椭球薄纳
+// 米磁体、demag 开启、开放边界无 PBC、无 DMI、无 STT、无静态偏置场。
 // =============================================================================
 
-// 1. 公共模型段：网格/椭圆几何/Msat/Aex/Ku1/易轴/demag/开放边界的唯一
+// 1. 公共模型段：网格/椭球几何/Msat/Aex/Ku1/易轴/demag/开放边界的唯一
 //    渲染文本（_render_model_setup），与 simulation.mx3.in 的公共段逐字节
 //    相同；cell_size 由 size_m/cells 派生后填入；alpha 不属于公共段。
 {{MODEL_SETUP}}

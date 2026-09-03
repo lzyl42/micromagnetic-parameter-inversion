@@ -110,6 +110,16 @@ def _sampling_from_script(script_text: str) -> tuple[int, float, float]:
     return int(loop.group(1)), float(run_args[1]), float(run_args[0])
 
 
+def _geom_diameters(script_text: str) -> list[float]:
+    """提取渲染脚本中唯一的 SetGeom(Ellipsoid(dx, dy, dz)) 三轴全直径。"""
+    geom_lines = [line for line in script_text.splitlines() if line.startswith("SetGeom(")]
+    assert len(geom_lines) == 1, geom_lines
+    assert geom_lines[0].startswith("SetGeom(Ellipsoid("), geom_lines[0]
+    body = geom_lines[0][len("SetGeom(Ellipsoid(") :]
+    assert body.endswith("))"), geom_lines[0]
+    return [float(part) for part in body[:-2].split(",")]
+
+
 @dataclass
 class _FakeMumax:
     data_dir: Path
@@ -213,7 +223,7 @@ def test_parameter_set_id_format_and_dependence(tmp_path: Path) -> None:
     other = _test_config_dict()
     other["dataset_name"] = "other-dataset"
     other["material"]["ms_a_per_m"] = 7.0e5
-    other["geometry"]["cells"] = [16, 8, 1]
+    other["geometry"]["cells"] = [16, 8, 3]
     other["recording"]["sample_count"] = 3
     other["pulses"] = [{**other["pulses"][0], "pulse_id": "solo"}]
     variant = load_config(_write_config_yaml(tmp_path / "other", other))
@@ -230,6 +240,8 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
     assert "{{" not in equilibrium
     assert equilibrium.count("Relax()") == 1
     assert "B_ext = vector(0, 0, 0)" in equilibrium
+    assert _geom_diameters(equilibrium) == [160.0e-9, 80.0e-9, 3.0e-9]
+    assert "SetGeom(Ellipse(" not in equilibrium
 
     for pulse in config.pulses:
         rendered = render_simulation_script(config, pulse, simulation_template)
@@ -237,6 +249,8 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
         assert rendered.count(_LOADFILE_LINE) == 1
         assert rendered.count("TableSave()") == 2
         assert "Relax" not in rendered
+        assert _geom_diameters(rendered) == [160.0e-9, 80.0e-9, 3.0e-9]
+        assert "SetGeom(Ellipse(" not in rendered
         count, interval_s, duration_s = _sampling_from_script(rendered)
         assert (count, interval_s, duration_s) == (
             config.recording.sample_count,
@@ -253,6 +267,13 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
             [pulse.b_ext_amplitude_t * axis for axis in pulse.direction],
             [0.0, 0.0, 0.0],
         ]
+
+    # nz>1 variant: the renderer does not assume a single layer, Ellipsoid remains triaxial.
+    multi = _test_config_dict()
+    multi["geometry"]["cells"] = [32, 16, 3]
+    nz3 = load_config(_write_config_yaml(tmp_path / "nz3", multi))
+    nz3_script = render_simulation_script(nz3, nz3.pulses[0], simulation_template)
+    assert _geom_diameters(nz3_script) == [160.0e-9, 80.0e-9, 3.0e-9]
 
 
 def test_parse_table_valid_and_csv_export(tmp_path: Path) -> None:
