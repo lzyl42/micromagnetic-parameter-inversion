@@ -6,33 +6,116 @@
 
 from __future__ import annotations
 
-from micromagnetic_parameter_inversion.mumax3_config import PulseConfig, SimulationConfig
+import re
+
+from micromagnetic_parameter_inversion.mumax3_config import (
+    PulseConfig,
+    SimulationConfig,
+    Vector3,
+    derive_cell_size_m,
+)
+
+# 既定占位符形态：双花括号包裹的大写标识符（如 {{MODEL_SETUP}}）。
+_PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z0-9_]+\}\}")
+
+
+class TemplateRenderError(ValueError):
+    """模板占位符契约被违反：缺失、重复出现或渲染后仍残留占位符。"""
+
+
+def _fmt_number(value: float) -> str:
+    """确定性数值文本：`.17g` 十进制/科学记法，MuMax3（Go 语法）可直接解析。
+
+    同一浮点值永远得到同一文本（逐字节可复现）；-0 与 0 统一输出为 0。
+    """
+    number = float(value)
+    if number == 0.0:
+        return "0"
+    return format(number, ".17g")
+
+
+def _fmt_vector3(components: Vector3) -> str:
+    """渲染 3 分量为 `x, y, z` 实参列表文本（供 uniform/vector 括号内使用）。"""
+    return ", ".join(_fmt_number(component) for component in components)
+
+
+def _replace_once(template_text: str, placeholder: str, replacement: str) -> str:
+    """占位符必须恰出现一次并整体替换；违反即抛 TemplateRenderError。"""
+    parts = template_text.split(placeholder)
+    occurrences = len(parts) - 1
+    if occurrences != 1:
+        raise TemplateRenderError(f"占位符 {placeholder} 出现 {occurrences} 次，必须恰为 1 次")
+    return replacement.join((parts[0], parts[1]))
+
+
+def _reject_residual_placeholders(rendered: str) -> None:
+    """渲染结果中残留任何 {{...}} 视为模板/替换契约被破坏。"""
+    residual = _PLACEHOLDER_PATTERN.findall(rendered)
+    if residual:
+        raise TemplateRenderError(f"渲染后仍残留占位符 {residual!r}")
 
 
 def _render_model_setup(config: SimulationConfig) -> str:
-    """公共模型段 {{MODEL_SETUP}} 的唯一渲染器（防两脚本漂移）。"""
-    # TODO: 渲染网格（cell_size 由 size_m/cells 派生）、椭圆几何、
-    #  Msat/Aex/Ku1/易轴/demag/开放边界；alpha 不属于公共段；确定性格式化，
-    #  结果不得残留占位符、不含绝对路径与输出目录。
-    raise NotImplementedError
+    """公共模型段 {{MODEL_SETUP}} 的唯一渲染器（防两脚本漂移）。
+
+    固定顺序：网格、cell size（size_m/cells 派生，单一真值）、PBC（开放
+    边界）、椭圆几何（z 厚度由网格/单元尺寸体现）、demag、材料参数
+    （Msat/Aex/Ku1/易轴）。alpha 是 per-run 参数，不属于公共段；输出不含
+    路径与占位符。
+    """
+    material = config.material
+    geometry = config.geometry
+    size_x, size_y, _ = geometry.size_m
+    return "\n".join(
+        (
+            "// 网格与单元尺寸：cell_size = size_m / cells（唯一派生真值），单位 m",
+            f"SetGridSize({geometry.cells[0]}, {geometry.cells[1]}, {geometry.cells[2]})",
+            f"SetCellSize({_fmt_vector3(derive_cell_size_m(geometry))})",
+            "// 开放边界：不启用周期性镜像",
+            "SetPBC(0, 0, 0)",
+            "// 椭圆薄纳米磁体：SetGeom 只取面内尺寸，z 厚度由网格/单元尺寸体现",
+            f"SetGeom(Ellipse({_fmt_number(size_x)}, {_fmt_number(size_y)}))",
+            "// 退磁场开启",
+            "EnableDemag = true",
+            "// 单一均匀材料（SI 单位：Msat A/m；Aex J/m；Ku1 J/m^3）与易轴单位向量",
+            f"Msat = {_fmt_number(material.ms_a_per_m)}",
+            f"Aex = {_fmt_number(material.aex_j_per_m)}",
+            f"Ku1 = {_fmt_number(material.ku_j_per_m3)}",
+            f"anisU = vector({_fmt_vector3(material.anisotropy_axis)})",
+        )
+    )
 
 
 def render_equilibrium_script(config: SimulationConfig, template_text: str) -> str:
     """把 config 渲染进 equilibrium 模板文本（每 parameter set 执行一次）。"""
-    # TODO: {{MODEL_SETUP}} 取 _render_model_setup(config)；另渲染均匀
-    #  初态；确定性格式化替换全部占位符，结果不得残留占位符，也不含
-    #  绝对路径与输出目录（输出由工作目录决定）。
-    raise NotImplementedError
+    rendered = _replace_once(template_text, "{{MODEL_SETUP}}", _render_model_setup(config))
+    rendered = _replace_once(rendered, "{{INIT_M}}", _fmt_vector3(config.initial_m))
+    _reject_residual_placeholders(rendered)
+    return rendered
 
 
 def render_simulation_script(
     config: SimulationConfig, pulse: PulseConfig, template_text: str
 ) -> str:
-    """把 config 与单个 pulse 渲染进 simulation 模板文本（每 pulse 一次）。"""
-    # TODO: {{MODEL_SETUP}} 取 _render_model_setup(config)（与 equilibrium
-    #  脚本公共段逐字节相同）；外场三分量占位符 {{B_EXT_X_T}}/{{B_EXT_Y_T}}/
-    #  {{B_EXT_Z_T}} 直接替换为 pulse.b_ext_amplitude_t * pulse.direction[i]
-    #  的运行时 SI 值（renderer 计算完成，单位 T，换算已在 load_config 边界
-    #  完成）；另渲染 alpha、脉冲时长与采样契约；同一 config + 同一 pulse
-    #  渲染结果逐字节相同。
-    raise NotImplementedError
+    """把 config 与单个 pulse 渲染进 simulation 模板文本（每 pulse 一次）。
+
+    外场三分量在 renderer 内算完（amplitude_t * direction[i]，单位 T，换算
+    已在 load_config 边界完成）；同一 config + 同一 pulse 渲染结果逐字节
+    相同。
+    """
+    amplitude_t = pulse.b_ext_amplitude_t
+    direction_x, direction_y, direction_z = pulse.direction
+    rendered = template_text
+    for placeholder, replacement in (
+        ("{{MODEL_SETUP}}", _render_model_setup(config)),
+        ("{{ALPHA}}", _fmt_number(config.material.alpha)),
+        ("{{B_EXT_X_T}}", _fmt_number(amplitude_t * direction_x)),
+        ("{{B_EXT_Y_T}}", _fmt_number(amplitude_t * direction_y)),
+        ("{{B_EXT_Z_T}}", _fmt_number(amplitude_t * direction_z)),
+        ("{{PULSE_DURATION_S}}", _fmt_number(pulse.duration_s)),
+        ("{{SAMPLE_COUNT}}", str(config.recording.sample_count)),
+        ("{{SAMPLE_INTERVAL_S}}", _fmt_number(config.recording.sample_interval_s)),
+    ):
+        rendered = _replace_once(rendered, placeholder, replacement)
+    _reject_residual_placeholders(rendered)
+    return rendered

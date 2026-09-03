@@ -1,10 +1,13 @@
 // =============================================================================
-// equilibrium.mx3.in —— 平衡态模板（结构骨架，未经真实 MuMax3 验证，
-// 不可直接运行）。占位符由 mumax3_script.render_equilibrium_script 填入；
-// 每个 parameter set 渲染并执行一次：进程工作目录 = equilibrium/，渲染
-// 脚本固定名 equilibrium.mx3；MuMax3 默认原生输出目录 equilibrium.out/
-// （equilibrium.ovf、log.txt、references.bib）；run.log 由 pipeline 写在
-// equilibrium/ 根。产出供全部 pulse 共享的 equilibrium.ovf。
+// equilibrium.mx3.in —— 平衡态模板。占位符由
+// mumax3_script.render_equilibrium_script 填入；每个 parameter set 渲染并
+// 执行一次：进程工作目录 = equilibrium/，渲染脚本固定名 equilibrium.mx3；
+// MuMax3 默认原生输出目录 equilibrium.out/（契约必需：equilibrium.ovf）；
+// run.log 由 pipeline 写在 equilibrium/ 根。产出供全部
+// pulse 共享的 equilibrium.ovf。
+// 命令写法依据 MuMax3 3.12 官方 API 文档；执行链已经短 test-only pilot
+// （8×4×1、1 pulse、3 samples）基础验证，但正式数值协议（solver/弛豫收敛
+// 行为）仍待研究配置与收敛/QC 验证，验证完成前不得用于正式科研数据。
 // 物理假设见 simulations/mumax3/README.md：0 K、单一均匀材料、椭圆薄纳米
 // 磁体、demag 开启、开放边界无 PBC、无 DMI、无 STT、无静态偏置场。
 // =============================================================================
@@ -13,15 +16,15 @@
 //    渲染文本（_render_model_setup），与 simulation.mx3.in 的公共段逐字节
 //    相同；cell_size 由 size_m/cells 派生后填入；alpha 不属于公共段。
 {{MODEL_SETUP}}
-// TODO: SetGridSize/SetCellSize/椭圆几何与材料命令的确切写法，
-//       实现前以 MuMax3 官方文档核实，不在此虚构数值。
 
-// 2. 均匀初态（固定初态方向 {{INIT_M}}，此后不再改初态）
-// TODO: 均匀磁化设置命令待核实。
+// 2. 均匀初态：固定初态方向（此后不再改初态）
+m = uniform({{INIT_M}})
 
-// 3. 无外场平衡（仅一次；无静态偏置场，B_ext 恒 0）
-// TODO: Relax 与 Minimize 二选一，及 gammaLL/MaxErr/MaxDt/EdgeSmooth 等
-//       数值，待真实 MuMax3 单 cell 验证后固定在模板，不进入 YAML。
+// 3. 无外场平衡（仅一次；无静态偏置场，B_ext 恒 0）。未设置 gammaLL/
+//    MaxErr/MaxDt/EdgeSmooth，沿用 MuMax3 默认；收敛验证完成后固定在
+//    模板，不进入 YAML。
+B_ext = vector(0, 0, 0)
+Relax()
 
-// 4. 保存共享平衡态（默认原生输出目录 equilibrium.out/ 内）
-// TODO: 保存命令与输出名（equilibrium.out/equilibrium.ovf）待核实。
+// 4. 保存共享平衡态：写入默认原生输出目录，即 equilibrium.out/equilibrium.ovf
+SaveAs(m, "equilibrium")

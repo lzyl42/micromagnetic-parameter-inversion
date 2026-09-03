@@ -5,7 +5,7 @@ this Git repository. The repository keeps only:
 
 - `README.md` (this file) — data layout and provenance notes;
 - `samples/` — small sample files for smoke tests and demos;
-- manifests, schemas and train/val/test split definitions (when they exist).
+- schemas and train/val/test split definitions (when they exist).
 
 Large data and best models are intended for Git LFS or a separate release
 channel (e.g. a data server or archive), not for the normal Git history.
