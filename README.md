@@ -11,12 +11,17 @@ Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku` 的研究项目
 
 ### 模拟对象
 
-一个椭圆薄纳米磁体（初定 `100 nm × 50 nm × 2 nm`，长轴沿 x 方向），初始磁化近似沿 `+x`：
+一个扁平的三轴椭球薄纳米磁体（初定三轴全直径 `100 nm × 50 nm × 2 nm`，长轴沿 x 方向），初始磁化近似沿 `+x`：
 
 - 长轴提供明确的形状易轴，磁体接近单畴、又保留少量空间非均匀性；
 - 计算网格小，适合 GPU 批量模拟；
 - 固定 `Ms`（饱和磁化强度）、`A`（交换常数）、几何与网格，待反演参数只有
   Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku`。
+
+几何语义：`size_m=[dx,dy,dz]` 是椭球三轴全直径（= 包围盒尺寸），公共模型
+段恒渲染完整三轴 `SetGeom(Ellipsoid(dx, dy, dz))`；`cells=[nx,ny,nz]` 各分量
+为任意正整数——`nz=1` 时单层体素离散自然表现为恒厚椭圆截面薄片，`nz>1`
+时才逐层解析 z 方向椭球表面，正式研究须通过网格收敛测试确定 cells。
 
 ### 物理模型
 
@@ -94,6 +99,21 @@ uv run python scripts/check_environment.py
 计算设备、MuMax3 可用性、数据/输出路径。无 GPU 或无 MuMax3 时仍以 0 退出，
 但会明确报告状态。
 
+## MuMax3 模拟 CLI
+
+```bash
+uv run python scripts/run_mumax3_simulation.py --config <validated-experiment.yaml>
+```
+
+`--config` 指向一份实验 YAML（模板见
+`configs/experiments/mumax3_simulation.yaml`）。该示例配置当前**所有研究值
+均为 null 占位**：运行前必须先填写并审查正式研究值（`load_config` 会拒绝
+任何仍为 null 的必填研究值）。训练/推理 pipeline 尚未实现。
+
+YAML 中的指数数值请使用带指数符号的形式（如 `8.0e+5`）或直接写十进制
+（如 `800000.0`）：`8.0e5` 这类不带符号的指数会被 PyYAML 解析为字符串，
+随后被配置校验拒绝。
+
 ## 测试与格式
 
 ```bash
@@ -131,16 +151,28 @@ Git LFS 或独立发布。详见 `data/README.md`。
   （`shutil.which` + `subprocess` 参数列表，禁止 `shell=True`）。
 - `scripts/check_environment.py` 会报告当前机器的 MuMax3、GPU 与 CUDA 状态；
   不得仅凭依赖声明假设外部二进制可用。
+- 有限验证记录（2026-09-02，test-only pilot）：在当前机器上以临时短 pilot
+  （8×4×1 网格、1 pulse、3 samples，数值不代表研究参数）验证了整条执行链：
+  模板可解析执行、Relax 产生 equilibrium.ovf、simulation 经固定相对路径
+  LoadFile 共享 OVF、原生表头 `# t (s) mx () my () mz ()` 与恰 3 行、parser
+  时间重锚定、config.yaml 快照与 index.csv 原子写出；`mumax3 -test` 同轮
+  通过。正式研究参数、
+  最终几何/网格收敛、Relax 收敛阈值/鲁棒性、EdgeSmooth 选择、OVF 物理 QC
+  与批量重复性、正向回代验证仍未进行。
 
 ## 目录结构
 
 ```
 src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
+                                         # + mumax3 vertical slice（config / script / results / pipeline）
 scripts/check_environment.py             # 环境诊断
-tests/                                   # pytest（无需 GPU/MuMax3）
+scripts/run_mumax3_simulation.py         # MuMax3 模拟 CLI（薄封装）
 configs/base.yaml                        # 通用设置（seed、device=auto）
+configs/experiments/mumax3_simulation.yaml
+                                         # 实验配置模板（研究值当前全 null）
+simulations/mumax3/                      # MuMax3 脚本模板（.mx3.in）与说明
+tests/                                   # pytest（无需 GPU/MuMax3）
 data/                                    # 数据（完整数据不入库）
 notebooks/                               # 探索性 notebook
-simulations/mumax3/                      # MuMax3 脚本/manifest
 results/figures, results/tables          # 最终结果（可跟踪）
 ```

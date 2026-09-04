@@ -5,8 +5,9 @@
 - 本仓库是 MuMax3 多激励磁化动力学研究项目：基于多激励磁化动力学反演 Gilbert
   阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku`（模型方向：MLP / 1D CNN /
   Temporal Transformer）。项目目标与设计以仓库内 `README.md` 与代码为准。
-- **当前仍为基础设施脚手架**：尚无训练、推理或模拟 pipeline。不得虚构或声称
-  这些工作流已实现；`scripts/check_environment.py` 是唯一可执行入口。
+- **当前实现状态**：MuMax3 vertical slice 模拟 pipeline 与 CLI 已实现；
+  训练/推理仍未实现。不得虚构或声称训练/推理已实现。可执行入口共两个
+  脚本：`scripts/check_environment.py` 与 `scripts/run_mumax3_simulation.py`。
 - **工作范围严格限于本仓库**：不得读取/编辑仓库外目录（`external_directory`
   已全局 deny），不引用仓库外研究计划路径；外部资料调研只走官方文档/论文。
 
@@ -20,6 +21,14 @@
   580.173.02、PyTorch 2.11.0+cu128、torch CUDA 12.8、CUDA available；用户级
   MuMax3 3.12（CUDA 12.9 build）已通过 `mumax3 -test`。**运行时仍以
   `scripts/check_environment.py` 与 `mumax3 -test` 输出为准**。
+- 已核实事实（2026-09-02）：离线 vertical slice 测试 31 passed；在当前
+  MuMax3 3.12/CUDA 12.9/Tesla T10 上完成一次临时 test-only 短 pilot
+  （8×4×1 网格、1 pulse、3 samples，数值不代表研究参数）：模板可解析执行、
+  Relax 产生 equilibrium.ovf、simulation 经固定相对路径 LoadFile 共享
+  OVF、原生表头 `# t (s) mx () my () mz ()` 与恰 3 行、parser 时间重锚定、
+  m_t0/m_tfinal、config.yaml 快照与 index.csv；`mumax3 -test` 同轮通过。
+  **此为执行链冒烟验证，不是正式科研验证**：最终几何/网格收敛、Relax 收敛阈值/
+  鲁棒性、EdgeSmooth 选择、物理 QC、批量可复现性、正向回代仍未验证。
 - 测试：`uv run pytest`（无 GPU/MuMax3 也可运行）；聚焦文件/用例用标准 pytest
   节点，如 `uv run pytest tests/test_paths.py` 或
   `uv run pytest tests/test_paths.py::test_env_override_data_root`。
@@ -33,6 +42,12 @@
 
 - `src/micromagnetic_parameter_inversion/paths.py` 负责数据/输出根目录解析，
   `runtime.py` 负责设备选择与诊断，`external.py` 负责 MuMax3 发现与执行。
+- MuMax3 vertical slice 模块：`mumax3_config.py` 负责 frozen dataclass 与
+  YAML 加载/校验（拒绝 null 研究值、mT→T 边界转换）；`mumax3_script.py`
+  负责 `.mx3.in` 模板渲染；`mumax3_results.py` 负责 table 解析与轨迹 CSV
+  导出；`mumax3_pipeline.py` 负责编排（equilibrium → 各 pulse、原字节
+  config.yaml 快照与最终 index.csv 原子写出）。模拟入口：
+  `scripts/run_mumax3_simulation.py --config <实验 YAML>`。
 - 可复用代码放 `src/micromagnetic_parameter_inversion/`；notebook 仅用于探索
   （notebook 纪律：用项目 `.venv` 内核、不提交大数据/checkpoint 输出、不出现
   机器绝对路径）。
