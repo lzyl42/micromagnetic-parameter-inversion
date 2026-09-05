@@ -58,18 +58,29 @@ def _reject_residual_placeholders(rendered: str) -> None:
 def _render_model_setup(config: SimulationConfig) -> str:
     """公共模型段 {{MODEL_SETUP}} 的唯一渲染器（防两脚本漂移）。
 
-    固定顺序：网格、cell size（size_m/cells 派生，单一真值）、PBC（开放
+    固定顺序：数值协议（EdgeSmooth 必须先于 SetGeom 设置以影响几何体素化；
+    SetSolver/MaxErr/MaxDt/GammaLL 公共积分控制，equilibrium/simulation 显式
+    一致）、网格、cell size（size_m/cells 派生，单一真值）、PBC（开放
     边界）、椭球几何（SetGeom 恒取三轴全直径，均来自 size_m，不对 nz 做
     条件分支：nz=1 时单层体素离散自然表现为恒厚椭圆截面薄片，nz>1 时逐层
-    解析椭球 z 表面）、demag、材料参数（Msat/Aex/Ku1/易轴）。alpha 是
-    per-run 参数，不属于公共段；输出不含路径与占位符。
+    解析椭球 z 表面）、demag、材料参数（Msat/Aex/Ku1/易轴）。alpha 与
+    RelaxTorqueThreshold 是 per-run/per-script 参数，不属于公共段；输出
+    不含路径与占位符。
     """
     material = config.material
     geometry = config.geometry
+    numerics = config.numerics
     size_x, size_y, size_z = geometry.size_m
     geom_line = f"SetGeom(Ellipsoid({_fmt_vector3((size_x, size_y, size_z))}))"
     return "\n".join(
         (
+            "// 数值协议（YAML numerics 块；equilibrium/simulation 显式一致）",
+            "// EdgeSmooth 影响几何体素化，必须先于 SetGeom 设置（0=硬阶梯边界）",
+            f"EdgeSmooth = {numerics.edge_smooth}",
+            f"SetSolver({numerics.solver})",
+            f"MaxErr = {_fmt_number(numerics.max_err)}",
+            f"MaxDt = {_fmt_number(numerics.max_dt_s)}",
+            f"GammaLL = {_fmt_number(numerics.gamma_ll_rad_per_t_s)}",
             "// 网格与单元尺寸：cell_size = size_m / cells（唯一派生真值），单位 m",
             f"SetGridSize({geometry.cells[0]}, {geometry.cells[1]}, {geometry.cells[2]})",
             f"SetCellSize({_fmt_vector3(derive_cell_size_m(geometry))})",
@@ -92,6 +103,11 @@ def render_equilibrium_script(config: SimulationConfig, template_text: str) -> s
     """把 config 渲染进 equilibrium 模板文本（每 parameter set 执行一次）。"""
     rendered = _replace_once(template_text, "{{MODEL_SETUP}}", _render_model_setup(config))
     rendered = _replace_once(rendered, "{{INIT_M}}", _fmt_vector3(config.initial_m))
+    rendered = _replace_once(
+        rendered,
+        "{{RELAX_TORQUE_THRESHOLD_T}}",
+        _fmt_number(config.numerics.relax_torque_threshold_t),
+    )
     _reject_residual_placeholders(rendered)
     return rendered
 

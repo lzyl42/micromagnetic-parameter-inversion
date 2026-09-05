@@ -46,15 +46,87 @@ Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku` 的研究项目
 
 ### 多激励设计
 
-同一组 (`alpha`, `Ku`) 分别施加三种方向的脉冲，利用不同方向磁场对参数敏感性的差异降低两参数间的混淆：
+同一组 (`alpha`, `Ku`) 施加不同方向的短脉冲，利用磁场方向带来的敏感性差异
+降低两参数间的混淆。Pilot v1 首轮候选仅启用两个激励（A 沿 y、B 沿 z），
+第三激励暂缓（见下文「CoFeB-inspired 合成基准与 Pilot v1 参数选择」）：
 
-| 激励 | 脉冲方向 | 目的 |
+| 激励 | 脉冲方向 | Pilot v1 状态 |
 | --- | --- | --- |
-| A | 面内横向（沿 y） | 最简单的单激励基准 |
-| B | 面内倾斜（x–y 面内） | 补充不同面内角度的响应 |
-| C | 带面外分量（y–z 面内） | 激出面外进动信息 |
+| A | y（面内横向） | 启用 |
+| B | z（面外） | 启用 |
+| C | 待定 | 暂缓 |
 
 研究的核心逆问题：从一条或多条这样的平均磁化轨迹反演 (`alpha`, `Ku`)，再用 MuMax3 正向回代检验预测参数能否重建原始轨迹。
+
+## CoFeB-inspired 合成基准与 Pilot v1 参数选择
+
+本节记录 Pilot v1 协议、首轮哨兵实测（轨迹层）与放行决策。除标注「文献事实」
+外，以下数值均为项目选择或实测记录，不是文献结论。
+
+### 基准性质与固定候选
+
+- **合成基准，不是复现**：0 K、无热噪声、单一均匀有效介质的
+  synthetic CoFeB-inspired benchmark，仅借鉴 CoFeB 的典型量级，
+  **不声称精确复现任何具体 CoFeB/GaAs stack**。
+- **固定候选（可冻结）**：`Ms = 1.25e6 A/m`、`Aex = 15e-12 J/m`、
+  各向异性易轴 `+x`、真三轴椭球全直径 `100 × 50 × 2 nm`、
+  `initial_m = +x`；材料抽象与采样坐标（关场后 `t = 0` 重锚定）一并视为协议约定。
+- 文献事实（量级参考，非取值来源）：椭球退磁因子见 Osborn (1945,
+  DOI 10.1103/PhysRev.67.351)；单畴椭球进动频率见 Kittel (1948,
+  DOI 10.1103/PhysRev.73.155)；CoFeB 材料量级可参考 Conca et al.
+  (JAP 113, 213909 (2013), DOI 10.1063/1.4808462)。`Ms`/`Aex` 的具体取值
+  是本项目对齐这些量级的选择；模拟工具见 MuMax3 论文
+  (DOI 10.1063/1.4899186)。
+
+### Pilot v1 主域与首轮协议候选
+
+- 主域：`alpha ∈ [0.004, 0.020]`，在 **log(alpha) 空间**采样；
+  `Ku ∈ [2e3, 3e4] J/m^3`，在**线性空间**采样；`Ku = 0` 仅为物理
+  control，**不进入主域误差统计**。
+- 协议：`cells = 40 × 20 × 4`（`EdgeSmooth = 0`）；脉冲 `10 mT`、`50 ps`；
+  两个 pulse（A 沿 y、B 沿 z）；关场后每 `10 ps` 记录、共 `1001` 点（0..10 ns）。
+
+### 首轮哨兵实测（轨迹层）
+
+- 执行环境：MuMax3 3.12、Tesla T10；7 组 × 2 pulses 全部完整，每条轨迹
+  `1001` 点（0..10 ns）。此为 `EdgeSmooth=0`/默认 solver 协议的
+  **哨兵数据，不是训练数据**。
+- 轨迹层健全性：全部数值有限，`mean|m| ≈ 0.99996–0.99998`（min ≥ 0.9995）。
+- alpha/Ku 分离清晰（轨迹层）：dominant f 随 `Ku = 0/2k/16k/30k J/m^3` 约
+  `6.79/7.09/8.69/10.19 GHz`，跨 alpha 不变；e-fold 随
+  `alpha = .004/.008944/.020` 约 `1.82–1.95/.84–.85/.36–.40 ns`。
+- pulse B=z 响应幅值与 normalized RMS 可分性约比 A=y 弱 5–6 倍：不严格
+  冗余，但正式增益未证明；第三激励继续暂缓。
+- 关键阻塞：实测频率相对理想连续椭球宏自旋估算**偏高约 2–7%**（低 Ku 偏差
+  最大）；可能来自 ES0 阶梯边界/网格/有限振幅等，**不能据此冻结
+  `40×20×4` + ES0**。
+
+### 放行状态与下一步（哨兵轮后更新）
+
+| 项 | 状态 |
+| --- | --- |
+| CoFeB-inspired 抽象、`Ms`/`Aex`、采样坐标 | 可冻结 |
+| alpha/Ku 候选域、`50 ps` 脉冲、`10 ps × 1001` 记录、A/B 两激励 | 放行到下一阶段 |
+| `Ku = 0` | 仅物理 control，不入主域误差统计 |
+| `cells 40×20×4` + ES0 | 未放行（2–7% 频偏待 QC） |
+| 改 20 ps 采样 / 缩短 10 ns 窗 | 暂不改 |
+| 第三激励；MLP `1024/256/256` | 暂缓 |
+
+下一步顺序：先分析已有 OVF 与低 alpha 尾部，并做最小 EdgeSmooth/网格/
+solver/Relax QC；**之后**才考虑 32 点（建议改为 4 个 log-alpha × 8 个
+linear-Ku 的解释性规则切片，含 Ku=0 controls；正式训练集之后再 Sobol）——
+32 点尚未批准、未执行。MLP 首批先考虑 `64/32/32`，是否扩大由学习曲线
+决定。数值协议（EdgeSmooth/solver/MaxErr/MaxDt/GammaLL/RelaxTorqueThreshold）
+现已经 YAML `numerics` 块显式控制（哨兵轮运行时该控制尚不存在，其
+ES0/默认 solver 记录为历史事实）。**训练/推理仍未实现，不存在任何模型结果。**
+
+批量生成与运行实验配置：`uv run python scripts/generate_dataset.py`，组织为
+`FIXED_CONFIGS × PARAMETERS`：fixed config 携带除 alpha/Ku 外的全部协议
+字段（各套协议的 `dataset_name` 必须互不相同），PARAMETERS 只含 alpha/Ku。
+协议选择阶段用多套 fixed config × 少量压力点做数值/物理 QC；协议冻结后
+只保留单套 fixed config，正式数据集仅 alpha/Ku 变化，协议不同的数据不得
+混用（YAML 写到 `artifacts/generated_configs/<dataset_name>/`，模拟输出
+照常进 `data/raw/<dataset_name>/`）。
 
 ## 环境要求
 
@@ -167,6 +239,7 @@ src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
                                          # + mumax3 vertical slice（config / script / results / pipeline）
 scripts/check_environment.py             # 环境诊断
 scripts/run_mumax3_simulation.py         # MuMax3 模拟 CLI（薄封装）
+scripts/generate_dataset.py              # 生成哨兵实验 YAML 并顺序运行模拟
 configs/base.yaml                        # 通用设置（seed、device=auto）
 configs/experiments/mumax3_simulation.yaml
                                          # 实验配置模板（研究值当前全 null）

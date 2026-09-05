@@ -26,6 +26,14 @@ recording: # 关场后自由衰减采样（固定行数）
   sample_interval_s: null # 采样间隔，s
   sample_count: null # 采样点数；关场后首点为 sample_index=0、t_s=0
 
+numerics: # 数值协议（显式渲染进两个模板；改变任一值 = 协议改变，必须换 dataset_name）
+  edge_smooth: null # EdgeSmooth，非负整数（0=硬阶梯边界）；渲染于 SetGeom 之前
+  solver: null # SetSolver(...)，正整数（MuMax3 solver ID）
+  max_err: null # MaxErr，正数，无量纲
+  max_dt_s: null # MaxDt，正数，s
+  gamma_ll_rad_per_t_s: null # GammaLL，正数，rad/(T*s)
+  relax_torque_threshold_t: null # RelaxTorqueThreshold，T；-1 保留官方默认收敛判据
+
 pulses: # 短矩形脉冲列表（模板示例一项，可按当前实验追加多个 pulse；每项一次独立 run）
   - pulse_id: null # 脉冲唯一标识
     b_ext_amplitude_mT: null # 脉冲幅值，mT（load_config 边界内立即乘 1e-3 存为运行时 T）
