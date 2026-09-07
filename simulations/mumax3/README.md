@@ -16,7 +16,10 @@ MuMax3 是每台机器自行安装的外部依赖，不入库：加入 `PATH` �
   `FileExistsError` 仅在复用同一已有目录时拒绝覆盖。首版不自动验证同一
   dataset 下跨不同 parameter_set_id 的协议一致性。
 - 输入边界：`alpha >= 0`；`Ku` 只须有限（可为负或零）；脉冲幅值
-  `b_ext_amplitude_mT >= 0`。其余约束不变：所有层级严格 schema（拒绝缺失/
+  `b_ext_amplitude_mT >= 0`；`numerics` 块：`edge_smooth` 非负整数（允许 0）、
+  `solver` 正整数、`max_err`/`max_dt_s`/`gamma_ll_rad_per_t_s` 正数、
+  `relax_torque_threshold_t` 只须有限（允许 -1 保留官方默认）。其余约束不变：
+  所有层级严格 schema（拒绝缺失/
   未知字段、null、bool 冒充数值、非有限值），尺寸/Ms/Aex/duration/
   sample interval 须为正数，cells/sample_count 须为正整数，
   `anisotropy_axis`/`initial_m`/`direction` 须为单位向量（范数容差 1e-6），
@@ -28,8 +31,8 @@ MuMax3 是每台机器自行安装的外部依赖，不入库：加入 `PATH` �
   为恒厚椭圆截面薄片，`nz>1` 时才逐层解析 z 方向椭球表面；正式研究须
   通过网格收敛测试确定 cells。
 - 平衡态每个 parameter set 只算一次，全部 pulse 共享同一 `equilibrium.ovf`。
-- 采样静态契约（已经短 test-only pilot 基础执行验证；正式数值协议仍待研究
-  配置与收敛/QC 验证）：运行脉冲 -> 关场
+- 采样静态契约（已经短 test-only pilot 基础执行验证；数值协议收敛/QC 验证
+  仍待完成）：运行脉冲 -> 关场
   -> 立即 TableSave（`sample_index=0`、`t_s=0`）并保存 `m_t0.ovf` -> 再执行
   `sample_count-1` 次 `Run(sample_interval_s)+TableSave` -> 末点保存
   `m_tfinal.ovf`；其后取整数索引，`t_s = sample_index * sample_interval_s`，
@@ -58,7 +61,8 @@ data/raw/<dataset_name>/<parameter_set_id>/
 │   ├── equilibrium.mx3                      # 渲染脚本（固定名）
 │   ├── run.log
 │   └── equilibrium.out/
-│       └── equilibrium.ovf                  # 共享平衡态（须存在且非空）
+│       ├── equilibrium.ovf                  # 共享平衡态（须存在且非空）
+│       └── geom.ovf                         # 诊断：几何体素化（非契约必需）
 └── runs/<pulse_id>/                         # pulse 工作目录
     ├── simulation.mx3                       # 渲染脚本（固定名）
     ├── run.log
@@ -85,8 +89,13 @@ MuMax3 可能额外在 `.out/` 目录产生原生 `log.txt`/`references.bib`；�
   alpha,ku_j_per_m3,b_ext_x_T,b_ext_y_T,b_ext_z_T,pulse_duration_s,
   trajectory_path`；全部 pulse 成功后先写 `index.csv.tmp`，再原子替换为
   最终 `index.csv`。最终 `index.csv` 存在即表示该 parameter set 完整完成；
-  失败目录保留供人工诊断，但没有最终 index（临时 `index.csv.tmp` 会被
+  失败目录保留供人工诊断，但没有最终 index（临时 `index.csv.tmp` 会
   清除）。
+- 诊断（非契约必需）：两个模板向 stdout 输出 `DIAGNOSTIC` 行并由 pipeline
+  原文写入 run.log——equilibrium：`relax_converged`/`MaxTorque`(T)/
+  `E_total`(J)/`step`/`NEval`（Relax 后）；simulation：`PeakErr`（进程
+  历史峰值）/`LastErr`/`dt`(s)/`step`/`NEval`（采样完成后）。equilibrium
+  另存 `equilibrium.out/geom.ovf`（几何体素化，`SaveAs(geom, "geom")`）。
 - 任一步失败直接上抛并停止；输出目录已存在抛 `FileExistsError`；失败
   现场保留供人工诊断，不做自动恢复/重试。
 
@@ -102,8 +111,11 @@ MuMax3 可能额外在 `.out/` 目录产生原生 `log.txt`/`references.bib`；�
 
 正式实验前仍待验证：最终研究参数（当前 YAML 全 null）、最终几何与网格
 收敛、solver/Relax 收敛阈值与鲁棒性、EdgeSmooth 选择、OVF 物理 QC、批量
-重复性。上述协议一经验证即固定在模板内；YAML 不提供开关。模板虽可执行，
-其数值协议在正式验证完成前不得用于产生正式科研数据。
+重复性。数值协议（`EdgeSmooth`/`SetSolver`/`MaxErr`/`MaxDt`/`GammaLL`/
+`RelaxTorqueThreshold`）现已由 YAML `numerics` 块显式配置并渲染进两个模板
+（`EdgeSmooth` 渲染于 `SetGeom` 之前）；注意已完成哨兵（cofeb_synthetic_
+sentinel_v1，ES0/默认 solver）运行于该控制存在之前，历史事实不变。模板虽
+可执行，其数值协议在正式验证完成前不得用于产生正式科研数据。
 
 ## 验证策略
 

@@ -57,6 +57,14 @@ def _test_config_dict() -> dict[str, Any]:
         "geometry": {"size_m": [160.0e-9, 80.0e-9, 3.0e-9], "cells": [32, 16, 1]},
         "initial_m": [1.0, 0.0, 0.0],
         "recording": {"sample_interval_s": _INTERVAL_S, "sample_count": _SAMPLE_COUNT},
+        "numerics": {
+            "edge_smooth": 1,
+            "solver": 6,
+            "max_err": 1.0e-6,
+            "max_dt_s": 5.0e-13,
+            "gamma_ll_rad_per_t_s": 1.76e11,
+            "relax_torque_threshold_t": -1.0,
+        },
         "pulses": [
             {
                 "pulse_id": "pulse_a",
@@ -181,6 +189,11 @@ def test_load_config_valid_one_shot(tmp_path: Path) -> None:
     assert config.pulses[0].b_ext_amplitude_t == 50.0e-3
     assert config.pulses[1].b_ext_amplitude_t == 0.0
     assert derive_cell_size_m(config.geometry) == pytest.approx((5.0e-9, 5.0e-9, 3.0e-9))
+    assert (config.numerics.edge_smooth, config.numerics.solver) == (1, 6)
+    assert config.numerics.max_err == 1.0e-6
+    assert config.numerics.max_dt_s == 5.0e-13
+    assert config.numerics.gamma_ll_rad_per_t_s == 1.76e11
+    assert config.numerics.relax_torque_threshold_t == -1.0
 
 
 def test_load_config_rejects_invalid_yaml(tmp_path: Path) -> None:
@@ -242,6 +255,14 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
     assert "B_ext = vector(0, 0, 0)" in equilibrium
     assert _geom_diameters(equilibrium) == [160.0e-9, 80.0e-9, 3.0e-9]
     assert "SetGeom(Ellipse(" not in equilibrium
+    # 数值协议：EdgeSmooth 必须先于 SetGeom；公共 solver 控制；Relax 阈值渲染。
+    assert equilibrium.index("EdgeSmooth = 1") < equilibrium.index("SetGeom(")
+    assert "SetSolver(6)" in equilibrium
+    assert equilibrium.count("RelaxTorqueThreshold = -1") == 1
+    # 诊断：geom 快照 + DIAGNOSTIC relax 行（经 stdout 进 run.log）。
+    assert equilibrium.count('SaveAs(geom, "geom")') == 1
+    assert "relax_converged := Relax()" in equilibrium
+    assert "DIAGNOSTIC relax_converged=" in equilibrium
 
     for pulse in config.pulses:
         rendered = render_simulation_script(config, pulse, simulation_template)
@@ -251,6 +272,14 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
         assert "Relax" not in rendered
         assert _geom_diameters(rendered) == [160.0e-9, 80.0e-9, 3.0e-9]
         assert "SetGeom(Ellipse(" not in rendered
+        # 与 equilibrium 相同的公共数值协议段（无 RelaxTorqueThreshold）。
+        assert rendered.index("EdgeSmooth = 1") < rendered.index("SetGeom(")
+        assert "SetSolver(6)" in rendered
+        assert "MaxErr = " in rendered
+        assert "MaxDt = " in rendered
+        assert "GammaLL = " in rendered
+        # 诊断：DIAGNOSTIC dynamic 行（经 stdout 进 run.log）。
+        assert "DIAGNOSTIC PeakErr=" in rendered
         count, interval_s, duration_s = _sampling_from_script(rendered)
         assert (count, interval_s, duration_s) == (
             config.recording.sample_count,

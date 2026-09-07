@@ -20,11 +20,21 @@ type Vector3 = tuple[float, float, float]
 type Cells3 = tuple[int, int, int]
 
 _TOP_LEVEL_KEYS = frozenset(
-    {"dataset_name", "material", "geometry", "initial_m", "recording", "pulses"}
+    {"dataset_name", "material", "geometry", "initial_m", "recording", "numerics", "pulses"}
 )
 _MATERIAL_KEYS = frozenset({"ms_a_per_m", "aex_j_per_m", "alpha", "ku_j_per_m3", "anisotropy_axis"})
 _GEOMETRY_KEYS = frozenset({"size_m", "cells"})
 _RECORDING_KEYS = frozenset({"sample_interval_s", "sample_count"})
+_NUMERICS_KEYS = frozenset(
+    {
+        "edge_smooth",
+        "solver",
+        "max_err",
+        "max_dt_s",
+        "gamma_ll_rad_per_t_s",
+        "relax_torque_threshold_t",
+    }
+)
 _PULSE_KEYS = frozenset({"pulse_id", "b_ext_amplitude_mT", "direction", "duration_s"})
 
 # 单位向量范数容差：容忍 YAML 手写值（如 1/sqrt(3)）的浮点舍入。
@@ -63,6 +73,18 @@ class RecordingConfig:
 
 
 @dataclass(frozen=True)
+class NumericsConfig:
+    """数值协议（显式渲染进 equilibrium/simulation 两模板；改变即协议改变）。"""
+
+    edge_smooth: int  # EdgeSmooth，非负整数（0=硬阶梯边界）；渲染于 SetGeom 之前
+    solver: int  # SetSolver(...) 的 solver ID，正整数
+    max_err: float  # MaxErr，正数，无量纲
+    max_dt_s: float  # MaxDt，正数，s
+    gamma_ll_rad_per_t_s: float  # GammaLL，正数，rad/(T*s)
+    relax_torque_threshold_t: float  # RelaxTorqueThreshold，T；只须有限（-1=官方默认）
+
+
+@dataclass(frozen=True)
 class PulseConfig:
     """单个短矩形脉冲激励（每项一次独立 run）。"""
 
@@ -81,6 +103,7 @@ class SimulationConfig:
     geometry: GeometryConfig
     initial_m: Vector3  # 均匀初态方向，无量纲单位向量
     recording: RecordingConfig
+    numerics: NumericsConfig
     pulses: tuple[PulseConfig, ...]
 
 
@@ -127,6 +150,13 @@ def _require_positive_int(value: object, field: str) -> int:
     """正整数：拒绝 bool、浮点（含 3.0 这类整值浮点）与非正值。"""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         _fail(field, f"必须为正整数 (got {value!r})")
+    return value
+
+
+def _require_non_negative_int(value: object, field: str) -> int:
+    """非负整数（允许 0）：拒绝 bool、浮点与非负性违反。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        _fail(field, f"必须为非负整数 (got {value!r})")
     return value
 
 
@@ -212,8 +242,11 @@ def load_config(path: Path) -> SimulationConfig:
     校验边界（此后流程假定配置合法，不重复防御）：所有层级严格 schema，
     拒绝缺失/未知字段、null、bool 冒充数值、非有限值；尺寸/Ms/Aex/
     duration/sample interval 须为正数，cells/sample_count 须为正整数，
-    alpha 与 b_ext_amplitude_mT 须为非负数，Ku 只须有限（可 0/负）；三维
-    向量须恰 3 个有限分量，anisotropy_axis/initial_m/direction 还须为
+    alpha 与 b_ext_amplitude_mT 须为非负数，Ku 只须有限（可 0/负）；
+    numerics 块：edge_smooth 须为非负整数（允许 0），solver 须为正整数，
+    max_err/max_dt_s/gamma_ll_rad_per_t_s 须为正数，
+    relax_torque_threshold_t 只须有限（允许 -1 保留官方默认收敛判据）；
+    三维向量须恰 3 个有限分量，anisotropy_axis/initial_m/direction 还须为
     单位向量（范数容差 1e-6）；pulses 非空且 pulse_id 唯一；
     dataset_name/pulse_id 为安全单路径段。单位边界：b_ext_amplitude_mT
     在此乘 1e-3 存为运行时 T，mT 不进入运行时模型。
@@ -260,6 +293,21 @@ def load_config(path: Path) -> SimulationConfig:
         sample_count=_require_positive_int(recording_raw["sample_count"], "recording.sample_count"),
     )
 
+    numerics_raw = _require_mapping(root["numerics"], "numerics")
+    _check_mapping_keys(numerics_raw, "numerics", _NUMERICS_KEYS)
+    numerics = NumericsConfig(
+        edge_smooth=_require_non_negative_int(numerics_raw["edge_smooth"], "numerics.edge_smooth"),
+        solver=_require_positive_int(numerics_raw["solver"], "numerics.solver"),
+        max_err=_require_positive_number(numerics_raw["max_err"], "numerics.max_err"),
+        max_dt_s=_require_positive_number(numerics_raw["max_dt_s"], "numerics.max_dt_s"),
+        gamma_ll_rad_per_t_s=_require_positive_number(
+            numerics_raw["gamma_ll_rad_per_t_s"], "numerics.gamma_ll_rad_per_t_s"
+        ),
+        relax_torque_threshold_t=_require_finite(
+            numerics_raw["relax_torque_threshold_t"], "numerics.relax_torque_threshold_t"
+        ),
+    )
+
     pulses_raw = root["pulses"]
     if not isinstance(pulses_raw, list) or not pulses_raw:
         _fail("pulses", "必须为非空的 pulse 列表")
@@ -295,6 +343,7 @@ def load_config(path: Path) -> SimulationConfig:
         geometry=geometry,
         initial_m=initial_m,
         recording=recording,
+        numerics=numerics,
         pulses=tuple(pulses),
     )
 

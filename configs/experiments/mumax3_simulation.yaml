@@ -1,33 +1,44 @@
-# MuMax3 模拟配置：一份配置 = 一个 (alpha, Ku) parameter set 的多脉冲实验。
-# 硬约束：所有研究值为 null 占位，运行前必须全部填写为真实数值；
-# load_config 会拒绝任何仍为 null 的必填研究值。本文件不提供任何默认数值。
+# MuMax3 模拟配置：Protocol B（固定离散 benchmark，训练优先）。
+# 性质声明：本文件固定一套离散网格上的合成 benchmark 协议——cells/EdgeSmooth
+# 等离散选择为固定约定，未证明对连续模型网格收敛，也未验证真实器件有效性；
+# 固定离散 benchmark 不是网格收敛协议。改变任一固定字段 = 协议改变，
+# 必须换 dataset_name（协议不同的数据不得混用）。
+# 待填字段：仅 dataset_name、material.alpha、material.ku_j_per_m3 三处保留
+# null，运行前必须填写；load_config 会拒绝任何仍为 null 的必填研究值。
 # 单位：一律 SI；唯一例外是外场幅值以 mT 书写（b_ext_amplitude_mT），
 # load_config 边界内立即乘 1e-3；运行时模型与计算只使用 T。
-# 不设 seed/description/equilibration/execution/output 等字段。
+# 0 K、无热噪声的合成材料模型：不新增温度/热噪声等 schema 字段。
 
-dataset_name: null # 数据集名；输出根 data/raw/<dataset_name>/
+dataset_name: null # 数据集名；运行前必填。示例命名 cofeb_discrete_a2_v1 仅为格式示例，未填入模板；每套协议须按自身协议改名后填写。输出根 data/raw/<dataset_name>/
 
-material: # 单一均匀材料（0 K，无热噪声）
-  ms_a_per_m: null # 饱和磁化强度，A/m
-  aex_j_per_m: null # 交换刚度常数，J/m
-  alpha: null # Gilbert 阻尼系数（反演目标），无量纲
-  ku_j_per_m3: null # 单轴各向异性常数（反演目标），J/m^3
-  anisotropy_axis: null # 易轴单位向量 [x, y, z]，无量纲
+material: # 单一均匀材料（0 K，无热噪声；synthetic CoFeB-inspired 量级）
+  ms_a_per_m: 1.25e+6 # 饱和磁化强度，A/m（固定）
+  aex_j_per_m: 15.0e-12 # 交换刚度常数，J/m（固定）
+  alpha: null # Gilbert 阻尼系数（反演目标），无量纲；运行前必填
+  ku_j_per_m3: null # 单轴各向异性常数（反演目标），J/m^3；运行前必填
+  anisotropy_axis: [1.0, 0.0, 0.0] # 易轴单位向量 +x，无量纲（固定）
 
-geometry: # 扁椭球薄纳米磁体（三轴椭球）的尺寸与网格
-  size_m: null # 椭球三轴全直径 [dx, dy, dz]，m（= 包围盒尺寸）
-  cells: null # 网格单元数 [nx, ny, nz]，任意正整数；nz=1 单层体素近似，nz>1 解析 z 曲面
+geometry: # 固定离散几何：真三轴椭球 + 固定网格（非网格收敛协议）
+  size_m: [100.0e-9, 50.0e-9, 2.0e-9] # 椭球三轴全直径 [dx, dy, dz]，m（= 包围盒尺寸，固定）
+  cells: [40, 20, 4] # 网格单元数 [nx, ny, nz]；固定离散选择，网格收敛未证明
   # cell_size[i] = size_m[i] / cells[i] 由代码派生（单一真值），此处不填。
-  # 正式研究须通过网格收敛测试确定 cells。
 
-initial_m: null # 均匀初态方向 [x, y, z]，无量纲单位向量
+initial_m: [1.0, 0.0, 0.0] # 均匀初态方向 +x，无量纲单位向量（固定）
 
-recording: # 关场后自由衰减采样（固定行数）
-  sample_interval_s: null # 采样间隔，s
-  sample_count: null # 采样点数；关场后首点为 sample_index=0、t_s=0
+recording: # 关场后自由衰减采样（固定行数）：10 ps × 401 点 = 关场后 0..4 ns
+  sample_interval_s: 10.0e-12 # 采样间隔，s（固定）
+  sample_count: 401 # 采样点数；关场后首点为 sample_index=0、t_s=0（固定）
 
-pulses: # 短矩形脉冲列表（模板示例一项，可按当前实验追加多个 pulse；每项一次独立 run）
-  - pulse_id: null # 脉冲唯一标识
-    b_ext_amplitude_mT: null # 脉冲幅值，mT（load_config 边界内立即乘 1e-3 存为运行时 T）
-    direction: null # 脉冲方向单位向量 [x, y, z]，无量纲
-    duration_s: null # 脉冲时长，s；关场后 B_ext 恒为 0
+numerics: # 数值协议（显式渲染进两个模板；改变任一值 = 协议改变，必须换 dataset_name）
+  edge_smooth: 12 # EdgeSmooth，非负整数；渲染于 SetGeom 之前（固定；ES>0 时单层填充仍按平滑 Ellipsoid 几何，非等价恒厚柱体）
+  solver: 5 # SetSolver(...)，MuMax3 solver ID（固定）
+  max_err: 1.0e-5 # MaxErr，正数，无量纲（固定）
+  max_dt_s: 1.0e-11 # MaxDt，正数，s（固定）
+  gamma_ll_rad_per_t_s: 1.7595e+11 # GammaLL，正数，rad/(T*s)（固定）
+  relax_torque_threshold_t: -1.0 # RelaxTorqueThreshold，T；-1 保留官方默认收敛判据（固定）
+
+pulses: # 短矩形脉冲列表（Protocol B 首版：仅 1 个 pulse；多激励为后续对照，未批准）
+  - pulse_id: pulse_A2 # 脉冲唯一标识（已填写）
+    b_ext_amplitude_mT: 2.0 # 脉冲幅值，mT（load_config 边界内立即乘 1e-3 存为运行时 T）
+    direction: [0.0, 1.0, 0.0] # 脉冲方向单位向量 y，无量纲
+    duration_s: 50.0e-12 # 脉冲时长，s；关场后 B_ext 恒为 0

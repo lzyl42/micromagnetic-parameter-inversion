@@ -1,6 +1,33 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    ".opencode/ssh-mcp-policy.md"
+  ],
   "mcp": {
+    "ssh-mcp-read": {
+      "type": "local",
+      "command": [
+        "/home/lzyl/.local/opt/node-v22.23.2-linux-x64/bin/node",
+        "/mnt/unraid/user/zzc-sync/文件/项目/micromagnetic_parameter_inversion/.opencode/ssh-mcp-server.mjs",
+        "--mode", "read",
+        "--source-config", "/home/lzyl/.config/ssh-mcp-server/servers.json",
+        "--policy", "/mnt/unraid/user/zzc-sync/文件/项目/micromagnetic_parameter_inversion/.opencode/ssh-mcp-command-policy.json"
+      ],
+      "enabled": true,
+      "timeout": 10000
+    },
+    "ssh-mcp-ask": {
+      "type": "local",
+      "command": [
+        "/home/lzyl/.local/opt/node-v22.23.2-linux-x64/bin/node",
+        "/mnt/unraid/user/zzc-sync/文件/项目/micromagnetic_parameter_inversion/.opencode/ssh-mcp-server.mjs",
+        "--mode", "ask",
+        "--source-config", "/home/lzyl/.config/ssh-mcp-server/servers.json",
+        "--policy", "/mnt/unraid/user/zzc-sync/文件/项目/micromagnetic_parameter_inversion/.opencode/ssh-mcp-command-policy.json"
+      ],
+      "enabled": true,
+      "timeout": 10000
+    },
     "gitea": {
       "enabled": true
     },
@@ -9,6 +36,10 @@
     }
   },
   "permission": {
+    "ssh-mcp-read_*": "deny",
+    "ssh-mcp-read_execute-command": "allow",
+    "ssh-mcp-read_list-servers": "allow",
+    "ssh-mcp-ask_*": "ask",
     "gitea_*": "ask",
     "gitea-read_*": "allow",
     "external_directory": {
