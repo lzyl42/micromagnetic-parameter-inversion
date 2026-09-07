@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """generate_dataset.py —— 生成实验 YAML 并顺序运行 MuMax3 模拟。
 
-当前预设：F1 z16 测试（详见 progress.md「F1」节）。运行前必须确认
-data/raw/cofeb_qc04_es12_xy40_z16_a2_v1/ 与
-artifacts/generated_configs/cofeb_qc04_es12_xy40_z16_a2_v1/ 均不存在；
+当前预设：N5 xy80 z16 对照（xy80 网格的 z 参考：xy80 z16、ES12、仅 PL、
+pulse_zero + pulse_A2 顺序执行、10 ps × 101 点 = 每条轨迹关场后 1 ns）。
+运行前必须确认目标输出 set 目录
+data/raw/cofeb_diag05_xy80_z16_pl_v1/24737dde54fa8f18/ 不存在；
 若存在则不得运行（pipeline 会 FileExistsError 拒绝，不得删除已有数据）。
 
 FIXED_CONFIGS（所有固定协议字段）× PARAMETERS（仅 alpha/Ku）的每个组合
@@ -27,12 +28,13 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _RUN_SCRIPT = PROJECT_ROOT / "scripts" / "run_mumax3_simulation.py"
 
-# F1（z16 收敛测试）唯一 fixed config：ES12、xy40、z16、A2-only、R4、RT=-1。
-# 若改变任一固定协议（material/geometry/recording/numerics/pulses），必须更换
-# dataset_name；协议不同的数据不得混用。
+# N5（xy80 z16 对照）唯一 fixed config：ES12、xy80 z16（80×40×16）、PL、
+# zero+A2、10 ps × 101 点（每条轨迹关场后 1 ns）、RT=-1。相对 N4 仅
+# dataset_name 与 cells 两处变化；若改变任一固定协议（material/geometry/
+# recording/numerics/pulses），必须更换 dataset_name；协议不同的数据不得混用。
 FIXED_CONFIGS: list[dict[str, Any]] = [
     {
-        "dataset_name": "cofeb_qc04_es12_xy40_z16_a2_v1",
+        "dataset_name": "cofeb_diag05_xy80_z16_pl_v1",
         "material": {
             "ms_a_per_m": 1.25e6,  # A/m
             "aex_j_per_m": 15e-12,  # J/m
@@ -40,12 +42,12 @@ FIXED_CONFIGS: list[dict[str, Any]] = [
         },
         "geometry": {
             "size_m": [100e-9, 50e-9, 2e-9],  # 真三轴椭球全直径 [m]
-            "cells": [40, 20, 16],
+            "cells": [80, 40, 16],
         },
         "initial_m": [1.0, 0.0, 0.0],  # +x
         "recording": {
             "sample_interval_s": 10e-12,  # 10 ps
-            "sample_count": 401,  # 0..4 ns（R4）
+            "sample_count": 101,  # 关场后 1 ns
         },
         "numerics": {
             "edge_smooth": 12,
@@ -57,6 +59,12 @@ FIXED_CONFIGS: list[dict[str, Any]] = [
         },
         "pulses": [
             {
+                "pulse_id": "pulse_zero",
+                "b_ext_amplitude_mT": 0.0,
+                "direction": [0.0, 1.0, 0.0],  # y
+                "duration_s": 50e-12,  # 50 ps
+            },
+            {
                 "pulse_id": "pulse_A2",
                 "b_ext_amplitude_mT": 2.0,
                 "direction": [0.0, 1.0, 0.0],  # y
@@ -66,10 +74,9 @@ FIXED_CONFIGS: list[dict[str, Any]] = [
     },
 ]
 
-# F1 压力点：先 PL，后 PH（顺序执行）。
+# N5：仅 PL（顺序执行）。
 PARAMETERS: list[dict[str, float]] = [
     {"alpha": 0.004, "ku_j_per_m3": 2000.0},  # PL
-    {"alpha": 0.004, "ku_j_per_m3": 30000.0},  # PH
 ]
 
 
