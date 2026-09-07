@@ -5,13 +5,103 @@ Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku` 的研究项目
 
 项目目标、科研约束与当前实现状态以本仓库 `README.md`、`AGENTS.md`、配置和代码为准。
 
+## 当前协议：Protocol B（固定离散 benchmark，训练优先）
+
+**用户决策（2026-09）**：连续模型的网格收敛与真实器件有效性均未证明，
+网格扫描停止；先行推进「固定离散 benchmark → 数据 → 训练」闭环。当前
+一切模拟与数据生成以本协议为准；历史 ES0/其他网格/其他 pulse 协议数据
+一律不得与 Protocol B 数据混用。
+
+基准性质：0 K、无热噪声、单一均匀有效介质的 **synthetic CoFeB-inspired**
+benchmark（仅借鉴 CoFeB 典型量级，不声称复现任何具体 stack）。**固定
+离散 benchmark，不是网格收敛协议**：cells 与 EdgeSmooth 为固定约定，
+不作为网格收敛结论。
+
+### 固定字段全表（`configs/experiments/mumax3_simulation.yaml`）
+
+| 字段 | 固定值 |
+| --- | --- |
+| `material.ms_a_per_m` | `1.25e+6` A/m |
+| `material.aex_j_per_m` | `15.0e-12` J/m |
+| `material.anisotropy_axis` | `+x`（`[1.0, 0.0, 0.0]`） |
+| `geometry.size_m` | `100.0e-9 × 50.0e-9 × 2.0e-9` m（椭球三轴全直径） |
+| `geometry.cells` | `[40, 20, 4]` |
+| `initial_m` | `+x`（`[1.0, 0.0, 0.0]`） |
+| `recording.sample_interval_s` | `10.0e-12` s（10 ps） |
+| `recording.sample_count` | `401`（关场后 0..4 ns） |
+| `numerics.edge_smooth` | `12` |
+| `numerics.solver` | `5` |
+| `numerics.max_err` | `1.0e-5` |
+| `numerics.max_dt_s` | `1.0e-11` s |
+| `numerics.gamma_ll_rad_per_t_s` | `1.7595e+11` rad/(T·s) |
+| `numerics.relax_torque_threshold_t` | `-1.0`（保留官方默认收敛判据） |
+| `pulses`（首版仅 1 个） | `pulse_A2`：方向 y、幅值 `2.0` mT、时长 `50.0e-12` s |
+
+待填字段（仅三处，运行前必填，模板中保持 null）：
+`dataset_name`、`material.alpha`、`material.ku_j_per_m3`。
+`dataset_name` 须按协议命名——如 `cofeb_discrete_a2_v1` **仅为格式示例**，
+未填入模板；每套协议须改名后填写。
+
+### 参数主域（采样设计）
+
+- `alpha ∈ [0.004, 0.020]`：在 **log(alpha) 空间**采样；
+- `Ku ∈ [2000, 30000] J/m^3`：在**线性空间**采样；
+- `Ku = 0`：仅作独立物理 control，**不进入主域误差统计**。
+
+### 激励策略：先单激励 baseline，多激励为后续对照
+
+首版协议只含单一 `pulse_A2`（y 方向 2 mT、50 ps），先把「单激励 →
+(`alpha`, `Ku`)」baseline 跑通。模型方法的长远目标仍是多激励降混淆，
+但当前只有单激励 baseline；增加激励（如 z 向脉冲）留作后续对照实验，
+尚未批准执行。
+
+### 数据使用纪律（同协议闭环）
+
+- 同一 Protocol B 数据同时用于 training/val/test 划分与最终 MuMax3 正向
+  回代检验；不与历史 ES0/其他 cells/其他 pulse 协议数据混用。
+- 数据划分按参数组合进行：同一 (`alpha`, `Ku`) 的所有轨迹必须同组，
+  防止跨组泄漏。
+- 标准化/特征统计量只在训练组拟合，验证/测试组不得参与拟合。
+- 固定依赖（`uv.lock`）、seed（`configs/base.yaml`）与代码版本；
+  不为此新增脚本或 schema 字段。
+
+### 如何运行
+
+单份配置 CLI：复制 `configs/experiments/mumax3_simulation.yaml`，填好
+`dataset_name`、`material.alpha`、`material.ku_j_per_m3` 三处，即可运行：
+
+```bash
+uv run python scripts/run_mumax3_simulation.py --config <filled.yaml>
+```
+
+批量脚本 `scripts/generate_dataset.py` **不读取**这份 YAML：它使用自己
+内置的 `FIXED_CONFIGS × PARAMETERS`（`FIXED_CONFIGS` 携带除 alpha/Ku 外
+的全部固定字段，其 `material` 不含 alpha/ku 键；`PARAMETERS` 只含
+alpha/Ku）。**本次文档与模板更新未同步修改该脚本**：其内置 preset 仍是
+旧协议，直接运行不会得到 Protocol B 数据；运行批量脚本前须自行把上表
+固定字段逐项对齐进 `FIXED_CONFIGS`。输出 `artifacts/generated_configs/
+<dataset_name>/`、`data/raw/<dataset_name>/` 与 `index.csv` 只是目录/
+索引结构约定，不构成科学正确性证明。
+
+### 当前状态声明
+
+- 模拟 pipeline（vertical slice）与 CLI 已实现；**训练/推理仍未实现，
+  不存在任何训练模型或模型结果**。
+- 已完成的部分 QC：offline vertical slice 测试（31 passed）、2026-09-02
+  test-only pilot 执行链冒烟、Pilot v1 哨兵轮轨迹层检查（历史协议）。
+- **未证明**：连续模型网格收敛、Relax 收敛鲁棒性、EdgeSmooth 选择的
+  系统论证、批量可复现性、OVF/物理级 QC、真实器件有效性、正向回代验证。
+
 ## 物理模型概述
 
-本项目计划模拟的物理系统与变化过程如下（详细推导见 `plan.md` 第 5–8 节；几何尺寸等为初始方案，最终以试运行和网格收敛测试为准）。
+本项目模拟的物理系统与变化过程如下（详细推导见 `plan.md` 第 5–8 节；
+几何与离散已由上文「当前协议」固定为固定离散 benchmark 的约定值——
+连续模型网格收敛与真实器件有效性未证明，此为当前状态，不是待办门槛）。
 
 ### 模拟对象
 
-一个扁平的三轴椭球薄纳米磁体（初定三轴全直径 `100 nm × 50 nm × 2 nm`，长轴沿 x 方向），初始磁化近似沿 `+x`：
+一个扁平的三轴椭球薄纳米磁体（三轴全直径 `100 nm × 50 nm × 2 nm`，长轴
+沿 x 方向，当前协议固定值），初始磁化沿 `+x`：
 
 - 长轴提供明确的形状易轴，磁体接近单畴、又保留少量空间非均匀性；
 - 计算网格小，适合 GPU 批量模拟；
@@ -20,8 +110,10 @@ Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku` 的研究项目
 
 几何语义：`size_m=[dx,dy,dz]` 是椭球三轴全直径（= 包围盒尺寸），公共模型
 段恒渲染完整三轴 `SetGeom(Ellipsoid(dx, dy, dz))`；`cells=[nx,ny,nz]` 各分量
-为任意正整数——`nz=1` 时单层体素离散自然表现为恒厚椭圆截面薄片，`nz>1`
-时才逐层解析 z 方向椭球表面，正式研究须通过网格收敛测试确定 cells。
+为任意正整数。注意 `nz=1` **并不**使模型变成某个等价的恒厚柱体/薄片：
+ES>0 时单层网格仍按平滑后的 Ellipsoid 几何填充（边界单元带部分填充权重），
+与连续椭球并非等价替换；当前协议固定 `cells=[40, 20, 4]`（`nz=4`，逐层
+解析 z 方向椭球表面）。cells 为固定离散选择，网格收敛未证明。
 
 ### 物理模型
 
@@ -44,50 +136,49 @@ Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku` 的研究项目
 - `alpha` 主要控制振荡的衰减快慢；
 - `Ku` 主要影响回复力矩，从而改变振荡频率与幅度。
 
-### 多激励设计
+### 多激励设计（目标形态）
 
 同一组 (`alpha`, `Ku`) 施加不同方向的短脉冲，利用磁场方向带来的敏感性差异
-降低两参数间的混淆。Pilot v1 首轮候选仅启用两个激励（A 沿 y、B 沿 z），
-第三激励暂缓（见下文「CoFeB-inspired 合成基准与 Pilot v1 参数选择」）：
+降低两参数间的混淆。模型方法的长远目标是多激励，但**当前协议（Protocol B）
+只含单一 `pulse_A2`（y 向）baseline**；额外激励（如 B 沿 z）留作后续对照
+实验，尚未批准执行。
 
-| 激励 | 脉冲方向 | Pilot v1 状态 |
+| 激励 | 脉冲方向 | 当前状态 |
 | --- | --- | --- |
-| A | y（面内横向） | 启用 |
-| B | z（面外） | 启用 |
+| A | y（面内横向） | 当前协议唯一启用 |
+| B | z（面外） | 后续对照候选，未批准 |
 | C | 待定 | 暂缓 |
 
 研究的核心逆问题：从一条或多条这样的平均磁化轨迹反演 (`alpha`, `Ku`)，再用 MuMax3 正向回代检验预测参数能否重建原始轨迹。
 
-## CoFeB-inspired 合成基准与 Pilot v1 参数选择
+## 历史记录：Pilot v1 与 ES0 哨兵轮（已被 Protocol B 取代）
 
-本节记录 Pilot v1 协议、首轮哨兵实测（轨迹层）与放行决策。除标注「文献事实」
-外，以下数值均为项目选择或实测记录，不是文献结论。
+本节为**历史记录**：Pilot v1 协议选择过程与 ES0 哨兵轮实测数据/结果。
+除标注「文献事实」外，数值均为项目选择或实测记录，不是文献结论。
+本节内容不构成当前协议门槛；当前协议以上文「Protocol B」为准。
 
-### 基准性质与固定候选
+### 基准性质与固定候选（历史沿用至 Protocol B）
 
 - **合成基准，不是复现**：0 K、无热噪声、单一均匀有效介质的
   synthetic CoFeB-inspired benchmark，仅借鉴 CoFeB 的典型量级，
   **不声称精确复现任何具体 CoFeB/GaAs stack**。
-- **固定候选（可冻结）**：`Ms = 1.25e6 A/m`、`Aex = 15e-12 J/m`、
+- **固定候选（可冻结）**：`Ms = 1.25e+6 A/m`、`Aex = 15.0e-12 J/m`、
   各向异性易轴 `+x`、真三轴椭球全直径 `100 × 50 × 2 nm`、
-  `initial_m = +x`；材料抽象与采样坐标（关场后 `t = 0` 重锚定）一并视为协议约定。
+  `initial_m = +x`；材料抽象与采样坐标（关场后 `t = 0` 重锚定）一并视为
+  协议约定。以上候选已被 Protocol B 采纳为固定值。
 - 文献事实（量级参考，非取值来源）：椭球退磁因子见 Osborn (1945,
   DOI 10.1103/PhysRev.67.351)；单畴椭球进动频率见 Kittel (1948,
   DOI 10.1103/PhysRev.73.155)；CoFeB 材料量级可参考 Conca et al.
   (JAP 113, 213909 (2013), DOI 10.1063/1.4808462)。`Ms`/`Aex` 的具体取值
   是本项目对齐这些量级的选择；模拟工具见 MuMax3 论文
   (DOI 10.1063/1.4899186)。
+- 参数主域与 `Ku = 0` control 约定自 Pilot v1 起沿用至今（见「当前协议」）。
 
-### Pilot v1 主域与首轮协议候选
+### ES0 哨兵轮（历史数据/结果，非训练数据）
 
-- 主域：`alpha ∈ [0.004, 0.020]`，在 **log(alpha) 空间**采样；
-  `Ku ∈ [2e3, 3e4] J/m^3`，在**线性空间**采样；`Ku = 0` 仅为物理
-  control，**不进入主域误差统计**。
-- 协议：`cells = 40 × 20 × 4`（`EdgeSmooth = 0`）；脉冲 `10 mT`、`50 ps`；
-  两个 pulse（A 沿 y、B 沿 z）；关场后每 `10 ps` 记录、共 `1001` 点（0..10 ns）。
-
-### 首轮哨兵实测（轨迹层）
-
+- 协议（历史）：`cells = 40 × 20 × 4` 且 **`EdgeSmooth = 0`**；两个 pulse
+  （A 沿 y、B 沿 z），各 `10 mT`、`50 ps`；关场后每 `10 ps` 记录、共
+  `1001` 点（0..10 ns）。
 - 执行环境：MuMax3 3.12、Tesla T10；7 组 × 2 pulses 全部完整，每条轨迹
   `1001` 点（0..10 ns）。此为 `EdgeSmooth=0`/默认 solver 协议的
   **哨兵数据，不是训练数据**。
@@ -95,38 +186,20 @@ Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku` 的研究项目
 - alpha/Ku 分离清晰（轨迹层）：dominant f 随 `Ku = 0/2k/16k/30k J/m^3` 约
   `6.79/7.09/8.69/10.19 GHz`，跨 alpha 不变；e-fold 随
   `alpha = .004/.008944/.020` 约 `1.82–1.95/.84–.85/.36–.40 ns`。
-- pulse B=z 响应幅值与 normalized RMS 可分性约比 A=y 弱 5–6 倍：不严格
-  冗余，但正式增益未证明；第三激励继续暂缓。
-- 关键阻塞：实测频率相对理想连续椭球宏自旋估算**偏高约 2–7%**（低 Ku 偏差
-  最大）；可能来自 ES0 阶梯边界/网格/有限振幅等，**不能据此冻结
-  `40×20×4` + ES0**。
+- pulse B=z 响应幅值与 normalized RMS 可分性约比 A=y 弱 5–6 倍。
+- 历史阻塞（**仅属 ES0 协议，不是当前 Protocol B 的放行门槛**）：实测频率
+  相对理想连续椭球宏自旋估算偏高约 2–7%（低 Ku 偏差最大），可能来自 ES0
+  阶梯边界/网格/有限振幅等，因此当时未冻结 ES0 协议。
 
-### 放行状态与下一步（哨兵轮后更新）
+### 决策与历史方案处置
 
-| 项 | 状态 |
-| --- | --- |
-| CoFeB-inspired 抽象、`Ms`/`Aex`、采样坐标 | 可冻结 |
-| alpha/Ku 候选域、`50 ps` 脉冲、`10 ps × 1001` 记录、A/B 两激励 | 放行到下一阶段 |
-| `Ku = 0` | 仅物理 control，不入主域误差统计 |
-| `cells 40×20×4` + ES0 | 未放行（2–7% 频偏待 QC） |
-| 改 20 ps 采样 / 缩短 10 ns 窗 | 暂不改 |
-| 第三激励；MLP `1024/256/256` | 暂缓 |
-
-下一步顺序：先分析已有 OVF 与低 alpha 尾部，并做最小 EdgeSmooth/网格/
-solver/Relax QC；**之后**才考虑 32 点（建议改为 4 个 log-alpha × 8 个
-linear-Ku 的解释性规则切片，含 Ku=0 controls；正式训练集之后再 Sobol）——
-32 点尚未批准、未执行。MLP 首批先考虑 `64/32/32`，是否扩大由学习曲线
-决定。数值协议（EdgeSmooth/solver/MaxErr/MaxDt/GammaLL/RelaxTorqueThreshold）
-现已经 YAML `numerics` 块显式控制（哨兵轮运行时该控制尚不存在，其
-ES0/默认 solver 记录为历史事实）。**训练/推理仍未实现，不存在任何模型结果。**
-
-批量生成与运行实验配置：`uv run python scripts/generate_dataset.py`，组织为
-`FIXED_CONFIGS × PARAMETERS`：fixed config 携带除 alpha/Ku 外的全部协议
-字段（各套协议的 `dataset_name` 必须互不相同），PARAMETERS 只含 alpha/Ku。
-协议选择阶段用多套 fixed config × 少量压力点做数值/物理 QC；协议冻结后
-只保留单套 fixed config，正式数据集仅 alpha/Ku 变化，协议不同的数据不得
-混用（YAML 写到 `artifacts/generated_configs/<dataset_name>/`，模拟输出
-照常进 `data/raw/<dataset_name>/`）。
+- Pilot v1 的「放行状态/下一步」表、32 点网格扫描方案（4 log-alpha ×
+  8 linear-Ku 切片）与低 alpha 尾部分析计划**均已被 Protocol B 决策取代**：
+  网格扫描停止，当前不计划任何网格扫描；该轮 ES0 数值协议控制尚未存在，
+  其 ES0/默认 solver 记录为历史事实。数值协议（EdgeSmooth/solver/MaxErr/
+  MaxDt/GammaLL/RelaxTorqueThreshold）现由 YAML `numerics` 块显式控制，
+  Protocol B 固定为 ES12/solver 5（固定离散选择，非网格收敛结论）。
+  **训练/推理仍未实现，不存在任何模型结果。**
 
 ## 环境要求
 
@@ -178,13 +251,51 @@ uv run python scripts/run_mumax3_simulation.py --config <validated-experiment.ya
 ```
 
 `--config` 指向一份实验 YAML（模板见
-`configs/experiments/mumax3_simulation.yaml`）。该示例配置当前**所有研究值
-均为 null 占位**：运行前必须先填写并审查正式研究值（`load_config` 会拒绝
-任何仍为 null 的必填研究值）。训练/推理 pipeline 尚未实现。
+`configs/experiments/mumax3_simulation.yaml`）。该模板当前为 Protocol B
+固定值（见上文「当前协议」），**仅 `dataset_name`、`material.alpha`、
+`material.ku_j_per_m3` 三处为 null 占位**：复制模板、填好这三处即可运行
+（`load_config` 会拒绝任何仍为 null 的必填研究值）。注意批量脚本
+`scripts/generate_dataset.py` 不读取此 YAML（其内置 preset 尚未对齐
+Protocol B，见「如何运行」）。训练/推理 pipeline 尚未实现。
 
 YAML 中的指数数值请使用带指数符号的形式（如 `8.0e+5`）或直接写十进制
 （如 `800000.0`）：`8.0e5` 这类不带符号的指数会被 PyYAML 解析为字符串，
 随后被配置校验拒绝。
+
+### 远端批量生成（Windows）
+
+一次多参数组远端执行的可复用流程要点（曾在 Windows + MuMax3 机器完成
+四组两批并行生成；`artifacts/` 下辅助脚本属运行产物，不入库、不作为
+版本化入口）：
+
+1. 每参数组从模板复制一份运行 YAML 到 `artifacts/run_configs/<run>/`，
+   填 `dataset_name`、`material.alpha`、`material.ku_j_per_m3`，经 `load_config` 校验并核对
+   parameter_set_id；远端预检版本/依赖/GPU 与目标 set 目录不存在（不覆盖、
+   不清理）；远端代码与本地不一致时不得上传覆盖源码。
+2. `scripts/generate_dataset.py` 的内置 preset 不自动读取模板；批量执行
+   用现有 CLI，每组独立调用：
+   `uv run python scripts/run_mumax3_simulation.py --config <run.yaml>`。
+3. 脱离 SSH 会话用 CIM `Win32_Process.Create` 拉起 launcher（ASCII 脚本，
+   `$PSScriptRoot` 定位），launcher 内以 `Start-Process` 并行启动每批两组，
+   各自 stdout/stderr 日志、PID 与退出码；上一批结构验收通过后再启动
+   下一批（SSH 会话内直接 `start`/`Start-Process` 可能随会话退出被结束）。
+4. 启动后核对真实进程命令行、config.yaml 快照与原生输出文件；按 25 分钟
+   间隔做有界轮询。失败暂停、保留现场、不自动重试；只按本任务记录的
+   PID 停止。
+5. 验收：equilibrium 与各 pulse 的 run.log 均为 returncode 0、index.csv 每 pulse 一条数据行、
+   trajectory.csv 行数 = sample_count+表头、各 OVF 存在且非空、采样窗 =
+   (sample_count-1)×interval。打包下载核对 SHA256；安全解压不覆盖已有，
+   归档条目反斜杠规范化并拒绝绝对路径与 `..` 逃逸。
+
+注意：PowerShell 5.1 `powershell -File` 不做表达式解析，逗号分隔不会自动
+拆成数组（按标量参数传递）；`Start-Process -ArgumentList` 以空格拼接，
+含空格路径需自行加引号；`-PassThru` 进程建议启动后先取一次 `.Handle`
+固定句柄、`WaitForExit()` 后再读 `.ExitCode`（实测长等待中不取句柄会得到
+空退出码，属单次观察而非普遍保证）。两组并行不保证占满 GPU。SSH 读写
+遵循当前 SSH MCP 通道策略：可匹配只读策略用 read 通道，其余命令
+经批准走 ask，文件传输走 ask（Windows 上传路径写 `/D:/...`）。结构验收
+不等于科学放行：Protocol B 为固定离散 benchmark，网格收敛与真实器件
+有效性未证明。
 
 ## 测试与格式
 
@@ -228,9 +339,11 @@ Git LFS 或独立发布。详见 `data/README.md`。
   模板可解析执行、Relax 产生 equilibrium.ovf、simulation 经固定相对路径
   LoadFile 共享 OVF、原生表头 `# t (s) mx () my () mz ()` 与恰 3 行、parser
   时间重锚定、config.yaml 快照与 index.csv 原子写出；`mumax3 -test` 同轮
-  通过。正式研究参数、
-  最终几何/网格收敛、Relax 收敛阈值/鲁棒性、EdgeSmooth 选择、OVF 物理 QC
-  与批量重复性、正向回代验证仍未进行。
+  通过。部分 QC 已完成：offline vertical slice 测试、执行链 pilot 冒烟、
+  Pilot v1 哨兵轮轨迹层检查（历史 ES0 协议）；正式研究参数已由 Protocol B
+  固定于实验 YAML 模板。**但连续模型网格收敛、Relax 收敛阈值/鲁棒性、
+  EdgeSmooth 选择的系统论证、OVF 物理 QC 与批量可复现性、真实器件有效性
+  及正向回代验证仍未证明。**
 
 ## 目录结构
 
@@ -239,10 +352,13 @@ src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
                                          # + mumax3 vertical slice（config / script / results / pipeline）
 scripts/check_environment.py             # 环境诊断
 scripts/run_mumax3_simulation.py         # MuMax3 模拟 CLI（薄封装）
-scripts/generate_dataset.py              # 生成哨兵实验 YAML 并顺序运行模拟
+scripts/generate_dataset.py              # 生成批量实验 YAML 并顺序运行模拟
+                                         # （内置 preset 仍是旧协议，未对齐
+                                         # Protocol B；运行前须自行对齐 FIXED_CONFIGS）
 configs/base.yaml                        # 通用设置（seed、device=auto）
 configs/experiments/mumax3_simulation.yaml
-                                         # 实验配置模板（研究值当前全 null）
+                                         # 实验配置模板（Protocol B 固定值；
+                                         # 仅 dataset_name/alpha/Ku 三处待填）
 simulations/mumax3/                      # MuMax3 脚本模板（.mx3.in）与说明
 tests/                                   # pytest（无需 GPU/MuMax3）
 data/                                    # 数据（完整数据不入库）
