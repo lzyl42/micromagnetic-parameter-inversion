@@ -85,12 +85,14 @@ alpha/Ku）。**本次文档与模板更新未同步修改该脚本**：其内�
 
 ### 当前状态声明
 
-- 模拟 pipeline（vertical slice）与 CLI 已实现；**训练/推理仍未实现，
-  不存在任何训练模型或模型结果**。
+- 模拟 pipeline（vertical slice）与 CLI 已实现；首版「样本准备 → 训练 →
+  独立评估」工程已实现（见 `train.md`），**但未在正式研究数据上训练，
+  不存在可靠科研结果或研究结论**。
 - 已完成的部分 QC：offline vertical slice 测试（31 passed）、2026-09-02
   test-only pilot 执行链冒烟、Pilot v1 哨兵轮轨迹层检查（历史协议）。
 - **未证明**：连续模型网格收敛、Relax 收敛鲁棒性、EdgeSmooth 选择的
-  系统论证、批量可复现性、OVF/物理级 QC、真实器件有效性、正向回代验证。
+  系统论证、批量可复现性、OVF/物理级 QC、真实器件有效性、正向回代验证、
+  训练侧科研有效性（未在正式研究数据上训练）。
 
 ## 物理模型概述
 
@@ -199,7 +201,8 @@ ES>0 时单层网格仍按平滑后的 Ellipsoid 几何填充（边界单元带�
   其 ES0/默认 solver 记录为历史事实。数值协议（EdgeSmooth/solver/MaxErr/
   MaxDt/GammaLL/RelaxTorqueThreshold）现由 YAML `numerics` 块显式控制，
   Protocol B 固定为 ES12/solver 5（固定离散选择，非网格收敛结论）。
-  **训练/推理仍未实现，不存在任何模型结果。**
+  首版训练/评估工程已实现（见 `train.md`），但未在正式研究数据上训练，
+  不存在可靠科研结果。
 
 ## 环境要求
 
@@ -256,7 +259,8 @@ uv run python scripts/run_mumax3_simulation.py --config <validated-experiment.ya
 `material.ku_j_per_m3` 三处为 null 占位**：复制模板、填好这三处即可运行
 （`load_config` 会拒绝任何仍为 null 的必填研究值）。注意批量脚本
 `scripts/generate_dataset.py` 不读取此 YAML（其内置 preset 尚未对齐
-Protocol B，见「如何运行」）。训练/推理 pipeline 尚未实现。
+Protocol B，见「如何运行」）。训练/评估 pipeline 首版工程已实现（见
+`train.md`），未做正式研究训练。
 
 YAML 中的指数数值请使用带指数符号的形式（如 `8.0e+5`）或直接写十进制
 （如 `800000.0`）：`8.0e5` 这类不带符号的指数会被 PyYAML 解析为字符串，
@@ -321,9 +325,10 @@ uv run pre-commit run --all-files   # 可选，repo-local hooks
 ## 数据政策
 
 完整数据（`data/raw/`、`data/processed/`）、checkpoints、TensorBoard
-runs/cache 不入库；`data/README.md` 与 `data/samples/` 可跟踪；最终
-`results/figures`、`results/tables` 可跟踪。大数据与最佳模型未来走
-Git LFS 或独立发布。详见 `data/README.md`。
+runs/cache 不入库；`data/README.md` 可跟踪，`data/samples/` 在白名单内
+（Git 无法跟踪空目录，当前其下无已跟踪文件）；最终 `results/figures`、
+`results/tables` 可跟踪。大数据与最佳模型未来走 Git LFS 或独立发布。
+详见 `data/README.md`。
 
 ## MuMax3
 
@@ -350,15 +355,22 @@ Git LFS 或独立发布。详见 `data/README.md`。
 ```
 src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
                                          # + mumax3 vertical slice（config / script / results / pipeline）
+                                         # + 训练/评估（training_config / training_data / preprocessing /
+                                         #   models/mlp / training / evaluation）
 scripts/check_environment.py             # 环境诊断
 scripts/run_mumax3_simulation.py         # MuMax3 模拟 CLI（薄封装）
 scripts/generate_dataset.py              # 生成批量实验 YAML 并顺序运行模拟
                                          # （内置 preset 仍是旧协议，未对齐
                                          # Protocol B；运行前须自行对齐 FIXED_CONFIGS）
+scripts/prepare_training_samples.py      # raw → data/samples npz/meta/split（train.md §2）
+scripts/train_mlp.py                     # MLP 训练入口（train.md）
+scripts/evaluate_model.py                # 独立 test 评估入口（train.md）
 configs/base.yaml                        # 通用设置（seed、device=auto）
 configs/experiments/mumax3_simulation.yaml
                                          # 实验配置模板（Protocol B 固定值；
                                          # 仅 dataset_name/alpha/Ku 三处待填）
+configs/training/mlp.yaml                # 训练配置（dataset/run_name 占位待填）
+train.md                                 # 首版训练/评估实现说明
 simulations/mumax3/                      # MuMax3 脚本模板（.mx3.in）与说明
 tests/                                   # pytest（无需 GPU/MuMax3）
 data/                                    # 数据（完整数据不入库）

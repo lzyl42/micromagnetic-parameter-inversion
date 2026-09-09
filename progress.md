@@ -4,7 +4,8 @@
 > benchmark 定义之外的 numerics（EdgeSmooth/solver/MaxErr/MaxDt/GammaLL/
 > RelaxTorqueThreshold）、z/xy 网格、Relax 行为、pulse 设计、recording 逐项
 > 冻结。alpha/Ku 端点本身只验证"稳定可辨识"，不做物理标定。
-> **训练/推理代码目前未实现**——本文档全部内容仅关于 MuMax3 前向数据生成与 QC。
+> 目前首版训练与评估工程已实现；本文档仍仅关于 MuMax3 前向数据生成与
+> QC，详见 `train.md` 与 `training_implementation_log_2026-09-09.md`。
 > 不包含环境安装要求与代码库架构介绍。
 
 ---

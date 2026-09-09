@@ -6,8 +6,12 @@
   阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku`（模型方向：MLP / 1D CNN /
   Temporal Transformer）。项目目标与设计以仓库内 `README.md` 与代码为准。
 - **当前实现状态**：MuMax3 vertical slice 模拟 pipeline 与 CLI 已实现；
-  训练/推理仍未实现。不得虚构或声称训练/推理已实现。可执行入口共两个
-  脚本：`scripts/check_environment.py` 与 `scripts/run_mumax3_simulation.py`。
+  首版「样本准备 → 训练 → 独立评估」工程已实现（见 `train.md`），但未在
+  正式研究数据上训练，不存在可靠科研结果或研究结论。不得虚构或声称已有
+  正式研究训练或可靠科研结论。可执行脚本包括：
+  `scripts/check_environment.py`、`scripts/run_mumax3_simulation.py`、
+  `scripts/generate_dataset.py`、`scripts/prepare_training_samples.py`、
+  `scripts/train_mlp.py`、`scripts/evaluate_model.py`。
 - **工作范围严格限于本仓库**：不得读取/编辑仓库外目录（`external_directory`
   已全局 deny），不引用仓库外研究计划路径；外部资料调研只走官方文档/论文。
 
@@ -48,6 +52,10 @@
   导出；`mumax3_pipeline.py` 负责编排（equilibrium → 各 pulse、原字节
   config.yaml 快照与最终 index.csv 原子写出）。模拟入口：
   `scripts/run_mumax3_simulation.py --config <实验 YAML>`。
+- 训练/评估首版模块（见 `train.md`）：`training_config.py`（严格 YAML
+  加载/校验）、`training_data.py`（npz/dataset_meta/split/Dataset）、
+  `preprocessing.py`、`models/mlp.py`、`training.py`（训练循环/early
+  stopping/ckpt 读写）、`evaluation.py`（独立 test 评估）。
 - 可复用代码放 `src/micromagnetic_parameter_inversion/`；notebook 仅用于探索
   （notebook 纪律：用项目 `.venv` 内核、不提交大数据/checkpoint 输出、不出现
   机器绝对路径）。
@@ -70,8 +78,10 @@
 ## 数据政策
 
 - 完整数据（`data/raw/`、`data/processed/`）、checkpoints、TensorBoard
-  runs/cache 不入库；只跟踪 `data/README.md`、`data/samples/` 与最终
-  `results/figures`、`results/tables`。详见 `data/README.md`。
+  runs/cache 不入库；白名单允许 `data/README.md` 与 `data/samples/` 下的
+  少量样本文件（Git 无法跟踪空目录，当前 `data/samples/` 下无已跟踪
+  文件），以及最终 `results/figures`、`results/tables`。详见
+  `data/README.md`。
 
 ## 协作与执行纪律
 
