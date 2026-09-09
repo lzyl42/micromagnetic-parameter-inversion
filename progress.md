@@ -42,15 +42,20 @@
 - `PARAMETERS: list[dict]` —— 每项仅 `{"alpha": …, "ku_j_per_m3": …}`。
 
 运行 `uv run python scripts/generate_dataset.py` 会对 **每个 fixed config × 每个
-parameter** 组合：构造 YAML → 写入 → 立即顺序运行模拟。任何一组失败即整体停止
-（fail-fast），无 resume/并行/清理。
+parameter** 组合：构造 YAML → 写入 → 启动模拟。脚本内 `MAX_WORKERS = 2`
+为并发上限（可改的正整数，`1` 即串行），有界线程池直接调用
+`mumax3_pipeline.run_parameter_set`，不另起 Python 进程。发生失败：停止
+提交新任务、等运行中的组结束、保留现场并报错；无 resume、无「目录已
+存在即跳过」、无 CLI。控制台日志只有组级进度（时间、组序号、alpha/Ku、
+配置写出、模拟开始、成功/失败与耗时、总进度），不含 Relax 或 pulse
+内部实时进度；各组详细 run.log 仍由原机制写入。
 
 ### 手工操作规则（重要，含踩过的坑）
 - **新增一套协议候选**：在 FIXED_CONFIGS 里手工复制一个完整 entry 并改字段与
   dataset_name。不要写合并/继承逻辑。
 - **向已有 dataset 追加新参数点（如 PL→追加 PH）**：把 `PARAMETERS` **只留新参数**
-  后再运行。若 PARAMETERS 里仍含旧参数，generate_dataset 会先跑旧参数 →
-  pipeline 对已存在目录抛 FileExistsError → 整体停止（本轮在 es8 上因此多跑过一套
+  后再运行。若 PARAMETERS 里仍含已执行参数，pipeline 对已存在目录抛
+  FileExistsError → 按上述失败语义停止（历史：曾在 es8 上因此多跑过一套
   Ku=0，保留为额外数据）。
 - **正式数据生成时**：FIXED_CONFIGS 只保留冻结后的那一套，PARAMETERS 为全量压力点。
 
@@ -79,8 +84,9 @@ uv run python scripts/generate_dataset.py
   字节增长。**无 stdout ≠ 卡死**（mumax 的 log.txt 在退出前保持 0 字节，属正常缓冲）。
 - 判停条件（任一）：单个 equilibrium > 10 min；30 min 无任何产物字节增长；
   DIAGNOSTIC `relax_converged=false`；MaxTorque 超门槛。
-- 中断后：保留目录 → 换 dataset_name（v2/v3…）重跑失败组；同一 dataset 中
-  尚未执行的新参数可用 `run_mumax3_simulation.py --config <已生成的yaml>` 单独补跑。
+- 中断/失败后：保留现场，失败残留须人工检查后再决定处置（不自动删除、
+  不靠换 dataset_name 蒙混）；同一 dataset 中尚未执行的参数点：把
+  `PARAMETERS` 只留这些点后再运行（旧 per-config CLI 单独补跑入口已删除）。
 
 ### 数据回传
 - 必须回传：本次全部有效 `data/raw/cofeb_*` 的**完整目录树**（含所有 .ovf、run.log、
@@ -315,11 +321,16 @@ sentinel（ES0/z4/R10）实测概要（my 基频，10 ns 窗；τ 为 Hilbert �
 与 `configs/experiments/mumax3_simulation.yaml` 一致）× 列表推导式参数点
 `PARAMETERS`（1024 点 Sobol，`alpha = 0.004·5**u` 对数空间、
 `Ku = 2000 + 28000·v` 线性空间）；RNG 接口由旧 `seed=42` 切换为
-`rng=42`，点集相对旧接口已变化。运行即写出 YAML 并顺序启动模拟，无
-CLI/plan/resume，不承诺不覆盖已存在 YAML。
+`rng=42`，点集相对旧接口已变化。运行即写出 YAML 并启动模拟：脚本内
+`MAX_WORKERS = 2` 并发（可改，`1` 为串行），有界线程池直接调用
+`mumax3_pipeline.run_parameter_set`；失败停止新提交、等运行中结束、
+保留现场并报错；无 CLI/plan/resume，不承诺不覆盖已存在 YAML。旧单份
+配置 CLI `scripts/run_mumax3_simulation.py` 已删除。
 
 - 无任何轨迹数据、未准备正式样本、未训练、无科研结果。
 - 批量模拟执行待用户另行呈计划批准。
+- 本轮仅文档对齐（与脚本/测试改动并行进行）：未实际模拟；GPU 两并发
+  性能未实测，不声称占满显卡。
 - 四角数据（`cofeb_protocol_b_four_corners_test_v1`）不属于本数据集，
   与其关系留待研究决策。
 

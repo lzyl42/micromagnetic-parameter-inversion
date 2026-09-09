@@ -5,13 +5,14 @@
 - 本仓库是 MuMax3 多激励磁化动力学研究项目：基于多激励磁化动力学反演 Gilbert
   阻尼系数 `alpha` 与单轴磁各向异性常数 `Ku`（模型方向：MLP / 1D CNN /
   Temporal Transformer）。项目目标与设计以仓库内 `README.md` 与代码为准。
-- **当前实现状态**：MuMax3 vertical slice 模拟 pipeline 与 CLI 已实现；
+- **当前实现状态**：MuMax3 vertical slice 模拟 pipeline 已实现（单份配置
+  CLI 已删除，`scripts/generate_dataset.py` 为唯一模拟执行入口）；
   首版「样本准备 → 训练 → 独立评估」工程已实现（见 `train.md`），但未在
   正式研究数据上训练，不存在可靠科研结果或研究结论。不得虚构或声称已有
   正式研究训练或可靠科研结论。可执行脚本包括：
-  `scripts/check_environment.py`、`scripts/run_mumax3_simulation.py`、
-  `scripts/generate_dataset.py`、`scripts/prepare_training_samples.py`、
-  `scripts/train_mlp.py`、`scripts/evaluate_model.py`。
+  `scripts/check_environment.py`、`scripts/generate_dataset.py`、
+  `scripts/prepare_training_samples.py`、`scripts/train_mlp.py`、
+  `scripts/evaluate_model.py`。
 - **工作范围严格限于本仓库**：不得读取/编辑仓库外目录（`external_directory`
   已全局 deny），不引用仓库外研究计划路径；外部资料调研只走官方文档/论文。
 
@@ -50,8 +51,10 @@
   YAML 加载/校验（拒绝 null 研究值、mT→T 边界转换）；`mumax3_script.py`
   负责 `.mx3.in` 模板渲染；`mumax3_results.py` 负责 table 解析与轨迹 CSV
   导出；`mumax3_pipeline.py` 负责编排（equilibrium → 各 pulse、原字节
-  config.yaml 快照与最终 index.csv 原子写出）。模拟入口：
-  `scripts/run_mumax3_simulation.py --config <实验 YAML>`。
+  config.yaml 快照与最终 index.csv 原子写出）。模拟执行入口：
+  `scripts/generate_dataset.py`（内置固定配置与参数点，直接运行即批量
+  模拟；脚本内 `MAX_WORKERS=2` 并发、`1` 为串行；单点/补跑改
+  `PARAMETERS` 只留尚未执行目标）。
 - 训练/评估首版模块（见 `train.md`）：`training_config.py`（严格 YAML
   加载/校验）、`training_data.py`（npz/dataset_meta/split/Dataset）、
   `preprocessing.py`、`models/mlp.py`、`training.py`（训练循环/early
