@@ -302,3 +302,26 @@ sentinel（ES0/z4/R10）实测概要（my 基频，10 ns 窗；τ 为 Hilbert �
 
 *最后更新：本文件生成于 z16 预设时点；F1–F8 均未执行或仅部分执行（F1 待运行）。
 训练/推理未实现。*
+
+---
+
+## I. 阶段A当前状态（2026-09-09）
+
+> A–H 节为历史记录：其 F1–F8 网格扫描计划已被 2026-09 的 Protocol B
+> 决策取代（见 README「当前协议：Protocol B」），不作为当前路线。
+
+**当前状态（仅代码层面，零模拟零训练）**：`scripts/generate_dataset.py`
+为简单原始函数——内置 Protocol B 固定字段（`FIXED_CONFIGS`，固定字段
+与 `configs/experiments/mumax3_simulation.yaml` 一致）× 列表推导式参数点
+`PARAMETERS`（1024 点 Sobol，`alpha = 0.004·5**u` 对数空间、
+`Ku = 2000 + 28000·v` 线性空间）；RNG 接口由旧 `seed=42` 切换为
+`rng=42`，点集相对旧接口已变化。运行即写出 YAML 并顺序启动模拟，无
+CLI/plan/resume，不承诺不覆盖已存在 YAML。
+
+- 无任何轨迹数据、未准备正式样本、未训练、无科研结果。
+- 批量模拟执行待用户另行呈计划批准。
+- 四角数据（`cofeb_protocol_b_four_corners_test_v1`）不属于本数据集，
+  与其关系留待研究决策。
+
+*本节更新于 2026-09-09：此前一轮引入的冻结清单（CSV/MD）与专用训练
+配置 YAML 已按用户决定删除。*

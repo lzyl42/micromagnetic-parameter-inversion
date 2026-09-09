@@ -74,14 +74,16 @@ benchmark（仅借鉴 CoFeB 典型量级，不声称复现任何具体 stack）�
 uv run python scripts/run_mumax3_simulation.py --config <filled.yaml>
 ```
 
-批量脚本 `scripts/generate_dataset.py` **不读取**这份 YAML：它使用自己
-内置的 `FIXED_CONFIGS × PARAMETERS`（`FIXED_CONFIGS` 携带除 alpha/Ku 外
-的全部固定字段，其 `material` 不含 alpha/ku 键；`PARAMETERS` 只含
-alpha/Ku）。**本次文档与模板更新未同步修改该脚本**：其内置 preset 仍是
-旧协议，直接运行不会得到 Protocol B 数据；运行批量脚本前须自行把上表
-固定字段逐项对齐进 `FIXED_CONFIGS`。输出 `artifacts/generated_configs/
-<dataset_name>/`、`data/raw/<dataset_name>/` 与 `index.csv` 只是目录/
-索引结构约定，不构成科学正确性证明。
+批量脚本 `scripts/generate_dataset.py` 已对齐本协议：固定字段内置在
+`FIXED_CONFIGS`（与上表一致），参数点内置在 `PARAMETERS`——1024 点
+Sobol（`scipy.stats.qmc.Sobol(d=2, scramble=True, rng=42).random_base2(m=10)`，
+`alpha = 0.004·5**u` 取对数空间、`Ku = 2000 + 28000·v` 取线性空间），
+不读取任何外部清单/模板文件。直接运行即对每个 FIXED_CONFIGS ×
+PARAMETERS 组合写出实验 YAML（`artifacts/generated_configs/<dataset_name>/`）
+并**立即顺序启动 MuMax3 模拟**（fail-fast，无 CLI 参数、无 plan/resume，
+不承诺不覆盖已存在的 YAML；已有 raw set 目录会被 pipeline 拒绝）。
+**批量模拟执行前必须单独获得用户批准**；截至 2026-09-09 该数据集尚未
+运行任何模拟，输出目录与 `index.csv` 只是约定结构，不构成科学正确性证明。
 
 ### 当前状态声明
 
@@ -258,8 +260,8 @@ uv run python scripts/run_mumax3_simulation.py --config <validated-experiment.ya
 固定值（见上文「当前协议」），**仅 `dataset_name`、`material.alpha`、
 `material.ku_j_per_m3` 三处为 null 占位**：复制模板、填好这三处即可运行
 （`load_config` 会拒绝任何仍为 null 的必填研究值）。注意批量脚本
-`scripts/generate_dataset.py` 不读取此 YAML（其内置 preset 尚未对齐
-Protocol B，见「如何运行」）。训练/评估 pipeline 首版工程已实现（见
+`scripts/generate_dataset.py` 不读取此 YAML，其内置固定配置已对齐
+Protocol B（见「如何运行」）。训练/评估 pipeline 首版工程已实现（见
 `train.md`），未做正式研究训练。
 
 YAML 中的指数数值请使用带指数符号的形式（如 `8.0e+5`）或直接写十进制
@@ -360,8 +362,8 @@ src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
 scripts/check_environment.py             # 环境诊断
 scripts/run_mumax3_simulation.py         # MuMax3 模拟 CLI（薄封装）
 scripts/generate_dataset.py              # 生成批量实验 YAML 并顺序运行模拟
-                                         # （内置 preset 仍是旧协议，未对齐
-                                         # Protocol B；运行前须自行对齐 FIXED_CONFIGS）
+                                         # （内置 Protocol B 固定配置与 Sobol 1024 点；
+                                         # 直接运行会启动模拟，执行前须获批准）
 scripts/prepare_training_samples.py      # raw → data/samples npz/meta/split（train.md §2）
 scripts/train_mlp.py                     # MLP 训练入口（train.md）
 scripts/evaluate_model.py                # 独立 test 评估入口（train.md）
