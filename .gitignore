@@ -20,6 +20,11 @@ data/raw/
 data/processed/
 !data/README.md
 !data/samples/
+# Generated prepared-sample dataset directories (train.md §2) stay untracked;
+# the samples/ directory itself remains tracked so the layout stays visible.
+# Curated small sample files, if ever needed, are added explicitly (git add -f).
+data/samples/*
+!data/samples/README.md
 
 # Outputs: artifacts (default output root), checkpoints, TensorBoard runs/cache
 artifacts/

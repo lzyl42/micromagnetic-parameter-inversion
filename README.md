@@ -67,30 +67,38 @@ benchmark（仅借鉴 CoFeB 典型量级，不声称复现任何具体 stack）�
 
 ### 如何运行
 
-单份配置 CLI：复制 `configs/experiments/mumax3_simulation.yaml`，填好
-`dataset_name`、`material.alpha`、`material.ku_j_per_m3` 三处，即可运行：
-
-```bash
-uv run python scripts/run_mumax3_simulation.py --config <filled.yaml>
-```
-
-批量脚本 `scripts/generate_dataset.py` **不读取**这份 YAML：它使用自己
-内置的 `FIXED_CONFIGS × PARAMETERS`（`FIXED_CONFIGS` 携带除 alpha/Ku 外
-的全部固定字段，其 `material` 不含 alpha/ku 键；`PARAMETERS` 只含
-alpha/Ku）。**本次文档与模板更新未同步修改该脚本**：其内置 preset 仍是
-旧协议，直接运行不会得到 Protocol B 数据；运行批量脚本前须自行把上表
-固定字段逐项对齐进 `FIXED_CONFIGS`。输出 `artifacts/generated_configs/
-<dataset_name>/`、`data/raw/<dataset_name>/` 与 `index.csv` 只是目录/
-索引结构约定，不构成科学正确性证明。
+模拟执行唯一入口是批量脚本 `scripts/generate_dataset.py`（旧的单份配置
+CLI `scripts/run_mumax3_simulation.py` 已删除）。固定字段内置在
+`FIXED_CONFIGS`（与上表一致），参数点内置在 `PARAMETERS`——1024 点
+Sobol（`scipy.stats.qmc.Sobol(d=2, scramble=True, rng=42).random_base2(m=10)`，
+`alpha = 0.004·5**u` 取对数空间、`Ku = 2000 + 28000·v` 取线性空间），
+不读取任何外部清单/模板文件。直接运行即对每个 FIXED_CONFIGS ×
+PARAMETERS 组合写出实验 YAML（`artifacts/generated_configs/<dataset_name>/`）
+并启动模拟：脚本内 `MAX_WORKERS = 2` 为并发上限（可改的正整数，`1` 即
+串行），有界线程池直接调用 `mumax3_pipeline.run_parameter_set`，不另起
+Python 进程；底层 MuMax3 仍经 `external.py` 以 subprocess 参数列表调用。
+控制台日志只有组级进度（时间、组序号、alpha/Ku、配置写出、模拟开始、
+成功/失败与耗时、总进度），不含 Relax 或 pulse 内部实时进度；各组详细
+run.log 仍由原机制写入。无 CLI 参数、无 plan/resume、无「目录已存在即
+跳过」；不承诺不覆盖已生成的 YAML，已有 raw set 目录仍被 pipeline 拒绝。
+发生失败：停止提交新任务、等运行中的组结束、保留现场并报错。单点或
+补跑：改 `PARAMETERS` 只留尚未执行的目标后运行；失败残留须人工检查后
+处置，不要自动删除或换 dataset_name 蒙混。**批量模拟执行前必须单独获得
+用户批准**；截至 2026-09-09 该数据集尚未运行任何模拟，两并发在 GPU 上
+的性能未实测（不声称占满显卡），输出目录与 `index.csv` 只是约定结构，
+不构成科学正确性证明。
 
 ### 当前状态声明
 
-- 模拟 pipeline（vertical slice）与 CLI 已实现；**训练/推理仍未实现，
-  不存在任何训练模型或模型结果**。
+- 模拟 pipeline（vertical slice）已实现（批量脚本 `generate_dataset.py`
+  为唯一模拟执行入口，单份配置 CLI 已删除）；首版「样本准备 → 训练 →
+  独立评估」工程已实现（见 `train.md`），**但未在正式研究数据上训练，
+  不存在可靠科研结果或研究结论**。
 - 已完成的部分 QC：offline vertical slice 测试（31 passed）、2026-09-02
   test-only pilot 执行链冒烟、Pilot v1 哨兵轮轨迹层检查（历史协议）。
 - **未证明**：连续模型网格收敛、Relax 收敛鲁棒性、EdgeSmooth 选择的
-  系统论证、批量可复现性、OVF/物理级 QC、真实器件有效性、正向回代验证。
+  系统论证、批量可复现性、OVF/物理级 QC、真实器件有效性、正向回代验证、
+  训练侧科研有效性（未在正式研究数据上训练）。
 
 ## 物理模型概述
 
@@ -199,7 +207,8 @@ ES>0 时单层网格仍按平滑后的 Ellipsoid 几何填充（边界单元带�
   其 ES0/默认 solver 记录为历史事实。数值协议（EdgeSmooth/solver/MaxErr/
   MaxDt/GammaLL/RelaxTorqueThreshold）现由 YAML `numerics` 块显式控制，
   Protocol B 固定为 ES12/solver 5（固定离散选择，非网格收敛结论）。
-  **训练/推理仍未实现，不存在任何模型结果。**
+  首版训练/评估工程已实现（见 `train.md`），但未在正式研究数据上训练，
+  不存在可靠科研结果。
 
 ## 环境要求
 
@@ -244,37 +253,39 @@ uv run python scripts/check_environment.py
 计算设备、MuMax3 可用性、数据/输出路径。无 GPU 或无 MuMax3 时仍以 0 退出，
 但会明确报告状态。
 
-## MuMax3 模拟 CLI
+## MuMax3 模拟入口
 
-```bash
-uv run python scripts/run_mumax3_simulation.py --config <validated-experiment.yaml>
-```
+单份配置 CLI `scripts/run_mumax3_simulation.py --config <yaml>` 已删除，
+不再可用；模拟执行唯一入口是 `scripts/generate_dataset.py`（见上文
+「如何运行」）。单点或补跑不走命令行：改脚本内 `PARAMETERS` 只留尚未
+执行的目标后运行。
 
-`--config` 指向一份实验 YAML（模板见
-`configs/experiments/mumax3_simulation.yaml`）。该模板当前为 Protocol B
-固定值（见上文「当前协议」），**仅 `dataset_name`、`material.alpha`、
-`material.ku_j_per_m3` 三处为 null 占位**：复制模板、填好这三处即可运行
-（`load_config` 会拒绝任何仍为 null 的必填研究值）。注意批量脚本
-`scripts/generate_dataset.py` 不读取此 YAML（其内置 preset 尚未对齐
-Protocol B，见「如何运行」）。训练/推理 pipeline 尚未实现。
+`configs/experiments/mumax3_simulation.yaml` 仍是 Protocol B 固定协议的
+模板与 schema 参照（**仅 `dataset_name`、`material.alpha`、
+`material.ku_j_per_m3` 三处为 null 占位**；`load_config` 会拒绝任何仍为
+null 的必填研究值）。批量脚本不读取此 YAML，其内置固定配置已对齐
+Protocol B。训练/评估 pipeline 首版工程已实现（见 `train.md`），未做
+正式研究训练。
 
 YAML 中的指数数值请使用带指数符号的形式（如 `8.0e+5`）或直接写十进制
 （如 `800000.0`）：`8.0e5` 这类不带符号的指数会被 PyYAML 解析为字符串，
 随后被配置校验拒绝。
 
-### 远端批量生成（Windows）
+### 远端批量生成（Windows，历史记录）
 
-一次多参数组远端执行的可复用流程要点（曾在 Windows + MuMax3 机器完成
-四组两批并行生成；`artifacts/` 下辅助脚本属运行产物，不入库、不作为
-版本化入口）：
+本节记录旧 per-config CLI 时代的远端流程，曾在 Windows + MuMax3 机器
+完成四组两批并行生成（`artifacts/` 下辅助脚本属运行产物，不入库、不作为
+版本化入口）。**该流程依赖的 `scripts/run_mumax3_simulation.py --config`
+入口已删除，整节不再适用于当前执行**；当前批量执行唯一入口是
+`scripts/generate_dataset.py`（内置 `MAX_WORKERS` 并发，见「如何运行」）。
+以下 launcher/SSH 机制仅作历史参考：
 
-1. 每参数组从模板复制一份运行 YAML 到 `artifacts/run_configs/<run>/`，
+1. （旧流程）每参数组从模板复制一份运行 YAML 到 `artifacts/run_configs/<run>/`，
    填 `dataset_name`、`material.alpha`、`material.ku_j_per_m3`，经 `load_config` 校验并核对
    parameter_set_id；远端预检版本/依赖/GPU 与目标 set 目录不存在（不覆盖、
    不清理）；远端代码与本地不一致时不得上传覆盖源码。
-2. `scripts/generate_dataset.py` 的内置 preset 不自动读取模板；批量执行
-   用现有 CLI，每组独立调用：
-   `uv run python scripts/run_mumax3_simulation.py --config <run.yaml>`。
+2. （旧流程）每组独立调用已删除的 per-config CLI——该命令不再存在，
+   不得执行；当前没有等价的单组命令行入口。
 3. 脱离 SSH 会话用 CIM `Win32_Process.Create` 拉起 launcher（ASCII 脚本，
    `$PSScriptRoot` 定位），launcher 内以 `Start-Process` 并行启动每批两组，
    各自 stdout/stderr 日志、PID 与退出码；上一批结构验收通过后再启动
@@ -321,9 +332,10 @@ uv run pre-commit run --all-files   # 可选，repo-local hooks
 ## 数据政策
 
 完整数据（`data/raw/`、`data/processed/`）、checkpoints、TensorBoard
-runs/cache 不入库；`data/README.md` 与 `data/samples/` 可跟踪；最终
-`results/figures`、`results/tables` 可跟踪。大数据与最佳模型未来走
-Git LFS 或独立发布。详见 `data/README.md`。
+runs/cache 不入库；`data/README.md` 可跟踪，`data/samples/` 在白名单内
+（Git 无法跟踪空目录，当前其下无已跟踪文件）；最终 `results/figures`、
+`results/tables` 可跟踪。大数据与最佳模型未来走 Git LFS 或独立发布。
+详见 `data/README.md`。
 
 ## MuMax3
 
@@ -350,15 +362,22 @@ Git LFS 或独立发布。详见 `data/README.md`。
 ```
 src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
                                          # + mumax3 vertical slice（config / script / results / pipeline）
+                                         # + 训练/评估（training_config / training_data / preprocessing /
+                                         #   models/mlp / training / evaluation）
 scripts/check_environment.py             # 环境诊断
-scripts/run_mumax3_simulation.py         # MuMax3 模拟 CLI（薄封装）
-scripts/generate_dataset.py              # 生成批量实验 YAML 并顺序运行模拟
-                                         # （内置 preset 仍是旧协议，未对齐
-                                         # Protocol B；运行前须自行对齐 FIXED_CONFIGS）
+scripts/generate_dataset.py              # 唯一模拟执行入口：生成批量实验 YAML 并
+                                         # 运行模拟（内置 Protocol B 固定配置与 Sobol
+                                         # 1024 点；MAX_WORKERS=2 并发，1=串行；
+                                         # 直接运行会启动模拟，执行前须获批准）
+scripts/prepare_training_samples.py      # raw → data/samples npz/meta/split（train.md §2）
+scripts/train_mlp.py                     # MLP 训练入口（train.md）
+scripts/evaluate_model.py                # 独立 test 评估入口（train.md）
 configs/base.yaml                        # 通用设置（seed、device=auto）
 configs/experiments/mumax3_simulation.yaml
                                          # 实验配置模板（Protocol B 固定值；
                                          # 仅 dataset_name/alpha/Ku 三处待填）
+configs/training/mlp.yaml                # 训练配置（dataset/run_name 占位待填）
+train.md                                 # 首版训练/评估实现说明
 simulations/mumax3/                      # MuMax3 脚本模板（.mx3.in）与说明
 tests/                                   # pytest（无需 GPU/MuMax3）
 data/                                    # 数据（完整数据不入库）
