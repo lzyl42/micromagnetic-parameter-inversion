@@ -1,4 +1,4 @@
-"""MuMax3 .mx3 模板渲染（vertical slice）。
+"""MuMax3 .mx3 模板渲染。
 
 模板原件位于 simulations/mumax3/（equilibrium.mx3.in 与 simulation.mx3.in），
 只读；模板文件的读取、渲染结果的写盘与哈希归 mumax3_pipeline 管。

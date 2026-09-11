@@ -182,7 +182,7 @@ def test_missing_config_file(tmp_path: Path) -> None:
 
 
 def test_config_mapping_roundtrip_and_bad_schema(tmp_path: Path) -> None:
-    """config_to_mapping/from_mapping 属主往返：与 YAML 加载一致、坏 schema 拒绝。"""
+    """config_to_mapping/from_mapping 往返：与 YAML 加载一致、坏 schema 拒绝。"""
     config = load_config(_write(tmp_path, _MINIMAL))
     mapping = training_config.config_to_mapping(config)
     rebuilt = training_config.config_from_mapping(mapping)

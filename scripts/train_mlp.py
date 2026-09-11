@@ -1,28 +1,13 @@
 #!/usr/bin/env python3
-"""train_mlp.py —— 配置 → 样本/划分 → 训练 → artifacts（已实现）。
+"""train_mlp.py —— 配置 → 样本/划分 → 训练 → artifacts。
 
-主流程（train.md 第 3–8 节）：
-
-1. ``training_config.load_config(--config)``；
-2. 输出目录预检：``output_dir`` 为 null 时取
-   ``output_root()/training/mlp/<dataset_name>/<run_name>``，**已存在则
-   拒绝启动**（FileExistsError，先于一切训练动作）；
-3. ``training_data.load_dataset_meta`` + ``load_split`` + 分别构造
-   train/val ``TrajectoryDataset``（**不构造 test**：test 不参与任何调参
-   与模型选择，也无需加载）；
-4. 契约冻结：自首个 train 样本建立 ``InputContract``，并交叉校验全部
-   train/val 成员（T/pulse 顺序/t_s 一致）；
-5. ``preprocessing.fit(train_set, ...)``：仅 train 组拟合；
-6. split 副本 raw 字节快照与 SHA、dataset_meta 路径+SHA（锚点
-   ``data_root()/samples/<dataset_name>/``，relpath 恒为
-   "dataset_meta.yaml"）→ ``training.train_model(..., dataset_meta_sha256=...)``
-   （播种/模型构造/DataLoader/循环/early stopping 均在其内部）；
-7. run 目录创建（在训练成功之后；此后失败可留部分产物，不事务），按序
-   写出：split.yaml 副本（raw 字节）、config_resolved.yaml（可被
-   ``load_config`` 重新加载的快照）、preprocessing.yaml（mean/effective
-   scale/零方差清单）、metrics.json（history + best val；**不含 test
-   评估**；``allow_nan=False``）、best.pt/final.pt（各写一次，
-   ``save_checkpoint`` 拒绝覆盖）。
+输出目录（``config.output_dir`` 或
+``output_root()/training/mlp/<dataset_name>/<run_name>``）已存在则先于
+一切训练动作拒绝覆盖。仅构造 train/val（test 不参与调参/模型选择，也不
+加载）；契约自首个 train 样本冻结并交叉校验；split 副本按 raw 字节保存并
+与 ckpt 绑定 SHA；预处理仅 train 组拟合。训练成功后按序写出 split.yaml
+副本、config_resolved.yaml、preprocessing.yaml、metrics.json（不含 test
+评估）、best.pt/final.pt（拒绝覆盖）。
 
 错误处理：已知契约错误（ConfigError/DataError/PreprocessingError/
 FileExistsError/TrainingError）向 stderr 友好输出并返回退出码 2；其余
@@ -107,7 +92,7 @@ def _metrics_payload(
 
 
 def _write_metrics(path: Path, result: training.TrainingResult) -> None:
-    """metrics.json：逐 epoch history + best val + 停止状态（JSON 有限值）。"""
+    """写出 metrics.json（payload 见 ``_metrics_payload``）。"""
     payload = _metrics_payload(
         result.history,
         result.best_checkpoint.best_val_loss,
@@ -135,7 +120,7 @@ def _write_failure_metrics(path: Path, error: training.TrainingError) -> None:
 
 
 def run(config_path: Path) -> Path:
-    """执行完整训练流程，返回 run 目录（产物见模块 docstring 第 7 步）。"""
+    """执行完整训练流程，返回 run 目录。"""
     config = load_config(config_path)
     samples_dir = paths.data_root() / "samples" / config.dataset_name
     if not samples_dir.is_dir():

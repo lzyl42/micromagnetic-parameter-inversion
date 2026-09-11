@@ -1,6 +1,6 @@
 """preprocessing 单元测试：CPU 合成数据 + stub Dataset（不触真实 raw）。
 
-覆盖（train.md 第 9 节第 5 条）：仅 train 拟合（val 统计不影响输出）、
+覆盖：仅 train 拟合（val 统计不影响输出）、
 ``[P,1,3]`` 广播形状、x/y 零方差位置除数取 1、标签变换-逆变换往返
 （identity/logalpha）、logalpha 遇 alpha <= 0 报错（无静默裁剪）、
 非有限值报错、batch 广播与 float32 输出、logalpha float64 统一精度
@@ -453,7 +453,7 @@ def test_state_comparison_is_identity_based() -> None:
 
 
 def test_state_mapping_roundtrip_and_bad_schema() -> None:
-    """state_to_mapping/from_mapping 属主往返：字段保真、坏 schema 拒绝。"""
+    """state_to_mapping/from_mapping 往返：字段保真、坏 schema 拒绝。"""
     x = _make_x(3, 2, 5, seed=40)
     y = _make_y(3, seed=40)
     state = fit(_tensor_dataset(x, y), PreprocessingConfig(), LabelConfig())

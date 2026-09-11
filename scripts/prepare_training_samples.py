@@ -1,24 +1,11 @@
 #!/usr/bin/env python3
-"""prepare_training_samples.py —— raw → data/samples/<dataset>/（已实现）。
+"""prepare_training_samples.py —— raw → data/samples/<dataset>/。
 
-主流程（train.md 第 2 节）：
-
-1. ``training_config.load_config(--config)``（占位 dataset_name/run_name
-   拒绝）；
-2. 解析 ``--parameter-set-ids``：显式 psid 列表或 ``all``（只展开所选
-   dataset 目录下的子目录，绝不跨 dataset 扫描；``all`` 不可与显式 psid
-   混用）；
-3. ``training_data.load_protocol_snapshot``：所选 psid 升序取首的
-   config.yaml（safe_load，兼容缺 numerics 旧快照），冻结协议摘要与
-   pulse 顺序；
-4. 逐组 ``training_data.read_parameter_group``：index.csv 固定列齐全、
-   pulse 集合与冻结顺序恰一致、标签同组一致；trajectory.csv 按列序读取
-   （usecols=(2,3,4) ndmin=2 → [T,3]；首条 t_s ndmin=1）；
-5. ``training_data.make_split``（写样本前判定；min_per_split 不足报错）；
-6. ``training_data.write_prepared_dataset``：写前预检拒绝覆盖，按序写出
-   （无事务，失败可能留部分产物）。
-
-数据政策见 ``data/README.md``：生成的 dataset 子目录不入 Git。
+读取训练 YAML 配置（占位 dataset_name/run_name 拒绝），解析
+``--parameter-set-ids``：显式 psid 列表或 ``all``（只展开所选 dataset
+目录下的子目录，绝不跨 dataset 扫描；两者不可混用）。随后经
+training_data 冻结协议快照、逐组读取样本、判定 split、写前预检拒绝覆盖
+（无事务）。生成的 dataset 子目录不入 Git。
 
 schema 数值/字段违反抛 ConfigError，布局/成员违反抛 DataError；main 捕获
 后向 stderr 输出友好错误并返回退出码 2，不向用户抛 traceback。
@@ -72,7 +59,6 @@ def _resolve_psids(
     raw_dataset_dir: pathlib.Path, parameter_set_ids: Sequence[str]
 ) -> tuple[str, ...]:
     """解析所选 psid：显式列表或 ``all``（仅单 dataset 目录内展开）。"""
-    # Sequence 兼容：list/tuple 均可（如 ("all",)），仅当唯一元素为 "all"。
     if len(parameter_set_ids) == 1 and parameter_set_ids[0] == "all":
         if not raw_dataset_dir.is_dir():
             _fail_dir(raw_dataset_dir)

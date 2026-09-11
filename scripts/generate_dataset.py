@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """generate_dataset.py —— 生成实验 YAML 并有界并发运行 MuMax3 模拟。
 
-当前预设：Protocol B（固定离散 benchmark，训练优先）Sobol 1024 主域点集
+当前预设：Protocol B（固定离散 benchmark）Sobol 1024 主域点集
 （dataset cofeb_protocol_b_a2_sobol1024_v1：ES12、40×20×4、10 ps × 401 点
-= 关场后 0..4 ns、仅 pulse_A2）。运行前必须确认目标输出 set 目录
+= 关场后 0..4 ns、仅 pulse_A2），定义见 FIXED_CONFIGS / PARAMETERS。
+运行前必须确认目标输出 set 目录
 data/raw/cofeb_protocol_b_a2_sobol1024_v1/<parameter_set_id>/ 不存在；
 若存在则不得运行（pipeline 会 FileExistsError 拒绝，不得删除已有数据）。
 
-FIXED_CONFIGS（所有固定协议字段）× PARAMETERS（仅 alpha/Ku）的每个组合
-构造一份实验 YAML（schema 严格同 configs/experiments/mumax3_simulation.yaml），
-写入 artifacts/generated_configs/<dataset_name>/，每份写完立即经
-mumax3_pipeline.run_parameter_set 运行。并发由脚本常量 MAX_WORKERS 唯一控制
-（无 CLI/外部文件/框架）：每套 fixed config 内任意时刻最多 MAX_WORKERS 个
-已提交未结束的模拟在途，不一次排队全部参数；每组原始顺序编号（即文件名
-序号）在调度前确定，与完成顺序无关。任一任务（配置写出或模拟）失败后停
-止补充提交，等待已启动任务自然结束并记录其结果，最后上抛第一个原异常
-（fail-fast）；Ctrl-C 同样停止补充提交并等待已提交任务自然结束（不强杀
-子进程）并重抛。不提供 resume/清理/跳过已有目录。PARAMETERS 使用固定
-seed 生成 1024 个 Sobol 点（见其定义），不读取外部参数文件；协议不同的
-数据不得混用。
+每个 fixed config × parameter 组合构造一份实验 YAML（schema 严格同
+configs/experiments/mumax3_simulation.yaml），写入
+artifacts/generated_configs/<dataset_name>/ 并立即运行。并发由脚本常量
+MAX_WORKERS 唯一控制，不一次排队全部参数；失败或 Ctrl-C 时停止补充提交
+并等待已提交任务自然结束（不强杀子进程），最后上抛第一个原异常。不提供
+resume/清理/跳过已有目录。PARAMETERS 使用固定 seed 生成，不读取外部
+参数文件；协议不同的数据不得混用。
 """
 
 from __future__ import annotations
@@ -41,10 +37,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MAX_WORKERS = 2
 
 # Protocol B（固定离散 benchmark）唯一 fixed config：与
-# configs/experiments/mumax3_simulation.yaml 固定字段一致——ES12、
-# 40×20×4、10 ps × 401 点（关场后 0..4 ns）、RT=-1、仅 pulse_A2
-# （y 2 mT、50 ps）。若改变任一固定协议（material/geometry/recording/
-# numerics/pulses），必须更换 dataset_name；协议不同的数据不得混用。
+# configs/experiments/mumax3_simulation.yaml 固定字段一致。若改变任一
+# 固定协议（material/geometry/recording/numerics/pulses），必须更换
+# dataset_name；协议不同的数据不得混用。
 FIXED_CONFIGS: list[dict[str, Any]] = [
     {
         "dataset_name": "cofeb_protocol_b_a2_sobol1024_v1",
@@ -124,7 +119,7 @@ def _task_prefix(dataset_name: str, index: int, total: int, parameter: dict[str,
 
 
 def _write_config_yaml(config: dict[str, Any], config_path: Path) -> None:
-    """按原语义写出 YAML（目标已存在则覆盖，不声称不覆盖）。"""
+    """写出实验 YAML（目标已存在则覆盖）。"""
     config_path.write_text(
         yaml.safe_dump(config, sort_keys=False, default_flow_style=False, allow_unicode=True),
         encoding="utf-8",
@@ -173,19 +168,15 @@ def _run_parameter_group(
 ) -> None:
     """单套 fixed config：写出编号稳定的 YAML 并有界并发运行模拟。
 
-    调度前先确定每组的原始顺序编号（即文件名序号，与完成顺序无关）；
-    任意时刻最多 max_workers 个已提交未结束 future，不一次排队全部参数。
-    wait(FIRST_COMPLETED) 收割整个 done 批次：先记录全部结果（含失败），
-    再决定是否补充提交；发现失败后停止补充提交，等待已启动任务自然结束
-    并记录其结果，最后上抛第一个原异常。Ctrl-C 同样停止补充提交并等待
-    已提交任务自然结束（不强杀子进程），随后重抛。
+    任意时刻最多 max_workers 个已提交未结束 future；先记录整批 done 结果
+    再决定是否补充提交，失败后停止补充提交并上抛第一个原异常；Ctrl-C
+    同样不强杀已提交子进程。
     """
     dataset_name = str(fixed_config["dataset_name"])
     output_dir = PROJECT_ROOT / "artifacts" / "generated_configs" / dataset_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 调度前确定原始顺序编号与文件名（编号稳定，与完成顺序无关）。
-    # 任务元组：(日志前缀, 完整配置 dict, 配置文件路径)。
     tasks: list[tuple[str, dict[str, Any], Path]] = []
     for index, parameter in enumerate(parameters, start=1):
         config = build_config(fixed_config, parameter)

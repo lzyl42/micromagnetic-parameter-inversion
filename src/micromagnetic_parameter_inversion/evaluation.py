@@ -1,6 +1,6 @@
 """评估：run/ckpt 定位的常规 evaluate 与物理单位指标。
 
-对应 ``train.md`` 第 8 节。定位：``--run <run_dir> [--checkpoint]``；
+定位：``--run <run_dir> [--checkpoint]``；
 网络结构、预处理与 label 变换**全部从 checkpoint 恢复**（不经当前 YAML）。
 绑定校验（任一不符即 EvaluationError）：
 
@@ -20,7 +20,7 @@
   一定对应实际加载的模型，而非仅默认路径；跨 run 相同 split 合法，仅
   如实记录来源，不引入新限制。
 
-指标（物理单位，alpha/Ku 分别报告）：首版仅 MAE/RMSE；主域排除 Ku = 0
+指标（物理单位，alpha/Ku 分别报告）：仅 MAE/RMSE；主域排除 Ku = 0
 的 control，control 单独报告、不计入主域；每个子集输出样本数 ``n``，
 空子集（n=0）指标为 ``None``（JSON null，非 NaN/0）；不重切凑指标。
 预测/输入含非有限值 → 明确拒绝（PreprocessingError/EvaluationError），
@@ -166,23 +166,11 @@ def run_evaluation(
         checkpoint_path: 缺省 ``<run_dir>/best.pt``；无论显式与否，ckpt 的
             split SHA 必须与 run 内副本一致。
 
-    编排：
-
-    1. ``ckpt = training.load_checkpoint(...)``；结构/预处理/label 全部
-       来自 ckpt（不经当前 YAML）；
-    2. run 内 split 副本 sha256 与 ``ckpt.split_sha256`` 核对；随后生成
-       ``EvaluationProvenance``（实际 ckpt 路径、文件字节 sha256 一次
-       读取、来自该 ckpt 的 split_sha256）；
-    3. dataset_meta 按锚点 + relpath 定位（防逃逸）+ SHA 核对 + dataset_name
-       交叉核对；
-    4. ``training_data.load_split(samples_dir, meta, split_path=副本)``：
-       同一加载边界校验（npz 存在性针对真实样本目录）；
-    5. test 成员按 ``ckpt.config.training.batch_size`` 分批：CPU、eval、
-       ``no_grad`` 前向，``load_sample`` 契约校验（x 形状/pulse_ids 顺序/
-       t_s），``inverse_transform_y`` 还原物理单位；
-    6. 按 meta psid→Ku 表划分主域/control（Ku = 0 → control），各自
-       ``compute_subset_metrics``；
-    7. 组装 ``PredictionRow`` 序列（写盘由 ``evaluate_model.py`` 编排）。
+    全部结构/预处理/label 来自 ckpt（不经当前 YAML）；run 内 split 副本
+    SHA 与 ``ckpt.split_sha256`` 核对后生成 provenance；dataset_meta 按
+    锚点 + relpath 定位（防逃逸）并核对 SHA 与 dataset_name；test 成员经
+    ``load_sample`` 契约校验、分批 CPU 推理、``inverse_transform_y`` 还原
+    物理单位，按 meta 的 psid→Ku 表划分主域/control。
 
     Raises:
         EvaluationError: split/meta 绑定不一致、路径逃逸、指标输入非法。

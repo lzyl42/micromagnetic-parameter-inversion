@@ -1,4 +1,4 @@
-"""MuMax3 vertical slice 公共行为测试：全部离线，不依赖 GPU/MuMax3、不写 data/raw。
+"""MuMax3 公共行为测试：全部离线，不依赖 GPU/MuMax3、不写 data/raw。
 
 MuMax3 执行经 monkeypatch 替换 pipeline 调用点伪造；数值均为 test-only 占位值。
 """

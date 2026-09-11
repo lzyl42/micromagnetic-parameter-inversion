@@ -1,21 +1,11 @@
-"""MuMax3 模拟流水线（vertical slice）。
+"""MuMax3 模拟流水线：参数组校验 → equilibrium（一次）→ 各 pulse simulation → 轨迹/索引导出。
 
-最小调用流（run_parameter_set）：
-1. load_config(config_path)          # 严格校验并将脉冲 mT 换算为运行时 T
-2. parameter_set_id(alpha, ku)       # 参数组身份
-3. 固定输出目录 data/raw/<dataset_name>/<parameter_set_id>/（唯一性 =
-   (dataset_name, parameter_set_id)；已存在 -> FileExistsError，不隐式
-   覆盖）。dataset_name 是固定协议（材料/几何/模拟）的命名约定，协议
-   改变必须换新 dataset_name；parameter_set_id 只代表 alpha+Ku（split
-   key）。首版不自动验证同 dataset 跨 parameter_set_id 的协议一致性
-4. 按原字节快照 config.yaml，渲染/执行 equilibrium 模板一次，产出供
-   全部 pulse 共享的 equilibrium.ovf
-5. 对每个 pulse：从同一平衡态渲染/执行 simulation 模板
-   -> parse_table -> write_trajectory_csv
-6. 全部 pulse 成功后，原子写出 index.csv（每 pulse 一行）
+dataset_name 是固定协议（材料/几何/模拟）的命名约定，协议改变必须换新
+dataset_name；parameter_set_id 只代表 alpha+Ku（split key）。不自动验证
+同 dataset 跨 parameter_set_id 的协议一致性。
 
 任一步失败直接上抛并停止；部分运行文件供人工诊断（临时 index.csv.tmp
-会清除），不做自动恢复。MuMax3 一律经现有 external.run_mumax3 调用
+会清除），不做自动恢复。MuMax3 一律经 external.run_mumax3 调用
 （subprocess 参数列表，禁止 shell=True）。
 """
 
@@ -40,7 +30,7 @@ _TEMPLATE_DIR: Final[Path] = PROJECT_ROOT / "simulations" / "mumax3"
 _EQUILIBRIUM_TEMPLATE_NAME: Final[str] = "equilibrium.mx3.in"
 _SIMULATION_TEMPLATE_NAME: Final[str] = "simulation.mx3.in"
 
-# 输出布局固定名（README「输出布局」；不进 YAML）。
+# 输出布局固定名（不进 YAML）。
 _CONFIG_SNAPSHOT_NAME: Final[str] = "config.yaml"
 _INDEX_NAME: Final[str] = "index.csv"
 _RUN_LOG_NAME: Final[str] = "run.log"
@@ -60,7 +50,7 @@ _SIMULATION_REQUIRED_OUTPUTS: Final[tuple[str, ...]] = (
     "m_tfinal.ovf",
 )
 
-# index.csv 固定最小字段（README 契约）。
+# index.csv 固定最小字段。
 _INDEX_FIELDS: Final[tuple[str, ...]] = (
     "parameter_set_id",
     "pulse_id",
@@ -148,16 +138,14 @@ def _write_index_csv(index_path: Path, rows: list[list[str]]) -> None:
 def run_parameter_set(config_path: Path) -> Path:
     """执行一个 parameter set 的全部模拟，返回其输出目录。
 
-    布局与契约见模块 docstring 与 simulations/mumax3/README.md：输出根为
-    ``data_root()/raw/<dataset_name>/<parameter_set_id>/``，已存在抛
-    ``FileExistsError``；equilibrium 渲染/执行仅一次；每 pulse 独立工作
-    目录；index.csv 仅在全部 pulse 成功后原子写出（此前不存在）。
+    输出根为 ``data_root()/raw/<dataset_name>/<parameter_set_id>/``，
+    已存在抛 ``FileExistsError``；equilibrium 仅执行一次；每 pulse 独立
+    工作目录；index.csv 仅在全部 pulse 成功后原子写出。
     """
-    # 1-2. 配置校验与参数组身份。
     config = load_config(config_path)
     set_id = parameter_set_id(config.material.alpha, config.material.ku_j_per_m3)
 
-    # 3. 固定输出目录；已存在即拒绝（不隐式覆盖、不清理失败现场）。
+    # 已存在即拒绝（不隐式覆盖、不清理失败现场）。
     out_dir = data_root() / "raw" / config.dataset_name / set_id
     if out_dir.exists():
         raise FileExistsError(f"输出目录已存在，拒绝覆盖: {out_dir}")
@@ -177,7 +165,7 @@ def run_parameter_set(config_path: Path) -> Path:
     # 配置快照：按原字节复制，不重排、不改写。
     shutil.copyfile(config_path, out_dir / _CONFIG_SNAPSHOT_NAME)
 
-    # 4. equilibrium 只渲染/执行一次，产出供全部 pulse 共享的 equilibrium.ovf。
+    # equilibrium 只渲染/执行一次，产出供全部 pulse 共享的 equilibrium.ovf。
     _write_text_deterministic(
         equilibrium_dir / _EQUILIBRIUM_SCRIPT_NAME,
         render_equilibrium_script(config, equilibrium_template),
@@ -185,8 +173,7 @@ def run_parameter_set(config_path: Path) -> Path:
     _run_and_log(equilibrium_dir, _EQUILIBRIUM_SCRIPT_NAME)
     _require_output_files(equilibrium_out_dir, _EQUILIBRIUM_REQUIRED_OUTPUTS, "equilibrium 运行")
 
-    # 5. 每 pulse 独立工作目录：渲染/执行 simulation 模板 -> parse_table
-    #    -> write_trajectory_csv；index 行在此收集，pulse 顺序与配置一致。
+    # 每 pulse 独立工作目录；index 行在此收集，pulse 顺序与配置一致。
     index_rows: list[list[str]] = []
     for pulse in config.pulses:
         pulse_dir = runs_dir / pulse.pulse_id
@@ -225,6 +212,6 @@ def run_parameter_set(config_path: Path) -> Path:
             ]
         )
 
-    # 6. 全部 pulse 成功后原子写出最终 index.csv；失败现场保留供诊断。
+    # 全部 pulse 成功后原子写出最终 index.csv；失败现场保留供诊断。
     _write_index_csv(out_dir / _INDEX_NAME, index_rows)
     return out_dir

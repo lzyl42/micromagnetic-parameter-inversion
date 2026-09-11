@@ -1,8 +1,8 @@
-"""MuMax3 模拟配置：frozen dataclass、YAML 加载与派生量（vertical slice）。
+"""MuMax3 模拟配置：frozen dataclass、YAML 加载与派生量。
 
 一份 YAML = 一个 (alpha, Ku) parameter set 的多脉冲模拟输入；研究数值一律
 来自 configs/experiments/*.yaml，本模块不携带任何默认数值。load_config 是
-唯一校验与单位换算边界，之后流程假定配置合法，不重复设计防御体系。
+唯一校验与单位换算边界，之后流程假定配置合法，不重复防御。
 """
 
 from __future__ import annotations
@@ -240,16 +240,14 @@ def load_config(path: Path) -> SimulationConfig:
     """读取 YAML、执行唯一入口校验并构造 SimulationConfig。
 
     校验边界（此后流程假定配置合法，不重复防御）：所有层级严格 schema，
-    拒绝缺失/未知字段、null、bool 冒充数值、非有限值；尺寸/Ms/Aex/
-    duration/sample interval 须为正数，cells/sample_count 须为正整数，
-    alpha 与 b_ext_amplitude_mT 须为非负数，Ku 只须有限（可 0/负）；
-    numerics 块：edge_smooth 须为非负整数（允许 0），solver 须为正整数，
-    max_err/max_dt_s/gamma_ll_rad_per_t_s 须为正数，
-    relax_torque_threshold_t 只须有限（允许 -1 保留官方默认收敛判据）；
-    三维向量须恰 3 个有限分量，anisotropy_axis/initial_m/direction 还须为
-    单位向量（范数容差 1e-6）；pulses 非空且 pulse_id 唯一；
-    dataset_name/pulse_id 为安全单路径段。单位边界：b_ext_amplitude_mT
-    在此乘 1e-3 存为运行时 T，mT 不进入运行时模型。
+    拒绝缺失/未知字段、null、bool 冒充数值与非有限值；正数/非负数/正
+    整数/非负整数按字段语义分别约束（Ku 与 relax_torque_threshold_t 只须
+    有限，允许 0/负与 -1）；三维向量须恰 3 个有限分量，
+    anisotropy_axis/initial_m/direction 须为单位向量（范数容差 1e-6）；
+    pulses 非空且 pulse_id 唯一；dataset_name/pulse_id 为安全单路径段。
+
+    单位边界：b_ext_amplitude_mT 在此乘 1e-3 存为运行时 T，mT 不进入
+    运行时模型。
     """
     try:
         raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
@@ -360,8 +358,7 @@ def derive_cell_size_m(geometry: GeometryConfig) -> Vector3:
 def parameter_set_id(alpha: float, ku_j_per_m3: float) -> str:
     """由 (alpha, Ku) 生成参数组身份；数据集 split 的唯一分组键。
 
-    输入先经有限数值校验；canonical UTF-8 文本为两者的 ``.17g`` 规范文本，
-    返回其 SHA-256 摘要的前 16 个小写十六进制字符；仅依赖 alpha 与 Ku。
+    ``.17g`` 规范文本的 SHA-256 前 16 位小写十六进制；仅依赖 alpha 与 Ku。
     """
     _require_finite(alpha, "alpha")
     _require_finite(ku_j_per_m3, "ku_j_per_m3")

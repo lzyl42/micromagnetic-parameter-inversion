@@ -10,7 +10,7 @@
 // MaxErr/MaxDt/GammaLL/RelaxTorqueThreshold）由 YAML numerics 块显式注入；
 // 诊断（geom.ovf 快照与 DIAGNOSTIC stdout 行）进入原生输出目录与 run.log；
 // 其收敛/QC 验证仍待完成，完成前不得用于正式科研数据。
-// 物理假设见 simulations/mumax3/README.md：0 K、单一均匀材料、扁椭球薄纳
+// 物理假设见仓库根 README.md：0 K、单一均匀材料、扁椭球薄纳
 // 米磁体、demag 开启、开放边界无 PBC、无 DMI、无 STT、无静态偏置场。
 // =============================================================================
 

@@ -1,7 +1,6 @@
 """输入/标签预处理：仅 train 组拟合的统计状态与变换。
 
-对应 ``train.md`` 第 4 节。核心语义（transform 与 ckpt/preprocessing.yaml
-序列化必须按同一语义读写）：
+核心语义（transform 与 ckpt/preprocessing.yaml 序列化必须按同一语义读写）：
 
 - 输入标准化仅对 train 组沿样本维与时间轴聚合 → 每 pulse 位置、每磁化
   分量的 mean/std，形状 ``[P, 1, 3]``，广播作用于 ``[P, T, 3]`` 或
@@ -243,7 +242,7 @@ def fit(
             非正或样本间不一致；y 形状非 ``[2]``；x/y 含非有限值；
             logalpha 遇 alpha <= 0；eps/transform 配置非法。
 
-    实现说明：逐样本流式累计——时间轴内先两遍法求分块 (mean, M2)，再按
+    实现：逐样本流式累计，时间轴内先两遍法求分块 (mean, M2)，再按
     Chan et al. 并行公式合并进全局 float64 累计量（总体 std，ddof=0，
     数值稳定），不 stack 整个数据集。
     """

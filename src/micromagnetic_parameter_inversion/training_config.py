@@ -1,14 +1,12 @@
-"""训练/评估实验配置：frozen dataclass + 严格 YAML 加载/校验（已实现）。
+"""训练/评估实验配置：frozen dataclass + 严格 YAML 加载/校验。
 
-与 ``train.md`` 第 7 节 ``configs/training/mlp.yaml`` 字段一一对应；``split``
-块仅被 prepare 脚本使用。``load_config`` 是唯一校验边界：所有层级严格
-schema（拒绝未知/缺失字段），dataset_name/run_name 必填、须为安全单路径
-段且不得保留占位符；零值（weight_decay=0、min_delta=0）合法。校验通过后
-流程假定配置合法，不重复防御。
+字段与 ``configs/training/mlp.yaml`` 一一对应；``split`` 块仅被 prepare
+脚本使用。``load_config`` 是唯一校验边界：所有层级严格 schema（拒绝
+未知/缺失字段），dataset_name/run_name 必填、须为安全单路径段且不得保留
+占位符；零值（weight_decay=0、min_delta=0）合法，校验通过后流程假定配置
+合法。
 
-校验 helper（``_fail``/``_require_*``/``_UniqueKeyLoader``）自
-``mumax3_config`` 复用，保持同一严格风格与错误类型（ConfigError）；
-schema 违反统一抛 ConfigError。
+校验 helper 自 ``mumax3_config`` 复用，schema 违反统一抛 ConfigError。
 
 依赖方向：本模块为叶子（标准库 + yaml + mumax3_config 校验器）；被
 training_data / preprocessing / training / evaluation 单向引用。
@@ -45,7 +43,7 @@ CKPT_FORMAT_VERSION = 1
 
 type LabelTransform = Literal["identity", "logalpha"]
 
-# 激活函数在 ckpt 中显式留档（模型结构显式字段）；首版固定 ReLU。
+# 激活函数在 ckpt 中显式留档（模型结构显式字段）；固定 ReLU。
 type ActivationName = Literal["relu"]
 
 _TOP_LEVEL_KEYS = frozenset(
@@ -360,14 +358,12 @@ def _parse_output_dir(root: dict[Any, Any]) -> str | None:
 def load_config(path: Path) -> ExperimentConfig:
     """读取 YAML、执行唯一入口校验并构造 ExperimentConfig。
 
-    校验边界（此后流程假定配置合法）：所有层级严格 schema（未知字段一律
-    拒绝，重复 YAML 键拒绝）；dataset_name/run_name 必填、安全单路径段、
-    不得保留占位符；data.pulse_order 为 null 或无重复 pulse_id 列表；
-    hidden_dims 正整数；label.transform 取值合法；std_eps/learning_rate/
-    batch_size/max_epochs/patience 为正，weight_decay/min_delta 非负
-    （0 合法）；device ∈ {auto,cpu,cuda}（语义同 runtime.select_device）；
-    ratios 非负有限且和为 1（容差 1e-9）；min_per_split 非负整数；
-    output_dir 为 null 或非空字符串。可选节缺省时使用 dataclass 默认值。
+    校验边界（此后流程假定配置合法）：所有层级严格 schema（未知字段与
+    重复 YAML 键拒绝）；dataset_name/run_name 必填、安全单路径段、不得
+    保留占位符；device ∈ {auto,cpu,cuda}（语义同
+    runtime.select_device）；ratios 非负有限且和为 1（容差 1e-9）；
+    weight_decay/min_delta/min_per_split 允许 0；可选节缺省时使用
+    dataclass 默认值。
 
     Raises:
         ConfigError: 消息含字段路径（如 training.batch_size）。
@@ -403,7 +399,7 @@ def load_config(path: Path) -> ExperimentConfig:
 
 
 def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
-    """ExperimentConfig → 嵌套纯字典（本模块拥有的唯一映射 schema）。
+    """ExperimentConfig → 嵌套纯字典（本模块维护的映射 schema）。
 
     形状与 ``configs/training/mlp.yaml`` 一致（可被 ``load_config`` 重新
     加载），也作为 ckpt ``config`` 副本的落盘形态；容器均为
@@ -463,8 +459,8 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
     """嵌套纯字典 → ExperimentConfig（ckpt ``config`` 副本重建的唯一入口）。
 
     与 ``config_to_mapping`` 对称；缺省节/键回退 dataclass 默认值（ckpt
-    副本由本模块写出，总是完整）。YAML 严格加载仍走 ``load_config``
-    （占位符/ratios 求和等校验属 YAML 边界，不在本函数重复）。
+    副本总是完整）。YAML 严格加载仍走 ``load_config``（占位符/ratios
+    求和等校验属 YAML 边界，不在此重复）。
 
     Raises:
         ConfigError: 非映射、缺失 dataset_name/run_name、节非映射或字段

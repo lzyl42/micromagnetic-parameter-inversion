@@ -13,18 +13,13 @@ venv/
 # Environment files (secrets / machine-specific)
 .env
 .env.*
-!.env.example
 
-# Full datasets never enter Git; only data/README.md and data/samples/ are tracked
+# Full datasets and generated samples never enter Git
 data/raw/
 data/processed/
-!data/README.md
-!data/samples/
-# Generated prepared-sample dataset directories (train.md §2) stay untracked;
-# the samples/ directory itself remains tracked so the layout stays visible.
-# Curated small sample files, if ever needed, are added explicitly (git add -f).
+# Generated prepared-sample dataset directories stay untracked; curated small
+# files, if ever needed, are added explicitly with `git add -f`.
 data/samples/*
-!data/samples/README.md
 
 # Outputs: artifacts (default output root), checkpoints, TensorBoard runs/cache
 artifacts/
@@ -33,7 +28,9 @@ runs/
 tensorboard/
 *.log
 
-# Results policy: final figures/tables are tracked (see results/figures, results/tables)
+# Local exploratory notebooks and results (kept out of the public repository)
+/notebooks/
+/results/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -52,4 +49,7 @@ htmlcov/
 Thumbs.db
 
 # IDE
-.vscode/*.log
+/.vscode/
+
+# Local AI tooling configuration (kept out of the public repository)
+/.opencode/

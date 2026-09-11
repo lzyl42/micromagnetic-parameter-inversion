@@ -1,23 +1,16 @@
 """训练循环与 checkpoint 读写。
 
-对应 ``train.md`` 第 5/8 节。职责边界：
-
-- seed 入口：``train_model`` 在**模型构造之前**调用 ``set_seed``（训练 seed
-  唯一归 train_model 管）；DataLoader shuffle 使用显式 seeded
-  ``torch.Generator``（``make_data_generator``）。
-- 训练：Adam + 标准化标签空间 MSE（按样本数加权聚合）；batch 在 CPU 上
-  经 preprocessing 变换为 float32 numpy 再送 device；``num_workers=0``；
-  非有限 loss/grad/pred 立即停止且不保存坏权重（best/final 只含完成
-  epoch 的权重）；early stopping 使用独立 reference（仅当改善 >
-  ``min_delta`` 才更新），与绝对 best（严格更低即更新）分开。
-- checkpoint：``save_checkpoint`` 落盘字典仅含 Python primitives/list/dict
-  + CPU Tensor（无 dataclass/numpy 对象），同名文件拒绝覆盖；
-  ``load_checkpoint`` 以 ``torch.load(weights_only=True, map_location="cpu")``
-  显式安全读取，校验格式版本与关键字段/契约形状后重建 dataclass（config
-  嵌套重建不经临时文件）。
-- 数据流：``train_model`` 返回 ``TrainingResult``（best/final checkpoint +
-  逐 epoch history）；best.pt/final.pt/metrics.json 的磁盘写出由
-  ``train_mlp.py`` 编排，checkpoint 读写仅在本模块。
+- seed：``train_model`` 在模型构造之前调用 ``set_seed``；DataLoader
+  shuffle 使用显式 seeded ``torch.Generator``。
+- 训练：Adam + 标准化标签空间 MSE（按样本数加权）；非有限
+  loss/grad/pred 立即停止且不保存坏权重（best/final 只含完成 epoch 的
+  权重）；early stopping 使用独立 reference（仅当改善 > ``min_delta``
+  才更新），与绝对 best（严格更低即更新）分开。
+- checkpoint：落盘仅 Python primitives/list/dict + CPU Tensor，同名文件
+  拒绝覆盖；``load_checkpoint`` 以 ``weights_only=True`` 安全读取，校验
+  格式版本与关键字段/契约形状后重建 dataclass。
+- 数据流：``train_model`` 返回 ``TrainingResult``；best.pt/final.pt/
+  metrics.json 的磁盘写出由 ``train_mlp.py`` 编排。
 
 依赖方向：training_config / training_data / preprocessing / runtime →
 （本模块）→ evaluation；本模块禁止导入 evaluation（评估侧反向调用
@@ -58,14 +51,14 @@ from micromagnetic_parameter_inversion.training_data import (
     TrajectoryDataset,
 )
 
-# ckpt_format_version 取 training_config.CKPT_FORMAT_VERSION（train.md 第 8 节）。
+# ckpt_format_version 取 training_config.CKPT_FORMAT_VERSION。
 type StateDict = Mapping[str, Tensor]
 
 # 停止原因：正常上限 / 早停 / 数值失败（ckpt 格式版本不变；停止元数据仅
 # 存于 TrainingResult 与 metrics.json，不进 ckpt）。
 type StopReason = Literal["max_epochs", "early_stopping", "numerical_failure"]
 
-_ACTIVATIONS = ("relu",)  # 首版固定 ReLU（Checkpoint.activation 显式留档）
+_ACTIVATIONS = ("relu",)  # 固定 ReLU（Checkpoint.activation 显式留档）
 _N_OUTPUTS = 2  # 标准化标签列数 (alpha, ku_j_per_m3)
 
 
@@ -86,11 +79,11 @@ class TrainingError(RuntimeError):
 
 @dataclass(frozen=True)
 class EpochMetrics:
-    """单个 epoch 的标准化 MSE 记录（metrics.json「逐 epoch train/val MSE」）。
+    """单个 epoch 的标准化 MSE 记录（metrics.json history 来源）。
 
-    ``train_loss`` 是该 epoch 内**在线累计**的 batch 损失按样本数加权平均
-    （训练进行到 epoch 结束时的累计值）；``val_loss`` 为整体验证集加权
-    MSE。二者均处于标准化标签空间。
+    ``train_loss`` 为该 epoch 内**在线累计**的 batch 损失按样本数加权平均
+    （到 epoch 结束时的累计值）；``val_loss`` 为整体验证集加权 MSE；二者
+    均处于标准化标签空间。
     """
 
     epoch: int  # 从 1 计
@@ -114,7 +107,7 @@ class Checkpoint:
     ckpt_format_version: int  # 写出时的 schema 版本
     model_state_dict: StateDict  # 模型权重（磁盘形态为 CPU Tensor 字典）
     hidden_dims: tuple[int, ...]  # 模型结构显式字段（不只藏在 config 副本里）
-    activation: ActivationName  # 激活函数显式留档（首版固定 "relu"）
+    activation: ActivationName  # 激活函数显式留档（固定 "relu"）
     contract: InputContract  # 输入契约：pulse 顺序、T、分量序、t_s
     preprocessing: (
         PreprocessingState  # 预处理状态：x [P,1,3] mean、effective scale、label、y 统计量
@@ -319,7 +312,7 @@ def train_model(
     dataset_meta_relpath: str = "dataset_meta.yaml",
     dataset_meta_sha256: str | None = None,
 ) -> TrainingResult:
-    """训练主流程（train.md 第 8 节）。
+    """训练主流程。
 
     Args:
         config: 实验配置（seed/device/超参/early stopping）。
@@ -331,14 +324,10 @@ def train_model(
             meta 路径（默认 "dataset_meta.yaml"）。
         dataset_meta_sha256: dataset_meta 实际文件指纹；None → 记 ""。
 
-    编排：``set_seed``（先于模型构造）→ ``build_model`` →
-    ``runtime.select_device`` → DataLoader（train shuffle=True +
-    seeded generator；num_workers=0）→ Adam → 逐 epoch
-    ``_train_one_epoch`` + ``run_validation`` → best（绝对最低，严格小于
-    才更新，CPU clone）与 early stopping（独立 reference，仅改善 >
-    min_delta 才更新）分开推进 → 非有限 loss/grad/pred/聚合立即停止且不
-    保存坏权重（原因记入 ``stop_reason``/``stop_epoch``/``detail``，不吞
-    掉）→ 返回 ``TrainingResult``（磁盘写出由 ``train_mlp.py`` 编排）。
+    ``set_seed`` 先于模型构造；best（绝对最低，严格小于才更新）与 early
+    stopping reference（仅改善 > min_delta 才更新）分开推进；非有限
+    loss/grad/pred/聚合立即停止且不保存坏权重，原因记入
+    ``stop_reason``/``stop_epoch``/``detail``。
 
     Raises:
         TrainingError: 首个 epoch 即因数值失败停止（无可保存权重）；
@@ -567,8 +556,8 @@ def _contract_from_dict(raw: Any, path: Path) -> InputContract:
 
 
 def _preprocessing_from_dict(raw: Any, n_pulse: int, path: Path) -> PreprocessingState:
-    """ckpt 预处理状态重建：委托 preprocessing.state_from_mapping（属主），
-    并与契约 P 交叉校验；PreprocessingError 在 ckpt 边界包裹为 TrainingError。
+    """ckpt 预处理状态重建：委托 preprocessing.state_from_mapping，并与契约
+    P 交叉校验；PreprocessingError 在 ckpt 边界包裹为 TrainingError。
     """
     try:
         state = preprocessing.state_from_mapping(raw)
@@ -582,9 +571,8 @@ def _preprocessing_from_dict(raw: Any, n_pulse: int, path: Path) -> Preprocessin
 
 
 def _config_from_dict(raw: Any, path: Path) -> ExperimentConfig:
-    """ckpt 配置副本重建：委托 training_config.config_from_mapping（属主）；
-    ConfigError 在 ckpt 边界包裹为 TrainingError（不反向依赖 evaluation，
-    也不在 training 重复映射 schema）。
+    """ckpt 配置副本重建：委托 training_config.config_from_mapping，在此
+    包裹 ConfigError → TrainingError（不反向依赖 evaluation）。
     """
     try:
         return training_config.config_from_mapping(raw)

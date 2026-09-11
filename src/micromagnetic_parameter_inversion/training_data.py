@@ -1,6 +1,6 @@
-"""训练样本数据层：npz schema、协议快照、split 与 Dataset（已实现）。
+"""训练样本数据层：npz schema、协议快照、split 与 Dataset。
 
-对应 ``train.md`` 第 2/3/4 节。核心契约：
+核心契约：
 
 - npz schema（每参数组一个 ``<psid>.npz``）：``x: float32 [P, T, 3]``（按
   冻结 pulse 顺序 stack，通道序 mx,my,mz）、``y: float32 [2]``（alpha,
@@ -72,7 +72,7 @@ from micromagnetic_parameter_inversion.mumax3_config import (
 )
 from micromagnetic_parameter_inversion.training_config import SplitConfig, SplitRatios
 
-# npz 数组 dtype 契约（train.md 第 2 节第 6 条）。
+# npz 数组 dtype 契约。
 X_DTYPE = "float32"  # x: [P, T, 3]，原始时域轨迹，通道序 (mx, my, mz)
 Y_DTYPE = "float32"  # y: [2] = (alpha, ku_j_per_m3)，原始物理单位
 T_S_DTYPE = "float64"  # t_s: [T]，实际时间网格（取自该组首条轨迹时间列）
@@ -521,7 +521,7 @@ def _load_trajectory(
 
 
 def make_split(psids: Sequence[str], config: SplitConfig) -> SplitDefinition:
-    """确定性划分（train.md 第 3 节）：最大余数法，tie 固定 train→val→test。
+    """确定性划分：最大余数法，tie 固定 train→val→test。
 
     步骤：psid 去重升序 → ``np.random.default_rng(seed).permutation`` 打乱
     → 各组先取 ``floor(n·ratio)``，剩余名额按小数余数降序逐个 +1（余数并列

@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""evaluate_model.py —— run/ckpt 定位的常规 evaluate（已实现）。
+"""evaluate_model.py —— run/ckpt 定位的常规 evaluate。
 
 ``--run`` 定位训练 run，``--checkpoint`` 可选（缺省 ``<run>/best.pt``；
 无论显式与否，ckpt 必须与 run 内 split 副本 SHA 绑定一致）；不要求提供
 当前训练 config，结构/预处理/label 全部从 checkpoint 恢复。
 
-主流程：
-
-1. 预检 ``<run>/test_metrics.json`` 与 ``<run>/test_predictions.csv``
-   不存在（不覆盖旧评估，先于一切计算）；
-2. ``evaluation.run_evaluation(run_dir, checkpoint_path)`` →
-   ``(EvaluationReport, rows)``（纯计算）；
-3. 复核预检后按序写出：test_metrics.json（report 序列化：
-   ``main``/``control`` + ``provenance``（实际加载 ckpt 的路径/文件
-   sha256/来自该 ckpt 的 split_sha256），``allow_nan=False``）、
-   test_predictions.csv（``export_test_predictions``，LF、每 psid 一行、
-   拒绝覆盖）。
+写出 test_metrics.json（main/control + provenance：实际加载 ckpt 的
+路径/文件 sha256/来自该 ckpt 的 split_sha256）与 test_predictions.csv
+（``export_test_predictions``，LF、每 psid 一行）；产物已存在则先于一切
+计算拒绝覆盖（写出前复核 TOCTOU）。
 
 错误处理：已知契约错误（EvaluationError/DataError/PreprocessingError/
 TrainingError/ConfigError/FileExistsError/FileNotFoundError）向 stderr

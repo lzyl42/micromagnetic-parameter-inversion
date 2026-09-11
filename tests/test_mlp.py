@@ -1,6 +1,6 @@
 """models.mlp 单元测试：CPU 合成张量，最小 forward/backward 验证。
 
-覆盖（train.md 第 9 节第 6 条）：``[N,P,T,3]`` 展平 ``D = P*T*3``、输出
+覆盖：``[N,P,T,3]`` 展平 ``D = P*T*3``、输出
 ``[N,2]`` 且 batch 维保留、hidden_dims 配置生效、构造/前向形状校验、
 参数梯度有限、``input_shape``/``hidden_dims`` 字段保留（checkpoint
 结构字段来源）与 state_dict 往返一致。

@@ -1,23 +1,12 @@
 """MLP 反演回归模型。
 
-输入契约（对齐 ``train.md`` 第 5 节「模型与优化」）：
+输入契约 ``input_shape = (P, T, 3)``：单样本为某参数组全部 pulse 的原始
+时域轨迹，batch 形状 ``[N, P, T, 3]``（P 个 pulse、T 个时间步、3 个磁化
+分量 mx/my/mz）。不做每 pulse 切分、不做手工统计特征、不做降采样。
 
-- ``input_shape = (P, T, 3)``：单个训练样本为某参数组全部 pulse 的原始
-  时域轨迹 ``x[P, T, 3]``，其中 ``P`` 为 pulse 数量、``T`` 为每条轨迹的
-  时间步数、``3`` 为磁化分量 (mx, my, mz)。不做每 pulse 切分、不做手工
-  统计特征、不做降采样。
-- 一个 batch 的形状为 ``[N, P, T, 3]``（``N`` 为参数组级样本数）。
-
-模型结构：
-
-1. ``nn.Flatten(start_dim=1)``：从 ``dim=1`` 起展平、保留 batch 维，
-   ``[N, P, T, 3] → [N, D]``，其中 ``D = P * T * 3``；
-2. 按 ``hidden_dims``（默认 ``(64, 32, 32)``）逐层堆叠 ``Linear → ReLU``；
-3. 末层 ``Linear → 2``：线性输出，无激活、无约束。
-
-输出语义：形状 ``[N, 2]``，两列分别对应 ``alpha`` 与 ``Ku`` 的
-**标准化标签值（z-score 后）**，**不是物理单位**；物理单位还原依赖
-预处理模块保存的标准化统计量，不属于本模块职责。
+输出语义：形状 ``[N, 2]``，两列分别为 ``alpha`` 与 ``Ku`` 的**标准化标签
+值（z-score 后）**，**不是物理单位**；物理单位还原依赖预处理模块保存的
+标准化统计量。
 
 本模块不读取数据、不做任何标准化/归一化，也不导入其他训练模块
 （training_config / training_data / preprocessing / training 等），
@@ -37,15 +26,8 @@ _N_CHANNELS = 3  # 磁化分量数 (mx, my, mz)：输入契约恒为 3
 class MLPRegressor(nn.Module):
     """从多激励磁化轨迹反演 (alpha, Ku) 的 MLP 回归器。
 
-    Attributes:
-        input_shape: 输入样本形状 ``(P, T, 3)``——P 个 pulse、每 pulse
-            ``T`` 个时间步、3 个磁化分量；用于推导展平维度
-            ``D = P * T * 3`` 并校验 batch 形状 ``[N, P, T, 3]``。
-            随实例保存（checkpoint 结构字段来源）。
-        hidden_dims: 隐层宽度序列，默认 ``(64, 32, 32)``，可由训练配置
-            覆盖（``model.hidden_dims`` 配置化）；随实例保存。
-        network: ``nn.Sequential``：``Flatten(start_dim=1)`` → 逐层
-            ``Linear + ReLU`` → 末层 ``Linear → 2``（线性输出）。
+    ``input_shape``/``hidden_dims`` 随实例保存，是 checkpoint 的结构字段
+    来源；展平维度 ``D = P * T * 3``。
     """
 
     def __init__(
@@ -56,8 +38,7 @@ class MLPRegressor(nn.Module):
         """初始化网络层。
 
         Args:
-            input_shape: ``(P, T, 3)``，见模块 docstring 的输入契约；
-                各维必须为正，通道维恒为 3。
+            input_shape: ``(P, T, 3)``，各维必须为正，通道维恒为 3。
             hidden_dims: 隐层宽度序列（可为空 = 直接 ``Linear D→2``），
                 各维必须为正；末层线性输出标准化标签（非物理单位）。
 
@@ -65,7 +46,6 @@ class MLPRegressor(nn.Module):
             ValueError: ``input_shape`` 非 3 元、P/T 非正、通道维不为 3，
                 或 ``hidden_dims`` 含非正宽度。
         """
-        # 步骤 0：先完成 nn.Module 基类初始化（后续子模块注册的前提）。
         super().__init__()
         if len(input_shape) != 3:
             raise ValueError(f"input_shape 须为 (P, T, 3) (got {tuple(input_shape)})")

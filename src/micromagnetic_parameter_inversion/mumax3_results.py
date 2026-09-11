@@ -1,4 +1,4 @@
-"""MuMax3 table 解析与轨迹 CSV 导出（vertical slice）。
+"""MuMax3 table 解析与轨迹 CSV 导出。
 
 轨迹行 schema 固定为五列：sample_index, t_s, m_x, m_y, m_z。
 

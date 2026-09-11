@@ -1,4 +1,4 @@
-# MLP 训练配置（train.md 第 7 节；dataset 与 run_name 为占位符，运行前
+# MLP 训练配置（用法见 README.md；dataset 与 run_name 为占位符，运行前
 # 替换为实际值，不虚构研究参数。）
 dataset_name: PLACEHOLDER_DATASET_NAME   # 占位：替换为 data/raw 下实际 dataset
 run_name: PLACEHOLDER_RUN_NAME           # 必填（无默认、不可为 null/空）：
