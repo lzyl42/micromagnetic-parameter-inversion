@@ -1,15 +1,19 @@
-"""训练/评估实验配置：frozen dataclass + 严格 YAML 加载/校验。
+"""Training/evaluation experiment config: frozen dataclasses + strict YAML loading/validation.
 
-字段与 ``configs/training/mlp.yaml`` 一一对应；``split`` 块仅被 prepare
-脚本使用。``load_config`` 是唯一校验边界：所有层级严格 schema（拒绝
-未知/缺失字段），dataset_name/run_name 必填、须为安全单路径段且不得保留
-占位符；零值（weight_decay=0、min_delta=0）合法，校验通过后流程假定配置
-合法。
+Fields correspond one-to-one with ``configs/training/mlp.yaml``; the ``split``
+block is used only by the prepare script. ``load_config`` is the single
+validation boundary: every level uses a strict schema (unknown/missing fields
+rejected), dataset_name/run_name are required, must be safe single path
+segments, and must not keep placeholders; zero values (weight_decay=0,
+min_delta=0) are valid, and after validation passes the pipeline assumes the
+config is valid.
 
-校验 helper 自 ``mumax3_config`` 复用，schema 违反统一抛 ConfigError。
+Validation helpers are reused from ``mumax3_config``; schema violations raise
+ConfigError uniformly.
 
-依赖方向：本模块为叶子（标准库 + yaml + mumax3_config 校验器）；被
-training_data / preprocessing / training / evaluation 单向引用。
+Dependency direction: this module is a leaf (stdlib + yaml + mumax3_config
+validators); it is referenced one-way by training_data / preprocessing /
+training / evaluation.
 """
 
 from __future__ import annotations
@@ -33,17 +37,19 @@ from micromagnetic_parameter_inversion.mumax3_config import (
     _UniqueKeyLoader,
 )
 
-# 占位值：configs/training/mlp.yaml 示例使用；load_config 拒绝仍保留占位符
-# 的配置（dataset_name/run_name 运行前由用户替换）。
+# Placeholder values: used by the configs/training/mlp.yaml example; load_config
+# rejects configs that still keep placeholders (dataset_name/run_name are
+# replaced by the user before running).
 PLACEHOLDER_DATASET_NAME = "PLACEHOLDER_DATASET_NAME"
 PLACEHOLDER_RUN_NAME = "PLACEHOLDER_RUN_NAME"
 
-# ckpt schema 版本号（checkpoint 由 training 模块读写）。
+# ckpt schema version (checkpoints are read/written by the training module).
 CKPT_FORMAT_VERSION = 1
 
 type LabelTransform = Literal["identity", "logalpha"]
 
-# 激活函数在 ckpt 中显式留档（模型结构显式字段）；固定 ReLU。
+# The activation function is recorded explicitly in the ckpt (explicit model
+# structure field); fixed ReLU.
 type ActivationName = Literal["relu"]
 
 _TOP_LEVEL_KEYS = frozenset(
@@ -78,67 +84,77 @@ _EARLY_STOPPING_KEYS = frozenset({"patience", "min_delta"})
 _SPLIT_KEYS = frozenset({"seed", "ratios", "min_per_split"})
 _RATIO_KEYS = frozenset({"train", "val", "test"})
 
-# device 取值与 runtime.select_device 的语义一致。
+# device values match the semantics of runtime.select_device.
 _DEVICES = frozenset({"auto", "cpu", "cuda"})
 _TRANSFORMS = frozenset({"identity", "logalpha"})
-# ratios 求和容差：容忍手写小数的浮点舍入。
+# Tolerance for the ratios sum: tolerates floating-point rounding of hand-written decimals.
 _RATIO_TOLERANCE = 1e-9
 
 
 @dataclass(frozen=True)
 class DataConfig:
-    """``data`` 块：pulse 顺序来源。"""
+    """``data`` block: source of the pulse order."""
 
-    # None = 从所选首份 config.yaml 快照冻结并记录进 dataset_meta；
-    # 非 None = 显式 pulse_id 列表（须为协议集合的无重复排列）。
+    # None = frozen from the first selected config.yaml snapshot and recorded in
+    # dataset_meta; non-None = explicit pulse_id list (must be a duplicate-free
+    # permutation of the protocol set).
     pulse_order: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """``model`` 块：网络结构（[64,32,32] 时参数量 = ``64·D + 3266``）。"""
+    """``model`` block: network architecture (with [64,32,32] the parameter count is
+    ``64·D + 3266``).
+    """
 
     hidden_dims: tuple[int, ...] = (64, 32, 32)
 
 
 @dataclass(frozen=True)
 class LabelConfig:
-    """``label`` 块：标签变换（不等于 alpha 空间采样设计，两者独立）。"""
+    """``label`` block: label transform (distinct from the alpha-space sampling design;
+    the two are independent).
+    """
 
-    transform: LabelTransform = "identity"  # logalpha 仅对 alpha 取 log10，须 alpha > 0
+    transform: LabelTransform = "identity"  # logalpha takes log10 of alpha only; requires alpha > 0
 
 
 @dataclass(frozen=True)
 class PreprocessingConfig:
-    """``preprocessing`` 块：标准化超参（统计量本身仅 train 组拟合）。"""
+    """``preprocessing`` block: normalization hyperparameters (statistics are fit on
+    the train split only).
+    """
 
-    std_eps: float = 1.0e-8  # x/y 统一：std <= eps → 除数取 1，并记录零方差位置
+    std_eps: float = (
+        1.0e-8  # Uniform for x/y: std <= eps → divisor 1, and zero-variance positions are recorded
+    )
 
 
 @dataclass(frozen=True)
 class EarlyStoppingConfig:
-    """``training.early_stopping``：min_delta 只作用于停止判定，不改 best 规则。"""
+    """``training.early_stopping``: min_delta affects only the stop decision, not the best rule."""
 
     patience: int = 50
-    min_delta: float = 0.0  # 0 合法：任何非改善 epoch 都计入 patience
+    min_delta: float = 0.0  # 0 is valid: every non-improving epoch counts toward patience
 
 
 @dataclass(frozen=True)
 class TrainingParams:
-    """``training`` 块：优化与运行超参（初始工程候选，非已验证科研参数）。"""
+    """``training`` block: optimization and runtime hyperparameters (initial
+    engineering candidates, not validated research parameters)."""
 
-    seed: int = 42  # 与 configs/base.yaml 一致
-    device: str = "auto"  # auto|cpu|cuda，交 runtime.select_device
+    seed: int = 42  # consistent with configs/base.yaml
+    device: str = "auto"  # auto|cpu|cuda, passed to runtime.select_device
     batch_size: int = 32
     max_epochs: int = 500
     learning_rate: float = 1.0e-3
-    weight_decay: float = 0.0  # 0 合法（无 L2 正则）
+    weight_decay: float = 0.0  # 0 is valid (no L2 regularization)
     early_stopping: EarlyStoppingConfig = EarlyStoppingConfig()
 
 
 @dataclass(frozen=True)
 class SplitRatios:
-    """``split.ratios``：三者须全部非负有限且和为 1（容差 1e-9）。"""
+    """``split.ratios``: all three must be non-negative and finite and sum to 1 (tolerance 1e-9)."""
 
     train: float = 0.7
     val: float = 0.15
@@ -147,7 +163,8 @@ class SplitRatios:
 
 @dataclass(frozen=True)
 class SplitMinCounts:
-    """``split.min_per_split``：任一组数量不足 → prepare 写样本前报错退出。"""
+    """``split.min_per_split``: if any group is short → prepare fails before
+    writing samples."""
 
     train: int = 2
     val: int = 1
@@ -156,7 +173,7 @@ class SplitMinCounts:
 
 @dataclass(frozen=True)
 class SplitConfig:
-    """``split`` 块：仅 prepare 脚本使用（算法见 training_data.make_split）。"""
+    """``split`` block: used only by the prepare script (algorithm in training_data.make_split)."""
 
     seed: int = 42
     ratios: SplitRatios = SplitRatios()
@@ -165,10 +182,13 @@ class SplitConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    """实验配置聚合根（一份 ``configs/training/mlp.yaml`` 的内存表示）。"""
+    """Experiment config aggregate root (in-memory representation of one
+    ``configs/training/mlp.yaml``).
+    """
 
-    # 必填（不可为 null/空，运行前替换占位值）；run_name 对应的输出目录
-    # 已存在则拒绝启动，不隐式覆盖。
+    # Required (not null/empty; replace placeholder values before running); if the
+    # output directory for run_name already exists, startup is refused rather than
+    # overwriting implicitly.
     dataset_name: str
     run_name: str
     data: DataConfig = DataConfig()
@@ -177,26 +197,28 @@ class ExperimentConfig:
     preprocessing: PreprocessingConfig = PreprocessingConfig()
     training: TrainingParams = TrainingParams()
     split: SplitConfig = SplitConfig()
-    # None = output_root()/training/mlp/<dataset_name>/<run_name>。
+    # None = output_root()/training/mlp/<dataset_name>/<run_name>.
     output_dir: str | None = None
 
 
 def _check_keys(
     mapping: dict[Any, Any], field: str, known: frozenset[str], required: frozenset[str]
 ) -> None:
-    """严格 schema：拒绝未知字段；仅 ``required`` 子集为必填（其余可缺省）。"""
+    """Strict schema: reject unknown fields; only the ``required`` subset is mandatory
+    (the rest may be omitted).
+    """
     unknown = sorted((key for key in mapping if key not in known), key=repr)
     if unknown:
-        _fail(field, f"未知字段 {unknown!r}；允许的字段 {sorted(known)}")
+        _fail(field, f"unknown fields {unknown!r}; allowed fields {sorted(known)}")
     missing = sorted(required.difference(mapping))
     if missing:
-        _fail(field, f"缺失必填字段 {missing!r}")
+        _fail(field, f"missing required fields {missing!r}")
 
 
 def _optional_section(
     root: dict[Any, Any], field: str, known: frozenset[str]
 ) -> dict[Any, Any] | None:
-    """可选配置节：缺省 → None（调用方回退 dataclass 默认值）。"""
+    """Optional config section: absent → None (caller falls back to dataclass defaults)."""
     if field not in root:
         return None
     raw = _require_mapping(root[field], field)
@@ -205,26 +227,26 @@ def _optional_section(
 
 
 def _parse_pulse_order(value: object, field: str) -> tuple[str, ...] | None:
-    """pulse_order：null → None；否则非空、元素为安全路径段且无重复。"""
+    """pulse_order: null → None; otherwise non-empty with safe path segments and no duplicates."""
     if value is None:
         return None
     if not isinstance(value, list) or not value:
-        _fail(field, f"必须为 null 或非空 pulse_id 列表 (got {value!r})")
+        _fail(field, f"must be null or a non-empty pulse_id list (got {value!r})")
     ids = tuple(_require_safe_path_segment(item, f"{field}[{i}]") for i, item in enumerate(value))
     if len(set(ids)) != len(ids):
-        _fail(field, f"重复的 pulse_id (got {value!r})")
+        _fail(field, f"duplicate pulse_id (got {value!r})")
     return ids
 
 
 def _parse_hidden_dims(value: object, field: str) -> tuple[int, ...]:
-    """hidden_dims：非空的正整数序列。"""
+    """hidden_dims: non-empty sequence of positive integers."""
     if not isinstance(value, list) or not value:
-        _fail(field, f"必须为非空整数列表 (got {value!r})")
+        _fail(field, f"must be a non-empty integer list (got {value!r})")
     return tuple(_require_positive_int(item, f"{field}[{i}]") for i, item in enumerate(value))
 
 
 def _parse_ratios(value: object, field: str) -> SplitRatios:
-    """ratios：非负有限数，和为 1（容差内）。"""
+    """ratios: non-negative finite numbers summing to 1 (within tolerance)."""
     raw = _require_mapping(value, field)
     _check_keys(raw, field, _RATIO_KEYS, _RATIO_KEYS)
     values = {
@@ -233,12 +255,14 @@ def _parse_ratios(value: object, field: str) -> SplitRatios:
     }
     total = sum(values.values())
     if abs(total - 1.0) > _RATIO_TOLERANCE:
-        _fail(field, f"三项之和必须为 1（容差 {_RATIO_TOLERANCE}）(got {total!r})")
+        _fail(
+            field, f"the three terms must sum to 1 (tolerance {_RATIO_TOLERANCE}) (got {total!r})"
+        )
     return SplitRatios(train=values["train"], val=values["val"], test=values["test"])
 
 
 def _parse_min_per_split(value: object, field: str) -> SplitMinCounts:
-    """min_per_split：非负整数（允许 0 = 该组可为空）。"""
+    """min_per_split: non-negative integers (0 allowed = the group may be empty)."""
     raw = _require_mapping(value, field)
     _check_keys(raw, field, _RATIO_KEYS, _RATIO_KEYS)
     return SplitMinCounts(
@@ -274,7 +298,7 @@ def _parse_label(root: dict[Any, Any]) -> LabelConfig:
         return LabelConfig()
     transform = raw["transform"]
     if transform not in _TRANSFORMS:
-        _fail("label.transform", f"必须为 {sorted(_TRANSFORMS)} (got {transform!r})")
+        _fail("label.transform", f"must be one of {sorted(_TRANSFORMS)} (got {transform!r})")
     return LabelConfig(transform=transform)
 
 
@@ -309,7 +333,7 @@ def _parse_training(root: dict[Any, Any]) -> TrainingParams:
         kwargs["seed"] = _require_non_negative_int(raw["seed"], "training.seed")
     if "device" in raw:
         if raw["device"] not in _DEVICES:
-            _fail("training.device", f"必须为 {sorted(_DEVICES)} (got {raw['device']!r})")
+            _fail("training.device", f"must be one of {sorted(_DEVICES)} (got {raw['device']!r})")
         kwargs["device"] = raw["device"]
     if "batch_size" in raw:
         kwargs["batch_size"] = _require_positive_int(raw["batch_size"], "training.batch_size")
@@ -351,39 +375,40 @@ def _parse_output_dir(root: dict[Any, Any]) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value:
-        _fail("output_dir", f"必须为 null 或非空字符串 (got {value!r})")
+        _fail("output_dir", f"must be null or a non-empty string (got {value!r})")
     return value
 
 
 def load_config(path: Path) -> ExperimentConfig:
-    """读取 YAML、执行唯一入口校验并构造 ExperimentConfig。
+    """Read YAML, run the single-entry validation, and build an ExperimentConfig.
 
-    校验边界（此后流程假定配置合法）：所有层级严格 schema（未知字段与
-    重复 YAML 键拒绝）；dataset_name/run_name 必填、安全单路径段、不得
-    保留占位符；device ∈ {auto,cpu,cuda}（语义同
-    runtime.select_device）；ratios 非负有限且和为 1（容差 1e-9）；
-    weight_decay/min_delta/min_per_split 允许 0；可选节缺省时使用
-    dataclass 默认值。
+    Validation boundary (the pipeline assumes a valid config afterwards): every
+    level uses a strict schema (unknown fields and duplicate YAML keys rejected);
+    dataset_name/run_name are required, safe single path segments, and must not
+    keep placeholders; device ∈ {auto,cpu,cuda} (same semantics as
+    runtime.select_device); ratios are non-negative, finite, and sum to 1
+    (tolerance 1e-9); weight_decay/min_delta/min_per_split allow 0; absent
+    optional sections use dataclass defaults.
 
     Raises:
-        ConfigError: 消息含字段路径（如 training.batch_size）。
+        ConfigError: messages include the field path (e.g. training.batch_size).
     """
     try:
         raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"{path}: YAML 解析失败: {exc}") from exc
+        raise ConfigError(f"{path}: failed to parse YAML: {exc}") from exc
     except OSError as exc:
-        raise ConfigError(f"{path}: 读取失败: {exc}") from exc
+        raise ConfigError(f"{path}: failed to read: {exc}") from exc
 
     root = _require_mapping(raw, str(path))
     _check_keys(root, str(path), _TOP_LEVEL_KEYS, frozenset({"dataset_name", "run_name"}))
 
     dataset_name = _require_safe_path_segment(root["dataset_name"], "dataset_name")
     if dataset_name == PLACEHOLDER_DATASET_NAME:
-        _fail("dataset_name", f"占位符须在运行前替换 (got {dataset_name!r})")
+        _fail("dataset_name", f"placeholder must be replaced before running (got {dataset_name!r})")
     run_name = _require_safe_path_segment(root["run_name"], "run_name")
     if run_name == PLACEHOLDER_RUN_NAME:
-        _fail("run_name", f"占位符须在运行前替换 (got {run_name!r})")
+        _fail("run_name", f"placeholder must be replaced before running (got {run_name!r})")
 
     return ExperimentConfig(
         dataset_name=dataset_name,
@@ -399,11 +424,12 @@ def load_config(path: Path) -> ExperimentConfig:
 
 
 def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
-    """ExperimentConfig → 嵌套纯字典（本模块维护的映射 schema）。
+    """ExperimentConfig → nested plain dict (mapping schema maintained by this module).
 
-    形状与 ``configs/training/mlp.yaml`` 一致（可被 ``load_config`` 重新
-    加载），也作为 ckpt ``config`` 副本的落盘形态；容器均为
-    primitives/list/dict（tuple → list），无 dataclass/numpy 对象。
+    The shape matches ``configs/training/mlp.yaml`` (reloadable by
+    ``load_config``) and is also the on-disk form of the ckpt ``config`` copy;
+    containers are all primitives/list/dict (tuple → list), with no dataclass or
+    numpy objects.
     """
     return {
         "dataset_name": config.dataset_name,
@@ -446,31 +472,34 @@ def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
 
 
 def _mapping_section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
-    """可选配置节：缺省 → 空映射（调用方回退 dataclass 默认值）；非映射即报错。"""
+    """Optional config section: absent → empty mapping (caller falls back to dataclass
+    defaults); a non-mapping raises."""
     value = mapping.get(key)
     if value is None:
         return {}
     if not isinstance(value, Mapping):
-        _fail(f"config.{key}", f"必须为映射或 null (got {type(value)!r})")
+        _fail(f"config.{key}", f"must be a mapping or null (got {type(value)!r})")
     return value
 
 
 def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
-    """嵌套纯字典 → ExperimentConfig（ckpt ``config`` 副本重建的唯一入口）。
+    """Nested plain dict → ExperimentConfig (single entry point for rebuilding the
+    ckpt ``config`` copy).
 
-    与 ``config_to_mapping`` 对称；缺省节/键回退 dataclass 默认值（ckpt
-    副本总是完整）。YAML 严格加载仍走 ``load_config``（占位符/ratios
-    求和等校验属 YAML 边界，不在此重复）。
+    Symmetric with ``config_to_mapping``; absent sections/keys fall back to
+    dataclass defaults (the ckpt copy is always complete). Strict YAML loading
+    still goes through ``load_config`` (placeholder/ratios-sum checks belong to
+    the YAML boundary and are not repeated here).
 
     Raises:
-        ConfigError: 非映射、缺失 dataset_name/run_name、节非映射或字段
-            类型非法。
+        ConfigError: non-mapping, missing dataset_name/run_name, a non-mapping
+            section, or an illegal field type.
     """
     if not isinstance(mapping, Mapping):
-        _fail("config", f"必须为映射 (got {type(mapping)!r})")
+        _fail("config", f"must be a mapping (got {type(mapping)!r})")
     for key in ("dataset_name", "run_name"):
         if key not in mapping:
-            _fail("config", f"缺失必填键 {key!r}")
+            _fail("config", f"missing required key {key!r}")
     data_raw = _mapping_section(mapping, "data")
     model_raw = _mapping_section(mapping, "model")
     label_raw = _mapping_section(mapping, "label")
@@ -539,4 +568,4 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
     except ConfigError:
         raise
     except (TypeError, ValueError) as exc:
-        _fail("config", f"字段类型非法: {exc}")
+        _fail("config", f"illegal field type: {exc}")

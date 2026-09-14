@@ -1,6 +1,7 @@
-"""MuMax3 公共行为测试：全部离线，不依赖 GPU/MuMax3、不写 data/raw。
+"""MuMax3 shared-behavior tests: fully offline, no GPU/MuMax3 dependency and no writes to data/raw.
 
-MuMax3 执行经 monkeypatch 替换 pipeline 调用点伪造；数值均为 test-only 占位值。
+MuMax3 execution is faked by monkeypatching the pipeline call site; all values are
+test-only placeholders.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from micromagnetic_parameter_inversion.mumax3_script import (
 )
 from micromagnetic_parameter_inversion.paths import PROJECT_ROOT
 
-# 仓库真实模板（只读）与渲染/输出契约中的固定文本。
+# Real repository templates (read-only) and fixed text from rendering/output contracts.
 _EQUILIBRIUM_TEMPLATE = PROJECT_ROOT / "simulations" / "mumax3" / "equilibrium.mx3.in"
 _SIMULATION_TEMPLATE = PROJECT_ROOT / "simulations" / "mumax3" / "simulation.mx3.in"
 _LOADFILE_LINE = 'm.LoadFile("../../equilibrium/equilibrium.out/equilibrium.ovf")'
@@ -44,7 +45,10 @@ _DURATION_S = 2.0e-9
 
 
 def _test_config_dict() -> dict[str, Any]:
-    """最小合法 test-only 配置：alpha=0、负 Ku、非零 mT 脉冲 + 零场脉冲。"""
+    """Minimal valid test-only config: alpha=0, negative Ku, non-zero mT pulse.
+
+    Plus a zero-field pulse.
+    """
     return {
         "dataset_name": "test-dataset",
         "material": {
@@ -94,7 +98,10 @@ def _write_valid_config(tmp_path: Path) -> Path:
 
 
 def _table_text(sample_count: int, interval_s: float, duration_s: float) -> str:
-    """真实 MuMax3 表头格式的合成 table；raw_t 从 duration_s 起，m 物理合法。"""
+    """Synthetic table in the real MuMax3 header format.
+
+    raw_t starts at duration_s and m is physically valid.
+    """
     lines = ["# t (s)\tmx ()\tmy ()\tmz ()"]
     for i in range(sample_count):
         lines.append("\t".join(repr(v) for v in (duration_s + i * interval_s, 0.8, 0.6, 0.0)))
@@ -110,7 +117,7 @@ def _edit_field(lines: list[str], line_index: int, field_index: int, value: str)
 
 
 def _sampling_from_script(script_text: str) -> tuple[int, float, float]:
-    """从渲染后的 simulation 脚本提取 (sample_count, interval_s, duration_s)。"""
+    """Extract (sample_count, interval_s, duration_s) from the rendered simulation script."""
     run_args = re.findall(r"(?m)^[ \t]*Run\(([^)]+)\)", script_text)
     assert len(run_args) == 2, run_args
     loop = re.search(r"for i := 1; i < (\d+);", script_text)
@@ -119,7 +126,10 @@ def _sampling_from_script(script_text: str) -> tuple[int, float, float]:
 
 
 def _geom_diameters(script_text: str) -> list[float]:
-    """提取渲染脚本中唯一的 SetGeom(Ellipsoid(dx, dy, dz)) 三轴全直径。"""
+    """Extract the three full diameters of the unique SetGeom(Ellipsoid(dx, dy, dz)).
+
+    The set is taken from the rendered script.
+    """
     geom_lines = [line for line in script_text.splitlines() if line.startswith("SetGeom(")]
     assert len(geom_lines) == 1, geom_lines
     assert geom_lines[0].startswith("SetGeom(Ellipsoid("), geom_lines[0]
@@ -139,7 +149,10 @@ class _FakeMumax:
 def _install_pipeline_fake(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **kwargs: Any
 ) -> _FakeMumax:
-    """替换 pipeline 的 run_mumax3/data_root 调用点并伪造契约 .out 产物。"""
+    """Replace the pipeline's run_mumax3/data_root call sites.
+
+    Fakes the contract .out products.
+    """
     fake = _FakeMumax(data_dir=tmp_path / "data-root", **kwargs)
 
     def fake_run(
@@ -181,7 +194,10 @@ def _expected_out_dir(fake: _FakeMumax, config_path: Path) -> Path:
 
 
 def test_load_config_valid_one_shot(tmp_path: Path) -> None:
-    """合法边界一次覆盖：alpha=0、负 Ku、mT->T、零场脉冲、cell size。"""
+    """Valid boundary covered in one shot: alpha=0, negative Ku, mT->T, zero-field pulse.
+
+    Derived cell sizes are checked as well.
+    """
     config = load_config(_write_valid_config(tmp_path))
     assert config.material.alpha == 0.0
     assert config.material.ku_j_per_m3 == -5.0e5
@@ -197,7 +213,10 @@ def test_load_config_valid_one_shot(tmp_path: Path) -> None:
 
 
 def test_load_config_rejects_invalid_yaml(tmp_path: Path) -> None:
-    """代表性非法 YAML（子目录隔离）：schema/取值/唯一性/路径段一律 ConfigError。"""
+    """Representative invalid YAML (isolated per subdirectory).
+
+    Schema/value/uniqueness/path-segment violations all raise ConfigError.
+    """
     cases = [
         ("unknown-field", lambda m: m["material"].update(typo=1.0)),
         ("missing-field", lambda m: m["material"].pop("alpha")),
@@ -224,7 +243,10 @@ def test_load_config_rejects_invalid_yaml(tmp_path: Path) -> None:
 
 
 def test_parameter_set_id_format_and_dependence(tmp_path: Path) -> None:
-    """公共格式契约：16 位小写 hex；同参数稳定、任一参数改变则改变。"""
+    """Shared format contract: 16 lowercase hex chars.
+
+    Stable for the same parameters, changes when either parameter changes.
+    """
     alpha, ku = 0.0, -5.0e5
     set_id = parameter_set_id(alpha, ku)
     assert re.fullmatch(r"[0-9a-f]{16}", set_id)
@@ -232,7 +254,8 @@ def test_parameter_set_id_format_and_dependence(tmp_path: Path) -> None:
     assert parameter_set_id(0.01, ku) != set_id
     assert parameter_set_id(alpha, 5.0e5) != set_id
 
-    # 其余配置维度全变而 (alpha, Ku) 不变 -> id 不变（不受 pulse 等字段影响）。
+    # All other config dimensions change while (alpha, Ku) stays the same -> id unchanged
+    # (not affected by pulse and other fields).
     other = _test_config_dict()
     other["dataset_name"] = "other-dataset"
     other["material"]["ms_a_per_m"] = 7.0e5
@@ -244,7 +267,10 @@ def test_parameter_set_id_format_and_dependence(tmp_path: Path) -> None:
 
 
 def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
-    """两个公共 renderer 用仓库模板完整渲染：无残留占位符，含关键命令。"""
+    """Both shared renderers fully render the repository templates.
+
+    No residual placeholders, key commands present.
+    """
     config = load_config(_write_valid_config(tmp_path))
     equilibrium_template = _EQUILIBRIUM_TEMPLATE.read_text(encoding="utf-8")
     simulation_template = _SIMULATION_TEMPLATE.read_text(encoding="utf-8")
@@ -255,11 +281,12 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
     assert "B_ext = vector(0, 0, 0)" in equilibrium
     assert _geom_diameters(equilibrium) == [160.0e-9, 80.0e-9, 3.0e-9]
     assert "SetGeom(Ellipse(" not in equilibrium
-    # 数值协议：EdgeSmooth 必须先于 SetGeom；公共 solver 控制；Relax 阈值渲染。
+    # Numerical protocol: EdgeSmooth must come before SetGeom; shared solver control;
+    # Relax threshold rendered.
     assert equilibrium.index("EdgeSmooth = 1") < equilibrium.index("SetGeom(")
     assert "SetSolver(6)" in equilibrium
     assert equilibrium.count("RelaxTorqueThreshold = -1") == 1
-    # 诊断：geom 快照 + DIAGNOSTIC relax 行（经 stdout 进 run.log）。
+    # Diagnostics: geom snapshot + DIAGNOSTIC relax line (via stdout into run.log).
     assert equilibrium.count('SaveAs(geom, "geom")') == 1
     assert "relax_converged := Relax()" in equilibrium
     assert "DIAGNOSTIC relax_converged=" in equilibrium
@@ -272,13 +299,13 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
         assert "Relax" not in rendered
         assert _geom_diameters(rendered) == [160.0e-9, 80.0e-9, 3.0e-9]
         assert "SetGeom(Ellipse(" not in rendered
-        # 与 equilibrium 相同的公共数值协议段（无 RelaxTorqueThreshold）。
+        # Same shared numerical protocol section as equilibrium (without RelaxTorqueThreshold).
         assert rendered.index("EdgeSmooth = 1") < rendered.index("SetGeom(")
         assert "SetSolver(6)" in rendered
         assert "MaxErr = " in rendered
         assert "MaxDt = " in rendered
         assert "GammaLL = " in rendered
-        # 诊断：DIAGNOSTIC dynamic 行（经 stdout 进 run.log）。
+        # Diagnostics: DIAGNOSTIC dynamic line (via stdout into run.log).
         assert "DIAGNOSTIC PeakErr=" in rendered
         count, interval_s, duration_s = _sampling_from_script(rendered)
         assert (count, interval_s, duration_s) == (
@@ -306,7 +333,10 @@ def test_renderers_render_real_repo_templates(tmp_path: Path) -> None:
 
 
 def test_parse_table_valid_and_csv_export(tmp_path: Path) -> None:
-    """真实格式 table 正常解析：原生首时刻 = duration，输出重锚为整数网格。"""
+    """Real-format table parses normally: native first instant = duration.
+
+    Output is re-anchored to the integer grid.
+    """
     table_path = tmp_path / "table.txt"
     table_path.write_text(_table_text(_SAMPLE_COUNT, _INTERVAL_S, _DURATION_S), encoding="utf-8")
     lines = table_path.read_text(encoding="utf-8").splitlines()
@@ -333,7 +363,10 @@ def test_parse_table_valid_and_csv_export(tmp_path: Path) -> None:
 
 
 def test_parse_table_rejects_contract_violations(tmp_path: Path) -> None:
-    """代表性契约违反（子目录隔离）：单位/列/首时刻/网格/行数/NaN/范数。"""
+    """Representative contract violations (isolated per subdirectory).
+
+    Unit/column/first-time/grid/row-count/NaN/norm.
+    """
     lines = _table_text(_SAMPLE_COUNT, _INTERVAL_S, _DURATION_S).splitlines()
     cases = [
         ("wrong-unit", [lines[0].replace("t (s)", "t (ns)"), *lines[1:]]),
@@ -360,7 +393,7 @@ def test_parse_table_rejects_contract_violations(tmp_path: Path) -> None:
 def test_pipeline_success_writes_full_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """全流程成功：equilibrium 一次且先行、共享 LoadFile、index 两行正确。"""
+    """Full pipeline success: equilibrium once and first, shared LoadFile, index rows."""
     fake = _install_pipeline_fake(monkeypatch, tmp_path)
     config_path = _write_valid_config(tmp_path)
     config = load_config(config_path)
@@ -403,7 +436,10 @@ def test_pipeline_success_writes_full_output(
 
 
 def test_pipeline_stops_when_mumax_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """pulse 阶段非零返回：run.log 留存，后续 pulse 不执行，无最终 index。"""
+    """Non-zero return at the pulse stage: run.log kept, no later pulses executed.
+
+    No final index is produced.
+    """
     fake = _install_pipeline_fake(monkeypatch, tmp_path, simulation_returncode=1)
     config_path = _write_valid_config(tmp_path)
     out_dir = _expected_out_dir(fake, config_path)
@@ -420,7 +456,7 @@ def test_pipeline_stops_when_mumax_fails(monkeypatch: pytest.MonkeyPatch, tmp_pa
 def test_pipeline_rejects_empty_core_output(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """任一核心产物为空均失败（子目录隔离），且不产生最终 index。"""
+    """Any empty core product fails (isolated per subdirectory) and no final index is produced."""
     for name in ("equilibrium.ovf", "table.txt", "m_t0.ovf", "m_tfinal.ovf"):
         fake = _install_pipeline_fake(monkeypatch, tmp_path / name, empty_output=name)
         config_path = _write_valid_config(tmp_path / name)

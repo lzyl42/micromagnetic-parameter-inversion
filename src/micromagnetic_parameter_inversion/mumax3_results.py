@@ -1,12 +1,15 @@
-"""MuMax3 table 解析与轨迹 CSV 导出。
+"""MuMax3 table parsing and trajectory CSV export.
 
-轨迹行 schema 固定为五列：sample_index, t_s, m_x, m_y, m_z。
+The trajectory row schema is fixed at five columns: sample_index, t_s, m_x, m_y, m_z.
 
-MuMax3 3.12 默认 table（table.txt）：首行为 ``#`` 注释表头，列以 tab 分隔，
-每列为 ``名称 (单位)`` 形式。本模块要求表头（去开头 ``#`` 与字段两侧空白
-后）语义上严格等于且顺序固定为四列 ``t (s)``、``mx ()``、``my ()``、
-``mz ()``，数据行必须恰 4 列有限数值；采样契约参数由 config 校验，此处只
-校验 table 内容。任何契约违反一律 TableParseError，不做修复或截断。
+The MuMax3 3.12 default table (table.txt): the first line is a ``#`` comment header,
+columns are tab-separated, and each column has the form ``name (unit)``. This module
+requires the header (after stripping the leading ``#`` and surrounding whitespace of
+each field) to be semantically strictly equal, and fixed in order, to the four
+columns ``t (s)``, ``mx ()``, ``my ()``, ``mz ()``, and data rows to have exactly 4
+finite numeric columns; sampling-contract parameters are validated by the config, so
+only the table content is checked here. Any contract violation raises
+TableParseError, with no repair or truncation.
 """
 
 from __future__ import annotations
@@ -17,11 +20,13 @@ from pathlib import Path
 
 type TrajectoryRow = tuple[int, float, float, float, float]
 
-# 固定表头：去开头 ``#`` 后按 tab 切分、剥离字段两侧空白，必须逐列相等。
+# Fixed header: after stripping the leading ``#``, split on tab and strip surrounding
+# whitespace from each field; columns must match exactly.
 _HEADER_COLUMNS = ("t (s)", "mx ()", "my ()", "mz ()")
 
-# 时间网格容差系数（乘时间尺度）；磁化校验容差（|分量| 与 |m|^2 上界的
-# 浮点余量）。两者都远小于任何物理偏差，只吸收正常浮点输出噪声。
+# Time-grid tolerance factor (times the time scale); magnetization check tolerance
+# (floating-point margin on the |component| and |m|^2 upper bounds). Both are far
+# below any physical deviation and only absorb normal floating-point output noise.
 _TIME_CHECK_TOLERANCE = 1e-6
 _MAGNETIZATION_TOLERANCE = 1e-6
 
@@ -30,19 +35,21 @@ _FLOAT_FORMAT = ".17g"
 
 
 class TableParseError(ValueError):
-    """MuMax3 table 内容违反解析契约；消息含文件/行号/列名定位。"""
+    """MuMax3 table content violates the parsing contract; messages locate file/line/column."""
 
 
 def _parse_field(field: str, table_path: Path, line_number: int, column: str) -> float:
-    """解析单个数值字段；非数值与非有限值（nan/inf）直接拒绝。"""
+    """Parse a single numeric field; non-numeric and non-finite values (nan/inf) are rejected."""
     try:
         value = float(field)
     except ValueError:
         raise TableParseError(
-            f"{table_path}: 第 {line_number} 行列 {column!r} 非数值 {field!r}"
+            f"{table_path}: line {line_number} column {column!r} is not numeric: {field!r}"
         ) from None
     if not math.isfinite(value):
-        raise TableParseError(f"{table_path}: 第 {line_number} 行列 {column!r} 非有限值 {field!r}")
+        raise TableParseError(
+            f"{table_path}: line {line_number} column {column!r} non-finite value {field!r}"
+        )
     return value
 
 
@@ -53,44 +60,50 @@ def parse_table(
     sample_interval_s: float,
     sample_count: int,
 ) -> list[TrajectoryRow]:
-    """解析单个 pulse 的 MuMax3 table 为固定长度轨迹行列表。
+    """Parse one pulse's MuMax3 table into a fixed-length list of trajectory rows.
 
-    采样契约参数（pulse_duration_s/sample_interval_s/sample_count）已由
-    config 校验，此处不重复业务校验。内容契约：表头语义严格等于
-    _HEADER_COLUMNS（顺序固定，拒绝 ns、错误单位、缺列、额外列）；数据行
-    数恰为 sample_count 且全部数值有限；原生时间满足 ``raw_t[0] ≈
-    pulse_duration_s``，此后每行 ``raw_t[i] ≈ pulse_duration_s +
-    i*sample_interval_s``（容差为 _TIME_CHECK_TOLERANCE 乘时间尺度，覆盖
-    正常浮点输出噪声，远小于一个采样间隔，不会掩盖漏采/多采）；每行磁化
-    满足 |分量| <= 1+1e-6 且 mx^2+my^2+mz^2 <= 1+1e-6。输出重锚为整数
-    index 与 ``i * sample_interval_s``，不透传原生时间。表头后出现的
-    ``#`` 注释行同样拒绝（可能意味着数据流重置/重复表头）。
+    Sampling-contract parameters (pulse_duration_s/sample_interval_s/sample_count)
+    have already been validated by the config; no business validation is repeated
+    here. Content contract: the header is semantically strictly equal to
+    _HEADER_COLUMNS (fixed order; rejects ns, wrong units, missing columns, and extra
+    columns); the number of data rows is exactly sample_count and all values are
+    finite; the native time satisfies ``raw_t[0] ≈ pulse_duration_s``, and thereafter
+    each row satisfies ``raw_t[i] ≈ pulse_duration_s + i*sample_interval_s``
+    (tolerance is _TIME_CHECK_TOLERANCE times the time scale, covering normal
+    floating-point output noise and far below one sampling interval, so it cannot
+    mask missing/extra samples); each row's magnetization satisfies
+    |component| <= 1+1e-6 and mx^2+my^2+mz^2 <= 1+1e-6. Output is re-anchored to
+    integer indices and ``i * sample_interval_s``; native times are not passed
+    through. ``#`` comment lines appearing after the header are rejected as well
+    (they may indicate a data-stream reset / repeated header).
     """
     text = table_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines:
-        raise TableParseError(f"{table_path}: 文件为空，缺少表头")
+        raise TableParseError(f"{table_path}: file is empty, missing header")
     header_line = lines[0].strip()
     if not header_line.startswith("#"):
-        raise TableParseError(f"{table_path}: 第 1 行不是 '#' 表头 {lines[0]!r}")
+        raise TableParseError(f"{table_path}: line 1 is not a '#' header {lines[0]!r}")
     columns = tuple(cell.strip() for cell in header_line[1:].split("\t"))
     if columns != _HEADER_COLUMNS:
         raise TableParseError(
-            f"{table_path}: 表头必须恰为且顺序等于 {_HEADER_COLUMNS}；实际 {columns}"
+            f"{table_path}: header must be exactly {_HEADER_COLUMNS} in this order; got {columns}"
         )
 
     tolerance = _TIME_CHECK_TOLERANCE * max(abs(pulse_duration_s), abs(sample_interval_s))
     rows: list[TrajectoryRow] = []
     for offset, line in enumerate(lines[1:], start=2):
         if line.lstrip().startswith("#"):
-            raise TableParseError(f"{table_path}: 第 {offset} 行出现表头后的注释行 {line!r}")
+            raise TableParseError(
+                f"{table_path}: line {offset} has a comment line after the header: {line!r}"
+            )
         if not line.strip():
-            raise TableParseError(f"{table_path}: 第 {offset} 行为空行")
+            raise TableParseError(f"{table_path}: line {offset} is an empty line")
         fields = line.split("\t")
         if len(fields) != len(_HEADER_COLUMNS):
             raise TableParseError(
-                f"{table_path}: 第 {offset} 行列数 {len(fields)} 不等于表头列数 "
-                f"{len(_HEADER_COLUMNS)}"
+                f"{table_path}: line {offset} column count {len(fields)} does not equal "
+                f"the header column count {len(_HEADER_COLUMNS)}"
             )
 
         raw_t = _parse_field(fields[0], table_path, offset, "t")
@@ -101,18 +114,20 @@ def parse_table(
         expected_t = pulse_duration_s + len(rows) * sample_interval_s
         if abs(raw_t - expected_t) > tolerance:
             raise TableParseError(
-                f"{table_path}: 第 {offset} 行原生时间 {raw_t!r} 偏离采样网格 "
-                f"{expected_t!r} 超过容差 {tolerance!r}；疑似漏采/多采"
+                f"{table_path}: line {offset} native time {raw_t!r} deviates from the "
+                f"sampling grid {expected_t!r} beyond tolerance {tolerance!r}; "
+                f"suspected missing/extra samples"
             )
         for name, value in (("mx", m_x), ("my", m_y), ("mz", m_z)):
             if abs(value) > 1.0 + _MAGNETIZATION_TOLERANCE:
                 raise TableParseError(
-                    f"{table_path}: 第 {offset} 行 {name}={value!r} 超出 |分量| <= 1 容许范围"
+                    f"{table_path}: line {offset} {name}={value!r} exceeds the "
+                    f"|component| <= 1 allowance"
                 )
         norm_sq = m_x * m_x + m_y * m_y + m_z * m_z
         if norm_sq > 1.0 + _MAGNETIZATION_TOLERANCE:
             raise TableParseError(
-                f"{table_path}: 第 {offset} 行 |m|^2 = {norm_sq!r} 超出 1 容许范围"
+                f"{table_path}: line {offset} |m|^2 = {norm_sq!r} exceeds the 1 allowance"
             )
 
         sample_index = len(rows)
@@ -120,16 +135,17 @@ def parse_table(
 
     if len(rows) != sample_count:
         raise TableParseError(
-            f"{table_path}: 数据行数 {len(rows)} 不等于 sample_count {sample_count}"
+            f"{table_path}: data row count {len(rows)} does not equal sample_count {sample_count}"
         )
     return rows
 
 
 def write_trajectory_csv(rows: Sequence[TrajectoryRow], path: Path) -> None:
-    """把轨迹行写出为 CSV，表头固定 sample_index,t_s,m_x,m_y,m_z。
+    """Write trajectory rows as CSV with the fixed header sample_index,t_s,m_x,m_y,m_z.
 
-    UTF-8、newline=""（禁用换行翻译，统一 LF）；浮点一律 .17g 往返
-    确定性格式；不创建父目录（由调用方保证存在）。
+    UTF-8, newline="" (newline translation disabled, LF only); floats always in the
+    deterministic ``.17g`` round-trip format; parent directories are not created (the
+    caller guarantees they exist).
     """
     with path.open("w", encoding="utf-8", newline="") as stream:
         stream.write(f"{_CSV_HEADER}\n")

@@ -1,194 +1,227 @@
 # micromagnetic-parameter-inversion
 
-基于 MuMax3 磁化动力学反演 Gilbert 阻尼系数 `alpha` 与单轴磁各向异性常数
-`Ku`。当前实现为**单激励 baseline**：y 方向 2 mT / 50 ps 短脉冲，关场后记录
-空间平均磁化轨迹 `(m_x, m_y, m_z)`，用 MLP 回归 `(alpha, Ku)`；多激励（不同
-方向脉冲以降低参数混淆）是项目长期目标，尚未启用。
+Invert the Gilbert damping coefficient `alpha` and the uniaxial anisotropy constant
+`Ku` from MuMax3 magnetization dynamics. The current implementation is a **single-
+excitation baseline**: a 2 mT / 50 ps short pulse along y, recording the spatially
+averaged magnetization trajectory `(m_x, m_y, m_z)` after the field is switched off,
+and regressing `(alpha, Ku)` with an MLP; multiple excitations (pulses in different
+directions to reduce parameter ambiguity) are a long-term project goal and are not
+enabled yet.
 
-**工程状态**：MuMax3 模拟生成 → 样本准备 → MLP 训练 → 独立 test 评估四段
-pipeline 均已实现（入口与用法见下）。正式数据生成进行中，**尚未在正式研究
-数据上训练，仓库内不存在可靠研究结果或结论**。1D CNN / Transformer 等后续
-模型不在当前实现范围内。
+**Project status**: all four pipeline stages -- MuMax3 simulation generation, sample
+preparation, MLP training, and independent test evaluation -- are implemented (entry
+points and usage below). Formal data generation is in progress; **no training on
+formal research data has been performed, and the repository contains no reliable
+research results or conclusions**. Follow-up models such as 1D CNN / Transformer are
+outside the current implementation scope.
 
-## 物理模型与固定协议
+## Physical model and fixed protocol
 
-MuMax3 在 0 K 下求解 Landau–Lifshitz–Gilbert 方程（Gilbert 显式形式，与
-MuMax3 内核约定一致）：
+MuMax3 solves the Landau-Lifshitz-Gilbert equation at 0 K (explicit Gilbert form,
+consistent with the MuMax3 kernel convention):
 
 ```
 dm/dt = -γ_LL/(1+α²) · [m × B_eff + α m × (m × B_eff)]
 ```
 
-其中 `α` 即待反演的 `alpha`，`γ_LL`（`GammaLL`）取 MuMax3 默认正值约定
-`1.7595e11 rad/(T·s)`，`B_eff` 为有效场（单位 T），含交换场、单轴各向异性
-场、退磁场与外场四项；0 K、无热噪声项。单一均匀有效介质，synthetic
-CoFeB-inspired 基准，不声称复现任何具体材料 stack；无 DMI / STT / 静态
-偏置场，开放边界（`SetPBC(0, 0, 0)`，`EnableDemag = true`）。
+Here `α` is the `alpha` to be inverted, `γ_LL` (`GammaLL`) uses the MuMax3 default
+positive-value convention `1.7595e11 rad/(T·s)`, and `B_eff` is the effective field
+(in T) with four terms: exchange, uniaxial anisotropy, demagnetizing, and external
+field; 0 K, with no thermal-noise term. A single uniform effective medium, synthetic
+CoFeB-inspired baseline; no claim of reproducing any specific material stack; no
+DMI / STT / static bias field, open boundaries (`SetPBC(0, 0, 0)`, `EnableDemag = true`).
 
-- 几何：扁三轴椭球（非恒厚椭圆柱），`SetGeom(Ellipsoid(dx, dy, dz))` 的
-  三轴全直径 `100 nm × 50 nm × 2 nm`（即 `size_m` 包围盒尺寸），
-  `cells = [40, 20, 4]`；易轴与初始磁化均沿 `+x`。
-- 固定材料/数值参数：`Ms = 1.25e6 A/m`、`Aex = 15e-12 J/m`、
-  `EdgeSmooth = 12`（先于 `SetGeom` 设置）、`solver = 5`、`MaxErr = 1e-5`、
-  `MaxDt = 1e-11 s`、`RelaxTorqueThreshold = -1`（官方默认）。
-- 激励与采样：每个 `(alpha, Ku)` 参数组先运行一次
-  [equilibrium.mx3.in](simulations/mumax3/equilibrium.mx3.in)（无外场
-  `Relax()`，产出全部 pulse 共享的平衡态）；随后
-  [simulation.mx3.in](simulations/mumax3/simulation.mx3.in) 加载该平衡态、
-  设入真实 `alpha`，施加 y 方向 2 mT / 50 ps 矩形脉冲后精确关场
-  （`B_ext = 0`），自关场时刻起每 10 ps 记录一次空间平均磁化
-  `(m_x, m_y, m_z)`，共 401 点（关场后 0..4 ns）。
-- 待反演参数：`alpha ∈ [0.004, 0.020]`（对数空间采样）、
-  `Ku ∈ [2000, 30000] J/m^3`（线性空间采样），Sobol 1024 点
-  （`scramble=True, rng=42`）；`Ku = 0` 仅作物理 control，不计入主域误差。
-- 以上为**固定离散约定**：网格收敛与真实器件有效性均未验证，不代表收敛
-  结论。
+- Geometry: flat triaxial ellipsoid (not a constant-thickness elliptical cylinder),
+  with the three full diameters of `SetGeom(Ellipsoid(dx, dy, dz))` equal to
+  `100 nm × 50 nm × 2 nm` (i.e. the `size_m` bounding-box size), and
+  `cells = [40, 20, 4]`; the easy axis and the initial magnetization are both along `+x`.
+- Fixed material/numerical parameters: `Ms = 1.25e6 A/m`, `Aex = 15e-12 J/m`,
+  `EdgeSmooth = 12` (set before `SetGeom`), `solver = 5`, `MaxErr = 1e-5`,
+  `MaxDt = 1e-11 s`, `RelaxTorqueThreshold = -1` (official default).
+- Excitation and sampling: for each `(alpha, Ku)` parameter set, first run
+  [equilibrium.mx3.in](simulations/mumax3/equilibrium.mx3.in) once (zero field,
+  `Relax()`, producing the equilibrium state shared by all pulses); then
+  [simulation.mx3.in](simulations/mumax3/simulation.mx3.in) loads that equilibrium
+  state, sets the true `alpha`, applies a 2 mT / 50 ps rectangular pulse along y, and
+  switches the field off exactly (`B_ext = 0`), recording the spatially averaged
+  magnetization `(m_x, m_y, m_z)` every 10 ps from the switch-off instant, 401 points
+  in total (0..4 ns after switch-off).
+- Inversion targets: `alpha ∈ [0.004, 0.020]` (log-space sampling),
+  `Ku ∈ [2000, 30000] J/m^3` (linear-space sampling), 1024 Sobol points
+  (`scramble=True, rng=42`); `Ku = 0` serves only as a physical control and is
+  excluded from the main-domain error.
+- The above are **fixed discretization conventions**: neither mesh convergence nor
+  real-device validity has been verified, and they do not represent convergence
+  conclusions.
 
-协议数值的唯一来源是
-[scripts/generate_dataset.py](scripts/generate_dataset.py)（`FIXED_CONFIGS` /
-`PARAMETERS`）；YAML 校验与 mT→T 单位换算边界见
-[src/micromagnetic_parameter_inversion/mumax3_config.py](src/micromagnetic_parameter_inversion/mumax3_config.py)；
-模板渲染（公共模型段与椭球几何/材料参数的唯一渲染器）见
-[src/micromagnetic_parameter_inversion/mumax3_script.py](src/micromagnetic_parameter_inversion/mumax3_script.py)；
-模拟编排与轨迹导出见
+The single source of truth for protocol values is
+[scripts/generate_dataset.py](scripts/generate_dataset.py) (`FIXED_CONFIGS` /
+`PARAMETERS`); the YAML validation and mT→T unit-conversion boundary are in
+[src/micromagnetic_parameter_inversion/mumax3_config.py](src/micromagnetic_parameter_inversion/mumax3_config.py);
+template rendering (the only renderer for the shared model section and the ellipsoid
+geometry/material parameters) is in
+[src/micromagnetic_parameter_inversion/mumax3_script.py](src/micromagnetic_parameter_inversion/mumax3_script.py);
+simulation orchestration and trajectory export are in
 [src/micromagnetic_parameter_inversion/mumax3_pipeline.py](src/micromagnetic_parameter_inversion/mumax3_pipeline.py)
-与
-[src/micromagnetic_parameter_inversion/mumax3_results.py](src/micromagnetic_parameter_inversion/mumax3_results.py)；
-协议模板与字段说明参照
-[configs/experiments/mumax3_simulation.yaml](configs/experiments/mumax3_simulation.yaml)。
+and
+[src/micromagnetic_parameter_inversion/mumax3_results.py](src/micromagnetic_parameter_inversion/mumax3_results.py);
+the protocol template and field descriptions are in
+[configs/experiments/mumax3_simulation.yaml](configs/experiments/mumax3_simulation.yaml).
 
-## MLP 架构与训练（要点）
+## MLP architecture and training (highlights)
 
-baseline 模型为纯 MLP 回归器
-（[src/micromagnetic_parameter_inversion/models/mlp.py](src/micromagnetic_parameter_inversion/models/mlp.py)）：
+The baseline model is a pure MLP regressor
+([src/micromagnetic_parameter_inversion/models/mlp.py](src/micromagnetic_parameter_inversion/models/mlp.py)):
 
-- 输入契约：单样本为某参数组全部 pulse 的原始时域轨迹 `[P, T, 3]`（batch
-  `[N, P, T, 3]`，通道为 mx/my/mz）；不做每 pulse 切分、手工统计特征或
-  降采样。当前协议 `P = 1`（仅 `pulse_A2`）、`T = 401`，展平维度
-  `D = P·T·3 = 1203`。
-- 网络：`Flatten` 后接隐层序列（默认 `64 → 32 → 32`，每层 `Linear + ReLU`），
-  末层 `Linear` 双输出 `(alpha, Ku)` 的**标准化标签值**（z-score 空间，非
-  物理单位）。`hidden_dims` 在
-  [configs/training/mlp.yaml](configs/training/mlp.yaml) 配置，属工程候选，
-  非已验证科研参数。
-- 预处理
-  （[src/micromagnetic_parameter_inversion/preprocessing.py](src/micromagnetic_parameter_inversion/preprocessing.py)）：
-  输入统计量仅在 train 组拟合，沿样本维与时间轴聚合为每 pulse 位置、每
-  磁化分量的 mean/std（形状 `[P, 1, 3]`，广播作用于整条轨迹；
-  `std <= std_eps`（默认 `1e-8`）的位置除数取 1）。标签变换默认
-  `identity`；可选 `logalpha` 仅对 alpha 列取 **log10**（float64 计算，要求
-  alpha > 0，非自然对数），随后逐输出 z-score。
-- 训练
-  （[src/micromagnetic_parameter_inversion/training.py](src/micromagnetic_parameter_inversion/training.py)）：
-  Adam（默认 `lr = 1e-3`、`weight_decay = 0`），标准化标签空间 MSE 损失，
-  `batch_size = 32`、`max_epochs = 500`、`seed = 42`；early stopping
-  （`patience = 50`、`min_delta = 0`）用独立 reference，与绝对 best 分开；
-  val loss 绝对最优权重写 `best.pt`，最后完成 epoch 权重写 `final.pt`；
-  非有限 loss/grad/pred 立即停止且不保存坏权重。
-- 评估
-  （[src/micromagnetic_parameter_inversion/evaluation.py](src/micromagnetic_parameter_inversion/evaluation.py)）：
-  网络结构、预处理与标签变换全部从 checkpoint 恢复（不经当前 YAML），预测
-  经逆变换还原物理单位后报告 alpha/Ku 的 MAE/RMSE（Ku 单位 J/m^3）；主域
-  排除 `Ku = 0` 的 control，control 单独报告。
+- Input contract: one sample is the raw time-domain trajectory `[P, T, 3]` of all
+  pulses for a parameter set (batch `[N, P, T, 3]`, channels mx/my/mz); no per-pulse
+  splitting, hand-crafted statistical features, or downsampling. The current
+  protocol has `P = 1` (only `pulse_A2`) and `T = 401`, so the flattened dimension is
+  `D = P·T·3 = 1203`.
+- Network: `Flatten` followed by a hidden-layer sequence (default `64 → 32 → 32`,
+  each layer `Linear + ReLU`), with a final `Linear` layer producing two outputs
+  `(alpha, Ku)` in **standardized label space** (z-score space, not physical units).
+  `hidden_dims` is configured in
+  [configs/training/mlp.yaml](configs/training/mlp.yaml) as an engineering candidate,
+  not a validated research parameter.
+- Preprocessing
+  ([src/micromagnetic_parameter_inversion/preprocessing.py](src/micromagnetic_parameter_inversion/preprocessing.py)):
+  input statistics are fit on the train split only and aggregated over the sample and
+  time axes into per-pulse-position, per-magnetization-component mean/std (shape
+  `[P, 1, 3]`, broadcast over the full trajectory; positions with
+  `std <= std_eps` (default `1e-8`) use a divisor of 1). The label transform defaults
+  to `identity`; the optional `logalpha` takes **log10** of the alpha column only
+  (computed in float64, requires alpha > 0; not the natural logarithm), followed by
+  per-output z-scoring.
+- Training
+  ([src/micromagnetic_parameter_inversion/training.py](src/micromagnetic_parameter_inversion/training.py)):
+  Adam (defaults `lr = 1e-3`, `weight_decay = 0`), MSE loss in standardized label
+  space, `batch_size = 32`, `max_epochs = 500`, `seed = 42`; early stopping
+  (`patience = 50`, `min_delta = 0`) uses an independent reference, separated from the
+  absolute best; the absolute-best val-loss weights are written to `best.pt`, and the
+  weights of the last completed epoch to `final.pt`; non-finite loss/grad/pred stops
+  immediately and no bad weights are saved.
+- Evaluation
+  ([src/micromagnetic_parameter_inversion/evaluation.py](src/micromagnetic_parameter_inversion/evaluation.py)):
+  network structure, preprocessing, and label transform are all restored from the
+  checkpoint (not from the current YAML); predictions are inverse-transformed back to
+  physical units before reporting alpha/Ku MAE/RMSE (Ku in J/m^3); the main domain
+  excludes the `Ku = 0` control, which is reported separately.
 
-## 安装与前置条件
+## Installation and prerequisites
 
-- Python 3.13（`>=3.13,<3.14`），由 [uv](https://docs.astral.sh/uv/) 管理；
-  在仓库根目录运行 `uv sync` 创建 `.venv` 并安装依赖。PyTorch 来自官方
-  CUDA 12.8 wheel 索引（x86_64 Linux / Windows，见 `pyproject.toml`）。
-- GPU 驱动与 [MuMax3](https://mumax.github.io/) 均为外部前提，本项目不安装、
-  不打包：MuMax3 加入 `PATH` 或设置 `MUMAX3_BIN`。
-- 环境诊断：
+- Python 3.13 (`>=3.13,<3.14`), managed by [uv](https://docs.astral.sh/uv/); run
+  `uv sync` in the repository root to create `.venv` and install dependencies.
+  PyTorch comes from the official CUDA 12.8 wheel index (x86_64 Linux / Windows, see
+  `pyproject.toml`).
+- A GPU driver and [MuMax3](https://mumax.github.io/) are external prerequisites; this
+  project does not install or bundle them: add MuMax3 to `PATH` or set `MUMAX3_BIN`.
+- Environment diagnostics:
 
   ```bash
   uv run python scripts/check_environment.py
   ```
 
-  报告 Python、包版本、CUDA 可用性与设备、MuMax3 状态、数据/输出路径；CUDA
-  或 MuMax3 缺失时仍以 0 退出，须阅读报告内容而非依赖退出码。
+  Reports Python, package versions, CUDA availability and device, MuMax3 status, and
+  data/output paths; it still exits 0 when CUDA or MuMax3 is missing, so read the
+  report content rather than relying on the exit code.
 
-## 使用流程（四个入口）
+## Workflow (four entry points)
 
-以下命令均在仓库根目录运行，参数以各脚本的真实 CLI 为准。
+All commands below are run from the repository root; arguments follow each script's
+actual CLI.
 
-### 1. 生成原始数据
+### 1. Generate raw data
 
 ```bash
 uv run python scripts/generate_dataset.py
 ```
 
-- 无 CLI 参数：固定协议字段与 1024 个 Sobol 参数点写在脚本内
-  （`FIXED_CONFIGS` / `PARAMETERS`），**不读取外部 YAML/清单**；
-  `configs/experiments/mumax3_simulation.yaml` 只是协议模板与 schema 参照，
-  不是生成入口。
-- 前置：MuMax3 可用；目标输出目录 `data/raw/<dataset_name>/<psid>/` 不存在
-  （已存在会被拒绝，不覆盖、不清理）。
-- 并发由脚本常量 `MAX_WORKERS` 控制（`1` 为串行），无 resume/跳过；单点或
-  补跑改为在脚本内 `PARAMETERS` 中只保留尚未执行的目标。
-- 生成配置写在 `artifacts/generated_configs/<dataset_name>/`。批量执行会
-  长时间占用 GPU，运行前请评估本机 GPU 资源与预计耗时。
+- No CLI arguments: the fixed protocol fields and 1024 Sobol parameter points are
+  written in the script (`FIXED_CONFIGS` / `PARAMETERS`), and **no external
+  YAML/manifest is read**; `configs/experiments/mumax3_simulation.yaml` is only the
+  protocol template and schema reference, not the generation entry point.
+- Prerequisite: MuMax3 available; the target output directory
+  `data/raw/<dataset_name>/<psid>/` does not exist (an existing one is refused, not
+  overwritten or cleaned).
+- Concurrency is controlled by the script constant `MAX_WORKERS` (`1` = serial); there
+  is no resume/skip; for a single point or a gap-filling rerun, keep only the not-yet-
+  run targets in `PARAMETERS` inside the script.
+- Generated configs are written under `artifacts/generated_configs/<dataset_name>/`.
+  Batch execution occupies the GPU for a long time; assess local GPU resources and
+  expected runtime before running.
 
-### 2. 准备训练样本
+### 2. Prepare training samples
 
 ```bash
 uv run python scripts/prepare_training_samples.py \
   --config configs/training/mlp.yaml --parameter-set-ids all
 ```
 
-- 前置：把 `configs/training/mlp.yaml` 的 `dataset_name` 占位符替换为实际
-  dataset；`--config` 与 `--parameter-set-ids` 均为必填（后者为显式 psid
-  列表或 `all`，`all` 只展开所选 dataset 目录）。
-- 输出 `data/samples/<dataset_name>/`：每参数组一个 `<psid>.npz`，外加
-  `dataset_meta.yaml` 与 `split.yaml`；写前预检、拒绝覆盖，失败可能留下
-  部分产物，须人工清理后重跑。
+- Prerequisite: replace the `dataset_name` placeholder in
+  `configs/training/mlp.yaml` with the actual dataset; `--config` and
+  `--parameter-set-ids` are both required (the latter is an explicit psid list or
+  `all`, and `all` expands only the selected dataset directory).
+- Output `data/samples/<dataset_name>/`: one `<psid>.npz` per parameter set, plus
+  `dataset_meta.yaml` and `split.yaml`; pre-checks run before writing and existing
+  files are refused; a failure may leave partial products that must be cleaned up
+  manually before rerunning.
 
-### 3. 训练（仅 train/val）
+### 3. Training (train/val only)
 
 ```bash
 uv run python scripts/train_mlp.py --config configs/training/mlp.yaml
 ```
 
-- 前置：替换 `run_name` 占位符；输出目录不存在。
-- 标准化/标签统计量只在 train 组拟合；`test` 不参与调参或模型选择。
-- 输出目录默认 `artifacts/training/mlp/<dataset>/<run_name>/`，含
-  `best.pt` / `final.pt` / `metrics.json` / `split.yaml` 等。
+- Prerequisites: replace the `run_name` placeholder; the output directory must not
+  exist.
+- Standardization/label statistics are fit on the train split only; `test` takes no
+  part in tuning or model selection.
+- The default output directory is `artifacts/training/mlp/<dataset>/<run_name>/` and
+  contains `best.pt` / `final.pt` / `metrics.json` / `split.yaml`, etc.
 
-### 4. 独立 test 评估
+### 4. Independent test evaluation
 
 ```bash
 uv run python scripts/evaluate_model.py --run <RUN_DIR>
 ```
 
-- `--checkpoint` 可选（缺省 `<RUN_DIR>/best.pt`）；checkpoint 与 run 内 split
-  副本 SHA 绑定。
-- 在 run 目录写出 `test_metrics.json`（main/control 的 MAE/RMSE，物理单位）
-  与 `test_predictions.csv`；产物已存在则拒绝覆盖。
+- `--checkpoint` is optional (default `<RUN_DIR>/best.pt`); the checkpoint is bound by
+  SHA to the split copy inside the run.
+- Writes `test_metrics.json` (main/control MAE/RMSE in physical units) and
+  `test_predictions.csv` into the run directory; existing products are refused.
 
-## 数据与输出
+## Data and outputs
 
-- `data/raw/`：MuMax3 原始输出；`data/samples/`：预处理样本；`artifacts/`：
-  运行产物与 checkpoint。原始数据、样本与产物均不入 Git，对外公开的仓库只含
-  代码与文档。
-- 数据与输出路径可用环境变量覆盖：`MICROMAG_DATA_ROOT`、
-  `MICROMAG_OUTPUT_ROOT`（见
-  [src/micromagnetic_parameter_inversion/paths.py](src/micromagnetic_parameter_inversion/paths.py)）；
-  MuMax3 可执行文件用 `MUMAX3_BIN`（见
-  [src/micromagnetic_parameter_inversion/external.py](src/micromagnetic_parameter_inversion/external.py)），
-  未设置时按平台默认名在 `PATH` 查找。
-- **`.env` 不会自动加载**（代码未调用 `load_dotenv`）：需要环境变量时由
-  shell 或运行环境显式注入，不要假设放置 `.env` 文件即生效；`.env` 由
-  `.gitignore` 排除，不会入库。
-- 仓库尚未选择开源许可证（LICENSE 未添加）。
+- `data/raw/`: raw MuMax3 output; `data/samples/`: preprocessed samples; `artifacts/`:
+  run products and checkpoints. Raw data, samples, and artifacts are not committed to
+  Git; the public repository contains only code and documentation.
+- Data and output paths can be overridden with environment variables:
+  `MICROMAG_DATA_ROOT`, `MICROMAG_OUTPUT_ROOT` (see
+  [src/micromagnetic_parameter_inversion/paths.py](src/micromagnetic_parameter_inversion/paths.py));
+  the MuMax3 executable uses `MUMAX3_BIN` (see
+  [src/micromagnetic_parameter_inversion/external.py](src/micromagnetic_parameter_inversion/external.py)),
+  and when unset it is looked up in `PATH` under the platform default name.
+- **`.env` is not loaded automatically** (the code does not call `load_dotenv`):
+  inject environment variables explicitly from the shell or runtime environment; do
+  not assume that placing a `.env` file is sufficient. `.env` is excluded by
+  `.gitignore` and never enters the repository.
+- No open-source license has been chosen yet (no LICENSE added).
 
-## 科研完整性约定
+## Research-integrity conventions
 
-- 数据划分按参数组合 `(alpha, Ku)` 分组：同一组合的所有激励轨迹必须同组
-  （train/val/test），防止跨组泄漏。
-- 标准化与标签统计量仅在训练组拟合；test 独立评估；训练 seed 取
-  `configs/training/mlp.yaml` 的 `training.seed`，生成数据的 Sobol seed
-  固定在 `scripts/generate_dataset.py`；依赖固定于 `uv.lock`，不虚构参数范围。
-- 最终结论需 MuMax3 正向回代验证（反演参数 → 正向模拟 → 与观测对比），
-  当前尚未执行。
-- **尚未验证**：网格收敛、Relax 收敛阈值与鲁棒性、EdgeSmooth 选择的系统
-  论证、批量可复现性、OVF 物理级 QC、真实器件有效性、正向回代，以及在
-  正式研究数据上的训练有效性。
+- Data splits are grouped by parameter combination `(alpha, Ku)`: all excitation
+  trajectories of the same combination must stay in the same split (train/val/test)
+  to prevent cross-group leakage.
+- Standardization and label statistics are fit on the training split only; test is
+  evaluated independently; the training seed comes from `training.seed` in
+  `configs/training/mlp.yaml`, the data-generation Sobol seed is fixed in
+  `scripts/generate_dataset.py`; dependencies are pinned in `uv.lock`, and parameter
+  ranges are not invented.
+- Final conclusions require MuMax3 forward re-validation (inverted parameters →
+  forward simulation → comparison with observations), which has not been performed
+  yet.
+- **Not yet verified**: mesh convergence, the Relax convergence threshold and its
+  robustness, systematic justification of the EdgeSmooth choice, batch
+  reproducibility, physical-level OVF QC, real-device validity, forward
+  re-validation, and training effectiveness on formal research data.

@@ -1,41 +1,49 @@
 // =============================================================================
-// equilibrium.mx3.in —— 平衡态模板。占位符由
-// mumax3_script.render_equilibrium_script 填入；每个 parameter set 渲染并
-// 执行一次：进程工作目录 = equilibrium/，渲染脚本固定名 equilibrium.mx3；
-// MuMax3 默认原生输出目录 equilibrium.out/（契约必需：equilibrium.ovf）；
-// run.log 由 pipeline 写在 equilibrium/ 根。产出供全部
-// pulse 共享的 equilibrium.ovf。
-// 命令写法依据 MuMax3 3.12 官方 API 文档；执行链已经短 test-only pilot
-// （8×4×1、1 pulse、3 samples）基础验证。数值协议（EdgeSmooth/solver/
-// MaxErr/MaxDt/GammaLL/RelaxTorqueThreshold）由 YAML numerics 块显式注入；
-// 诊断（geom.ovf 快照与 DIAGNOSTIC stdout 行）进入原生输出目录与 run.log；
-// 其收敛/QC 验证仍待完成，完成前不得用于正式科研数据。
-// 物理假设见仓库根 README.md：0 K、单一均匀材料、扁椭球薄纳
-// 米磁体、demag 开启、开放边界无 PBC、无 DMI、无 STT、无静态偏置场。
+// equilibrium.mx3.in -- equilibrium-state template. Placeholders are filled in by
+// mumax3_script.render_equilibrium_script; rendered and executed once per parameter
+// set: process working directory = equilibrium/, rendered script fixed name
+// equilibrium.mx3; MuMax3 default native output directory equilibrium.out/
+// (contract-required: equilibrium.ovf); run.log is written by the pipeline at the
+// equilibrium/ root. Produces the equilibrium.ovf shared by all pulses.
+// Command syntax follows the MuMax3 3.12 official API documentation; the execution
+// chain has been minimally validated by a short test-only pilot (8x4x1, 1 pulse,
+// 3 samples). The numerical protocol (EdgeSmooth/solver/MaxErr/MaxDt/GammaLL/
+// RelaxTorqueThreshold) is explicitly injected from the YAML numerics block;
+// diagnostics (geom.ovf snapshot and DIAGNOSTIC stdout lines) go to the native
+// output directory and run.log; convergence/QC validation remains to be done, and
+// until then this must not be used for formal research data.
+// Physical assumptions are in README.md at the repository root: 0 K, single uniform
+// material, flat-ellipsoid thin nano-magnet, demag enabled, open boundaries without
+// PBC, no DMI, no STT, no static bias field.
 // =============================================================================
 
-// 1. 公共模型段：数值协议（EdgeSmooth/SetSolver/MaxErr/MaxDt/GammaLL）+
-//    网格/椭球几何/Msat/Aex/Ku1/易轴/demag/开放边界的唯一渲染文本
-//    （_render_model_setup），与 simulation.mx3.in 的公共段逐字节相同；
-//    cell_size 由 size_m/cells 派生后填入；alpha 与 RelaxTorqueThreshold
-//    不属于公共段。
+// 1. Shared model section: numerical protocol (EdgeSmooth/SetSolver/MaxErr/MaxDt/
+//    GammaLL) plus the single rendering of grid/ellipsoid geometry/Msat/Aex/Ku1/
+//    easy axis/demag/open boundaries (_render_model_setup), byte-identical to the
+//    shared section of simulation.mx3.in; cell_size is derived from size_m/cells and
+//    filled in; alpha and RelaxTorqueThreshold are not part of the shared section.
 {{MODEL_SETUP}}
 
-// 2. 均匀初态：固定初态方向（此后不再改初态）
+// 2. Uniform initial state: fixed initial direction (the initial state is not
+//    changed afterwards)
 m = uniform({{INIT_M}})
 
-// 3. 诊断快照：几何体素化（SetGeom 已在公共段完成）-> equilibrium.out/geom.ovf
+// 3. Diagnostic snapshot: geometry voxelization (SetGeom already done in the shared
+//    section) -> equilibrium.out/geom.ovf
 SaveAs(geom, "geom")
 
-// 4. 无外场平衡（仅一次；无静态偏置场，B_ext 恒 0）。RelaxTorqueThreshold
-//    由 YAML numerics 块渲染，单位 T；-1 保留官方默认（平均转矩平稳/增大
-//    即停）。Relax 内部可能临时切换 solver，结束后恢复用户 SetSolver 配置。
+// 4. Zero-field equilibration (once only; no static bias field, B_ext is identically
+//    0). RelaxTorqueThreshold is rendered from the YAML numerics block in T; -1 keeps
+//    the official default (stop once the average torque plateaus/increases). Relax
+//    may temporarily switch the solver internally and restores the user SetSolver
+//    configuration afterwards.
 B_ext = vector(0, 0, 0)
 RelaxTorqueThreshold = {{RELAX_TORQUE_THRESHOLD_T}}
 relax_converged := Relax()
-// 诊断经 stdout 进入 run.log（DIAGNOSTIC 前缀便于检索）；MaxTorque 单位
-// T，E_total 单位 J，step/NEval 为整数计数。
+// Diagnostics go to run.log via stdout (DIAGNOSTIC prefix for easy lookup);
+// MaxTorque is in T, E_total in J, step/NEval are integer counts.
 print("DIAGNOSTIC relax_converged=", relax_converged, " MaxTorque_T=", MaxTorque, " E_total_J=", E_total, " step=", step, " NEval=", NEval)
 
-// 5. 保存共享平衡态：写入默认原生输出目录，即 equilibrium.out/equilibrium.ovf
+// 5. Save the shared equilibrium state: written to the default native output
+//    directory, i.e. equilibrium.out/equilibrium.ovf
 SaveAs(m, "equilibrium")

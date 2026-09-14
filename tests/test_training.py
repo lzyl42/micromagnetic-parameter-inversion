@@ -1,7 +1,8 @@
 """Tests for the training CLI, ckpt safety and reload parity (offline, CPU).
 
-合成 npz/meta/split 直接经 training_data 写入 tmp_path（不经 raw/prepare、
-不跨测试导入 fixture）；device 恒为 cpu；不触 GPU/MuMax3。
+Synthetic npz/meta/split are written directly via training_data into tmp_path
+(no raw/prepare, no cross-test fixture imports); device is always cpu; no
+GPU/MuMax3.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ _SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_mlp.py"
 
 
 def _load_script() -> Any:
-    """按路径加载 train_mlp 脚本模块（scripts/ 非包；自带、不跨测试导入）。"""
+    """Load the train_mlp script module by path (scripts/ is not a package; self-contained)."""
     spec = importlib.util.spec_from_file_location("train_mlp_script", _SCRIPT_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -42,7 +43,7 @@ def _load_script() -> Any:
 
 @pytest.fixture()
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
-    """重定向 MICROMAG_DATA_ROOT / MICROMAG_OUTPUT_ROOT 到临时目录。"""
+    """Redirect MICROMAG_DATA_ROOT / MICROMAG_OUTPUT_ROOT to temporary directories."""
     data_root = tmp_path / "data"
     out_root = tmp_path / "out"
     data_root.mkdir()
@@ -60,7 +61,7 @@ def _write_prepared_samples(
     n_steps: int = 8,
     seed: int = 0,
 ) -> Path:
-    """直接合成 npz + dataset_meta.yaml + split.yaml（跳过 raw/prepare）。"""
+    """Synthesize npz + dataset_meta.yaml + split.yaml directly (skipping raw/prepare)."""
     rng = np.random.default_rng(seed)
     psids = tuple(f"ps{i:04d}" for i in range(n_groups))
     pulses = tuple(f"p{j}" for j in range(n_pulses))
@@ -158,19 +159,19 @@ def test_run_trains_and_writes_artifacts(env: tuple[Path, Path]) -> None:
     assert metrics["best_val_loss"] == min(e["val_loss"] for e in metrics["history"])
     assert metrics["best_epoch"] in {entry["epoch"] for entry in metrics["history"]}
 
-    # config_resolved.yaml 可被 load_config 重新加载且字段一致
+    # config_resolved.yaml is reloadable by load_config with identical fields
     resolved = load_config(run_dir / "config_resolved.yaml")
     assert (resolved.dataset_name, resolved.run_name) == ("ds1", "r1")
     assert resolved.model.hidden_dims == (8, 4)
     assert resolved.training.max_epochs == 2
-    # split 副本 = 源 split.yaml 原字节
+    # split copy = raw bytes of the source split.yaml
     assert (run_dir / "split.yaml").read_bytes() == (samples_dir / "split.yaml").read_bytes()
     prep = yaml.safe_load((run_dir / "preprocessing.yaml").read_text(encoding="utf-8"))
     assert len(prep["x_stats"]["mean"]) == 2  # [P=2, 1, 3]
     assert len(prep["x_stats"]["mean"][0][0]) == 3
     assert prep["y_stats"]["transform"] == "identity"
 
-    # weights_only 安全读取
+    # weights_only safe read
     for name in ("best.pt", "final.pt"):
         payload = torch.load(run_dir / name, weights_only=True, map_location="cpu")
         assert isinstance(payload, dict)
@@ -194,7 +195,7 @@ def test_ckpt_roundtrip_reload_parity(env: tuple[Path, Path]) -> None:
     assert ckpt.dataset_meta_sha256 == training_data.sha256_file(samples_dir / "dataset_meta.yaml")
     assert all(t.device.type == "cpu" for t in ckpt.model_state_dict.values())
     assert all(t.isfinite().all() for t in ckpt.model_state_dict.values())
-    # 预处理状态 roundtrip：mean/effective scale 形状与语义
+    # preprocessing state roundtrip: mean/effective scale shapes and semantics
     assert ckpt.preprocessing.x_stats.mean.shape == (2, 1, 3)
     assert ckpt.preprocessing.y_stats.y_mean.shape == (2,)
 
@@ -206,10 +207,10 @@ def test_ckpt_roundtrip_reload_parity(env: tuple[Path, Path]) -> None:
         with torch.no_grad():
             return model(probe)
 
-    # 两次独立 load + 重建模型 → 预测逐位一致
+    # two independent loads + rebuilt models → bitwise-identical predictions
     again = training.load_checkpoint(run_dir / "best.pt")
     assert torch.equal(_predict(ckpt), _predict(again))
-    # final.pt 的 best_val_loss 为 None（best 才有）
+    # final.pt has best_val_loss None (only best.pt has it)
     final = training.load_checkpoint(run_dir / "final.pt")
     assert final.best_val_loss is None
     assert torch.equal(_predict(final), _predict(training.load_checkpoint(run_dir / "final.pt")))
@@ -221,9 +222,9 @@ def test_save_checkpoint_refuses_overwrite(env: tuple[Path, Path]) -> None:
     config_path = _write_config(data_root, _config_text("ds3", "r1"))
     run_dir = _load_script().run(config_path)
     ckpt = training.load_checkpoint(run_dir / "best.pt")
-    with pytest.raises(FileExistsError, match="拒绝覆盖"):
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
         training.save_checkpoint(run_dir / "best.pt", ckpt)
-    with pytest.raises(FileExistsError, match="拒绝覆盖"):
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
         training.save_checkpoint(run_dir / "final.pt", ckpt)
 
 
@@ -245,17 +246,17 @@ def test_load_checkpoint_rejects_corrupt(env: tuple[Path, Path], tmp_path: Path)
 
     with pytest.raises(training.TrainingError, match="ckpt_format_version"):
         training.load_checkpoint(_broken(lambda p: p.__setitem__("ckpt_format_version", 999)))
-    with pytest.raises(training.TrainingError, match="缺失键"):
+    with pytest.raises(training.TrainingError, match="missing keys"):
         training.load_checkpoint(_broken(lambda p: p.pop("contract")))
     with pytest.raises(training.TrainingError, match="t_s"):
         training.load_checkpoint(
             _broken(lambda p: p["contract"].__setitem__("t_s", p["contract"]["t_s"][:-1]))
         )
-    with pytest.raises(training.TrainingError, match="映射"):
+    with pytest.raises(training.TrainingError, match="mapping"):
         broken_list = tmp_path / "not_a_dict.pt"
         torch.save([1, 2, 3], broken_list)
         training.load_checkpoint(broken_list)
-    with pytest.raises(training.TrainingError, match="形状"):
+    with pytest.raises(training.TrainingError, match="shape"):
         training.load_checkpoint(
             _broken(lambda p: p["preprocessing"]["x_stats"].__setitem__("mean", [[0.0]]))
         )
@@ -272,22 +273,22 @@ def test_run_rejects_existing_run_dir(
     script = _load_script()
     assert script.run(config_path).is_dir()
     assert script.main(["--config", str(config_path)]) == 2
-    assert "已存在" in capsys.readouterr().err
+    assert "refusing to overwrite" in capsys.readouterr().err
 
 
 def test_earlystop_reference_independent_of_best(env: tuple[Path, Path]) -> None:
     data_root, _ = env
     _write_prepared_samples(data_root, "ds6")
-    # min_delta 极大：reference 永不显著改善 → patience=1 时第 2 个 epoch 后必停
+    # very large min_delta: the reference never improves significantly → stop after epoch 2
     config_path = _write_config(
         data_root, _config_text("ds6", "r1", max_epochs=10, patience=1, min_delta=1.0e6)
     )
     run_dir = _load_script().run(config_path)
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-    assert len(metrics["history"]) == 2  # 早停触发，未跑满 max_epochs
+    assert len(metrics["history"]) == 2  # early stopping triggered before max_epochs
     assert metrics["stop_reason"] == "early_stopping"
     assert metrics["stop_epoch"] == 2
-    # 绝对 best 与 earlystop reference 分开：best 仍取全程最低 val loss
+    # absolute best is separate from the earlystop reference: best is still the lowest val loss
     assert metrics["best_val_loss"] == min(e["val_loss"] for e in metrics["history"])
     final = training.load_checkpoint(run_dir / "final.pt")
     assert final.best_val_loss is None
@@ -301,7 +302,7 @@ def test_seed_determinism_across_runs(env: tuple[Path, Path]) -> None:
     run_b = script.run(_write_config(data_root, _config_text("ds7", "r_b"), name="b.yaml"))
     metrics_a = json.loads((run_a / "metrics.json").read_text(encoding="utf-8"))
     metrics_b = json.loads((run_b / "metrics.json").read_text(encoding="utf-8"))
-    assert metrics_a["history"] == metrics_b["history"]  # 同 seed 同数据 → 逐位一致
+    assert metrics_a["history"] == metrics_b["history"]  # same seed, same data → bitwise identical
     best_a = training.load_checkpoint(run_a / "best.pt")
     best_b = training.load_checkpoint(run_b / "best.pt")
     for name, tensor in best_a.model_state_dict.items():
@@ -316,18 +317,20 @@ def test_contract_mismatch_across_members_rejected(env: tuple[Path, Path]) -> No
     victim = samples_dir / f"{split.val[0]}.npz"
     with np.load(victim, allow_pickle=False) as archive:
         arrays = {key: archive[key] for key in archive.files}
-    arrays["x"] = arrays["x"][:, :-1, :]  # T 少一步：成员间契约错配
+    arrays["x"] = arrays["x"][:, :-1, :]  # one step fewer in T: contract mismatch across members
     arrays["t_s"] = arrays["t_s"][:-1]
     np.savez_compressed(victim, **arrays)
 
     config_path = _write_config(data_root, _config_text("ds8", "r1"))
-    with pytest.raises(training_data.DataError, match="契约"):
+    with pytest.raises(training_data.DataError, match="contract"):
         _load_script().run(config_path)
-    assert not (out_root / "training" / "mlp" / "ds8" / "r1").exists()  # 训练前拒绝
+    assert not (out_root / "training" / "mlp" / "ds8" / "r1").exists()  # refused before training
 
 
 class _TwoSampleSet(torch.utils.data.Dataset):
-    """两个样本、y 恒为 0 的最小数据集（配合偏置 1e19 模型触发 float32 求和溢出）。"""
+    """Minimal two-sample dataset with y always 0 (pairs with a 1e19-bias model for
+    float32 sum overflow).
+    """
 
     def __len__(self) -> int:
         return 2
@@ -337,7 +340,9 @@ class _TwoSampleSet(torch.utils.data.Dataset):
 
 
 def test_run_validation_float64_aggregate_survives_float32_sum_overflow() -> None:
-    """se 元素 float32 有限（1e38）但 float32 求和溢出 → 聚合必须升 float64。"""
+    """se elements are float32-finite (1e38) but the float32 sum overflows → the
+    aggregate must promote to float64.
+    """
     from torch.utils.data import DataLoader
 
     model = training.build_model(
@@ -349,7 +354,7 @@ def test_run_validation_float64_aggregate_survives_float32_sum_overflow() -> Non
     first_linear = model.network[1]
     last_linear = model.network[3]
     assert isinstance(first_linear, nn.Linear) and isinstance(last_linear, nn.Linear)
-    with torch.no_grad():  # 常数输出 1e19：隐层归零，末层仅偏置
+    with torch.no_grad():  # constant output 1e19: hidden layers zeroed, last layer bias only
         first_linear.weight.zero_()
         first_linear.bias.zero_()
         last_linear.weight.zero_()
@@ -371,7 +376,7 @@ def test_run_validation_float64_aggregate_survives_float32_sum_overflow() -> Non
     )
     loader: DataLoader[Any] = DataLoader(_TwoSampleSet(), batch_size=2)
     val_loss = training.run_validation(model, loader, state, "cpu")
-    # 2 样本 × 2 列 × (1e19)^2 = 4e38 > float32 max：旧实现此处为 inf
+    # 2 samples × 2 columns × (1e19)^2 = 4e38 > float32 max: the old implementation gave inf here
     assert math.isfinite(val_loss)
     assert val_loss == pytest.approx(1.0e38, rel=1.0e-3)
 
@@ -379,7 +384,9 @@ def test_run_validation_float64_aggregate_survives_float32_sum_overflow() -> Non
 def test_aggregate_nonfinite_stops_and_preserves_previous_epoch(
     env: tuple[Path, Path], capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """注入第二 epoch val 聚合非有限：停止、不写 history、保留第一完整 epoch 权重。"""
+    """Inject a non-finite val aggregate at epoch 2: stop, no history, keep first
+    complete epoch weights.
+    """
     data_root, _ = env
     _write_prepared_samples(data_root, "ds_guard")
     config_path = _write_config(data_root, _config_text("ds_guard", "r1", max_epochs=3))
@@ -393,31 +400,33 @@ def test_aggregate_nonfinite_stops_and_preserves_previous_epoch(
     script = _load_script()
     with pytest.raises(training.TrainingError) as exc_info:
         script.run(config_path)
-    assert exc_info.value.epoch == 2  # 数值失败触发 epoch（1-based）
-    assert exc_info.value.detail is not None and "非有限" in exc_info.value.detail
+    assert exc_info.value.epoch == 2  # numerical-failure triggering epoch (1-based)
+    assert exc_info.value.detail is not None and "non-finite" in exc_info.value.detail
 
     run_dir = _run_dir(env, "ds_guard", "r1")
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["stop_reason"] == "numerical_failure"
     assert metrics["stop_epoch"] == 2
-    assert metrics["detail"] is not None and "非有限" in metrics["detail"]
-    assert len(metrics["history"]) == 1  # 第二 epoch 聚合非有限：不写 history
+    assert metrics["detail"] is not None and "non-finite" in metrics["detail"]
+    assert len(metrics["history"]) == 1  # non-finite aggregate at epoch 2: no history written
     assert metrics["best_val_loss"] == 1.0
     best = training.load_checkpoint(run_dir / "best.pt")
     final = training.load_checkpoint(run_dir / "final.pt")
     assert best.best_val_loss == 1.0 and final.best_val_loss is None
     for name, tensor in best.model_state_dict.items():
-        assert torch.equal(tensor, final.model_state_dict[name])  # 均为第 1 完整 epoch 权重
-    # 两个 ckpt 均可安全序列化回读
+        assert torch.equal(
+            tensor, final.model_state_dict[name]
+        )  # both hold first complete-epoch weights
+    # both ckpts can be serialized and read back safely
     torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
     torch.load(run_dir / "final.pt", weights_only=True, map_location="cpu")
-    # CLI 失败非零、不打印训练完成（独立 run_name 重跑同一失败场景）
-    calls["n"] = 0  # 重置注入计数器：r2 复现相同的 [1.0, inf] 序列
+    # CLI fails non-zero and does not print training complete (rerun with a separate run_name)
+    calls["n"] = 0  # reset the injection counter: r2 reproduces the same [1.0, inf] sequence
     config_rerun = _write_config(data_root, _config_text("ds_guard", "r2", max_epochs=3))
     assert script.main(["--config", str(config_rerun)]) == 2
     captured = capsys.readouterr()
-    assert "训练完成" not in captured.out
-    assert "数值失败" in captured.err
+    assert "training complete" not in captured.out
+    assert "numerical failure" in captured.err
     rerun_metrics = json.loads(
         (_run_dir(env, "ds_guard", "r2") / "metrics.json").read_text(encoding="utf-8")
     )
@@ -426,7 +435,7 @@ def test_aggregate_nonfinite_stops_and_preserves_previous_epoch(
 
 
 def _run_dir(env: tuple[Path, Path], dataset: str, run_name: str) -> Path:
-    """测试内小 helper：默认输出目录布局。"""
+    """Small test helper: default output directory layout."""
     _, out_root = env
     return out_root / "training" / "mlp" / dataset / run_name
 
@@ -434,20 +443,22 @@ def _run_dir(env: tuple[Path, Path], dataset: str, run_name: str) -> Path:
 def test_first_epoch_numerical_failure_writes_failure_metrics_no_checkpoints(
     env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """首 epoch 数值失败：TrainingError 携带 epoch/detail；失败 metrics、无 ckpt。"""
+    """First-epoch numerical failure: TrainingError carries epoch/detail; failure
+    metrics, no ckpt.
+    """
     data_root, _ = env
     _write_prepared_samples(data_root, "ds_first_fail")
     config_path = _write_config(data_root, _config_text("ds_first_fail", "r1", max_epochs=3))
 
     def failing_validation(model: Any, loader: Any, state: Any, device: str) -> float:
-        raise training.TrainingError("验证预测含非有限值 (NaN/Inf)")
+        raise training.TrainingError("validation predictions contain non-finite values (NaN/Inf)")
 
     monkeypatch.setattr(training, "run_validation", failing_validation)
     script = _load_script()
     with pytest.raises(training.TrainingError) as exc_info:
         script.run(config_path)
     assert exc_info.value.epoch == 1
-    assert exc_info.value.detail is not None and "非有限" in exc_info.value.detail
+    assert exc_info.value.detail is not None and "non-finite" in exc_info.value.detail
 
     run_dir = _run_dir(env, "ds_first_fail", "r1")
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
@@ -455,9 +466,9 @@ def test_first_epoch_numerical_failure_writes_failure_metrics_no_checkpoints(
     assert metrics["stop_epoch"] == 1
     assert metrics["history"] == []
     assert metrics["best_val_loss"] is None
-    assert not (run_dir / "best.pt").exists()  # 无伪 checkpoint
+    assert not (run_dir / "best.pt").exists()  # no fake checkpoint
     assert not (run_dir / "final.pt").exists()
-    # CLI 失败非零（独立 run_name 重跑同一失败场景）
+    # CLI fails non-zero (rerun with a separate run_name)
     config_rerun = _write_config(
         data_root, _config_text("ds_first_fail", "r2", max_epochs=3), name="cfg_r2.yaml"
     )
@@ -472,7 +483,7 @@ def test_first_epoch_numerical_failure_writes_failure_metrics_no_checkpoints(
 def test_best_and_final_diverge_when_val_worsens(
     env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """val 恶化：best 停留在更优 epoch，final 为最后 epoch（二者分叉）。"""
+    """val worsens: best stays at the better epoch while final is the last epoch (they diverge)."""
     data_root, _ = env
     _write_prepared_samples(data_root, "ds_diverge")
     config_path = _write_config(data_root, _config_text("ds_diverge", "r1", max_epochs=2))
@@ -497,7 +508,9 @@ def test_best_and_final_diverge_when_val_worsens(
 def test_earlystop_reference_accumulates_small_improvements(
     env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """累计微小改善不重置 reference：min_delta=0.5、patience=2 → 第 3 epoch 停。"""
+    """Accumulated small improvements do not reset the reference: min_delta=0.5,
+    patience=2 → stop at epoch 3.
+    """
     data_root, _ = env
     _write_prepared_samples(data_root, "ds_accumulate")
     config_path = _write_config(
@@ -508,20 +521,22 @@ def test_earlystop_reference_accumulates_small_improvements(
     monkeypatch.setattr(training, "run_validation", lambda model, loader, state, device: next(vals))
     run_dir = _load_script().run(config_path)
     metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
-    assert len(metrics["history"]) == 3  # 0.2/0.1 均非显著改善 → 计数累计
+    assert (
+        len(metrics["history"]) == 3
+    )  # 0.2/0.1 are not significant improvements → counter accumulates
     assert metrics["stop_reason"] == "early_stopping"
     assert metrics["stop_epoch"] == 3
-    assert metrics["best_val_loss"] == 0.7  # 绝对 best 与 reference 分开
+    assert metrics["best_val_loss"] == 0.7  # absolute best is separate from the reference
 
 
 def test_weights_finite_update_from_same_seed_init(env: tuple[Path, Path]) -> None:
-    """同 seed 初始化 vs 训练后权重：有限且确实更新（非原地未变）。"""
+    """Same-seed init vs trained weights: finite and actually updated (not unchanged in place)."""
     data_root, _ = env
     _write_prepared_samples(data_root, "ds_update")
     config_path = _write_config(data_root, _config_text("ds_update", "r1", max_epochs=2))
     run_dir = _load_script().run(config_path)
     ckpt = training.load_checkpoint(run_dir / "best.pt")
-    training.set_seed(11)  # 与配置 training.seed 一致
+    training.set_seed(11)  # matches the config training.seed
     fresh = training.build_model(ckpt.contract, ckpt.hidden_dims)
     trained = dict(ckpt.model_state_dict)
     assert all(torch.isfinite(t).all() for t in trained.values())

@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""train_mlp.py —— 配置 → 样本/划分 → 训练 → artifacts。
+"""train_mlp.py — config → samples/split → training → artifacts.
 
-输出目录（``config.output_dir`` 或
-``output_root()/training/mlp/<dataset_name>/<run_name>``）已存在则先于
-一切训练动作拒绝覆盖。仅构造 train/val（test 不参与调参/模型选择，也不
-加载）；契约自首个 train 样本冻结并交叉校验；split 副本按 raw 字节保存并
-与 ckpt 绑定 SHA；预处理仅 train 组拟合。训练成功后按序写出 split.yaml
-副本、config_resolved.yaml、preprocessing.yaml、metrics.json（不含 test
-评估）、best.pt/final.pt（拒绝覆盖）。
+If the output directory (``config.output_dir`` or
+``output_root()/training/mlp/<dataset_name>/<run_name>``) already exists, it
+is refused before any training action. Only train/val are constructed (test
+never participates in tuning/model selection and is not loaded); the contract
+is frozen from the first train sample and cross-checked; the split copy is
+saved byte-for-byte from raw and SHA-bound to the ckpt; preprocessing is fit
+on the train split only. After successful training, the split.yaml copy,
+config_resolved.yaml, preprocessing.yaml, metrics.json (without test
+evaluation), and best.pt/final.pt are written in order (refusing overwrite).
 
-错误处理：已知契约错误（ConfigError/DataError/PreprocessingError/
-FileExistsError/TrainingError）向 stderr 友好输出并返回退出码 2；其余
-异常直接上抛（bug）。
+Error handling: known contract errors (ConfigError/DataError/
+PreprocessingError/FileExistsError/TrainingError) are reported to stderr and
+return exit code 2; all other exceptions propagate (bugs).
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ from micromagnetic_parameter_inversion.training_data import (
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    """构建命令行解析器：仅注册必填 --config。"""
+    """Build the CLI parser: only the required --config is registered."""
     parser = argparse.ArgumentParser(
         description=(
             "Train the MLP inverse-regression model from prepared samples "
@@ -60,7 +62,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _freeze_contract(train_set: TrajectoryDataset) -> InputContract:
-    """自首个**缓存**样本冻结输入契约（不回磁盘）；train 其余成员在缓存内校验。"""
+    """Freeze the input contract from the first **cached** sample (no disk access);
+    remaining train members are checked in cache.
+    """
     first = train_set.samples[0]
     contract = InputContract(
         pulse_order=first.pulse_ids,
@@ -78,7 +82,9 @@ def _metrics_payload(
     stop_epoch: int,
     detail: str | None,
 ) -> dict[str, Any]:
-    """metrics.json 文档：history + best val + 停止状态（无 test 评估；有限值）。"""
+    """metrics.json document: history + best val + stop state (no test evaluation;
+    finite values only).
+    """
     return {
         "history": [
             {"epoch": m.epoch, "train_loss": m.train_loss, "val_loss": m.val_loss} for m in history
@@ -92,7 +98,7 @@ def _metrics_payload(
 
 
 def _write_metrics(path: Path, result: training.TrainingResult) -> None:
-    """写出 metrics.json（payload 见 ``_metrics_payload``）。"""
+    """Write metrics.json (payload described in ``_metrics_payload``)."""
     payload = _metrics_payload(
         result.history,
         result.best_checkpoint.best_val_loss,
@@ -106,7 +112,7 @@ def _write_metrics(path: Path, result: training.TrainingResult) -> None:
 
 
 def _write_failure_metrics(path: Path, error: training.TrainingError) -> None:
-    """首 epoch 数值失败的失败状态 metrics（无 checkpoint 可保留）。"""
+    """Failure-state metrics for a first-epoch numerical failure (no checkpoint to keep)."""
     payload = _metrics_payload(
         [],
         None,
@@ -120,23 +126,24 @@ def _write_failure_metrics(path: Path, error: training.TrainingError) -> None:
 
 
 def run(config_path: Path) -> Path:
-    """执行完整训练流程，返回 run 目录。"""
+    """Run the full training flow and return the run directory."""
     config = load_config(config_path)
     samples_dir = paths.data_root() / "samples" / config.dataset_name
     if not samples_dir.is_dir():
-        raise DataError(f"样本目录不存在: {samples_dir}")
+        raise DataError(f"sample directory does not exist: {samples_dir}")
     meta: DatasetMeta = training_data.load_dataset_meta(samples_dir)
     split = training_data.load_split(samples_dir, meta)
-    # 训练契约要求 train/val 非空（test 允许为空：不参与训练也不评估）。
+    # The training contract requires non-empty train/val (test may be empty: neither
+    # trained nor evaluated).
     if not split.train:
         raise DataError(
-            f"split.train 为空：训练至少需要 1 个 train 成员 "
-            f"(split 副本位于 {samples_dir / 'split.yaml'})"
+            f"split.train is empty: training requires at least 1 train member "
+            f"(split copy at {samples_dir / 'split.yaml'})"
         )
     if not split.val:
         raise DataError(
-            f"split.val 为空：early stopping 与 best 选择需要 val 成员 "
-            f"(split 副本位于 {samples_dir / 'split.yaml'})"
+            f"split.val is empty: early stopping and best selection require a val member "
+            f"(split copy at {samples_dir / 'split.yaml'})"
         )
 
     output_dir = (
@@ -145,11 +152,12 @@ def run(config_path: Path) -> Path:
         else paths.output_root() / "training" / "mlp" / config.dataset_name / config.run_name
     )
     if output_dir.exists():
-        raise FileExistsError(f"run 目录已存在，拒绝覆盖: {output_dir}")
+        raise FileExistsError(f"run directory already exists, refusing to overwrite: {output_dir}")
 
-    # 仅构造 train/val；test 不参与任何调参与模型选择，也不加载。
-    # 每 npz 恰好读盘一次：train 先无契约加载并缓存，契约自首个缓存样本
-    # 冻结后在缓存内校验；val 一次读盘即按契约验证。
+    # Construct only train/val; test never enters tuning/model selection and is not loaded.
+    # Each npz is read exactly once: train loads without a contract and is cached, then
+    # the contract frozen from the first cached sample is checked in cache; val is
+    # validated during its single read.
     train_set = TrajectoryDataset(samples_dir, meta, split.train)
     contract = _freeze_contract(train_set)
     val_set = TrajectoryDataset(samples_dir, meta, split.val, contract=contract)
@@ -173,12 +181,12 @@ def run(config_path: Path) -> Path:
             dataset_meta_sha256=meta_sha256,
         )
     except training.TrainingError as exc:
-        # 首 epoch 数值失败：无可保留权重 → 仅写失败状态 metrics（无伪 ckpt）。
+        # First-epoch numerical failure: no weights to keep → failure-state metrics only.
         output_dir.mkdir(parents=True)
         _write_failure_metrics(output_dir / "metrics.json", exc)
         raise
 
-    # run 目录在训练返回后创建；此后失败可留部分产物（不事务）。
+    # The run directory is created after training returns; later failures may leave artifacts.
     output_dir.mkdir(parents=True)
     (output_dir / "split.yaml").write_bytes(split_bytes)
     (output_dir / "config_resolved.yaml").write_text(
@@ -196,22 +204,23 @@ def run(config_path: Path) -> Path:
     training.save_checkpoint(output_dir / "final.pt", result.final_checkpoint)
 
     if result.stop_reason == "numerical_failure":
-        # 有效快照（上一完整 epoch）已保存，但本次训练视为失败：非零退出、
-        # 不打印训练完成。
+        # A valid snapshot (previous complete epoch) was saved, but this run counts as a
+        # failure: non-zero exit and no training-complete message.
         raise training.TrainingError(
-            f"训练因数值失败停止于 epoch {result.stop_epoch}: {result.detail}",
+            f"training stopped due to numerical failure at epoch "
+            f"{result.stop_epoch}: {result.detail}",
             epoch=result.stop_epoch,
             detail=result.detail,
         )
 
-    print(f"训练完成: {output_dir}")
+    print(f"training complete: {output_dir}")
     print(f"  epochs={len(result.history)}; best_val_loss={result.best_checkpoint.best_val_loss!r}")
     print(f"  stop: {result.stop_reason} @ epoch {result.stop_epoch}")
     return output_dir
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """解析参数并执行训练；已知契约错误友好输出并返回 2。"""
+    """Parse arguments and run training; known contract errors are reported and return 2."""
     args = _build_arg_parser().parse_args(argv)
     try:
         run(args.config)

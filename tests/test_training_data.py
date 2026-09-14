@@ -1,7 +1,7 @@
 """Tests for the prepare pipeline, npz schema, split and contracts (offline).
 
-合成 raw 布局全部位于 tmp_path（``MICROMAG_DATA_ROOT`` 重定向），不依赖
-data/raw；不运行模拟/训练。
+Synthetic raw layouts all live under tmp_path (``MICROMAG_DATA_ROOT`` redirected) with no
+dependence on data/raw; no simulations/training are run.
 """
 
 from __future__ import annotations
@@ -43,10 +43,11 @@ def _write_raw_dataset(
     per_psid_interval: Mapping[str, float] | None = None,
     numerics: bool = False,
 ) -> None:
-    """合成最小 raw 布局：config.yaml + index.csv + runs/<pulse>/trajectory.csv。
+    """Synthesize a minimal raw layout: config.yaml + index.csv + runs/<pulse>/trajectory.csv.
 
-    缺 numerics（旧快照合法）；每 pulse 的 m_x 模式不同以便校验 x 的
-    pulse 维顺序；t_s 用 repr 保证 float64 roundtrip 精确。
+    Numerics is absent (older snapshots are valid); each pulse has a different
+    m_x pattern so the pulse dimension order of x can be checked; t_s uses repr
+    to guarantee exact float64 roundtrip.
     """
     for i, psid in enumerate(psids):
         psid_dir = root / "raw" / dataset / psid
@@ -123,7 +124,7 @@ def _training_config_text(
 
 
 def _load_script() -> Any:
-    """按路径加载 prepare 脚本模块（scripts/ 非包）。"""
+    """Load the prepare script module by path (scripts/ is not a package)."""
     script_path = paths.PROJECT_ROOT / "scripts" / "prepare_training_samples.py"
     spec = importlib.util.spec_from_file_location("prepare_training_samples", script_path)
     assert spec is not None and spec.loader is not None
@@ -135,7 +136,7 @@ def _load_script() -> Any:
 
 @pytest.fixture()
 def data_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """重定向 MICROMAG_DATA_ROOT 到临时目录。"""
+    """Redirect MICROMAG_DATA_ROOT to a temporary directory."""
     root = tmp_path / "data"
     root.mkdir()
     monkeypatch.setenv(paths.DATA_ROOT_ENV, str(root))
@@ -166,7 +167,9 @@ def test_prepare_all_end_to_end(data_root: Path, capsys: pytest.CaptureFixture[s
     assert sample.y.dtype == np.float32 and sample.y.shape == (2,)
     assert sample.t_s.dtype == np.float64 and sample.t_s.shape == (8,)
     assert sample.pulse_ids == ("p0", "p1")
-    expected_t = np.array([k * 2.0e-9 for k in range(8)])  # 首份快照 = 升序首个 psid
+    expected_t = np.array(
+        [k * 2.0e-9 for k in range(8)]
+    )  # first snapshot = lowest psid in ascending order
     np.testing.assert_array_equal(sample.t_s, expected_t)
     expected_m = np.loadtxt(
         data_root / "raw" / dataset / "grp_a" / "runs" / "p0" / "trajectory.csv",
@@ -184,7 +187,9 @@ def test_prepare_all_end_to_end(data_root: Path, capsys: pytest.CaptureFixture[s
     assert meta.n_time_steps == 8
     assert meta.labels["grp_a"] == (0.005, 1.0e4)
     assert meta.protocol is not None
-    assert meta.protocol["sample_interval_s"] == 2.0e-9  # 升序取首的快照
+    assert (
+        meta.protocol["sample_interval_s"] == 2.0e-9
+    )  # snapshot of the first psid in ascending order
     assert meta.protocol["pulses"]["p1"]["b_ext_amplitude_t"] == pytest.approx(11.0e-3)
     assert set(meta.config_sha256 or {}) == set(meta.members)
     assert meta.source_index_relpaths is not None
@@ -196,7 +201,7 @@ def test_prepare_all_end_to_end(data_root: Path, capsys: pytest.CaptureFixture[s
     all_members = split.train + split.val + split.test
     assert sorted(all_members) == list(meta.members)
     assert len(set(all_members)) == len(all_members)
-    assert "prepare 完成" in capsys.readouterr().out
+    assert "prepare complete" in capsys.readouterr().out
 
 
 def test_prepare_explicit_psids_subset(data_root: Path) -> None:
@@ -205,7 +210,7 @@ def test_prepare_explicit_psids_subset(data_root: Path) -> None:
     kwargs = {"ratios": (0.5, 0.5, 0.0), "min_per_split": (1, 1, 0)}
     assert _run_prepare(data_root, dataset, config_kwargs=kwargs, ids="grp_b grp_z") == 0
     meta = training_data.load_dataset_meta(data_root / "samples" / dataset)
-    assert meta.members == ("grp_b", "grp_z")  # 未选中的 grp_a 不进入清单
+    assert meta.members == ("grp_b", "grp_z")  # unselected grp_a does not enter the manifest
 
 
 def test_prepare_rejects_existing_outputs(
@@ -216,7 +221,7 @@ def test_prepare_rejects_existing_outputs(
     assert _run_prepare(data_root, dataset) == 0
     npz_bytes = (data_root / "samples" / dataset / "grp_a.npz").read_bytes()
     assert _run_prepare(data_root, dataset) == 2
-    assert "已存在" in capsys.readouterr().err
+    assert "refusing to overwrite" in capsys.readouterr().err
     assert (data_root / "samples" / dataset / "grp_a.npz").read_bytes() == npz_bytes
 
 
@@ -225,7 +230,7 @@ def test_prepare_rejects_min_violation_before_write(data_root: Path) -> None:
     _write_raw_dataset(data_root, dataset)
     exit_code = _run_prepare(data_root, dataset, config_kwargs={"min_per_split": (2, 1, 5)})
     assert exit_code == 2
-    assert not (data_root / "samples" / dataset).exists()  # 写样本前拒绝
+    assert not (data_root / "samples" / dataset).exists()  # refused before writing samples
 
 
 def test_prepare_configured_pulse_order(data_root: Path) -> None:
@@ -242,7 +247,9 @@ def test_prepare_configured_pulse_order(data_root: Path) -> None:
         usecols=(2, 3, 4),
         ndmin=2,
     ).astype(np.float32)
-    np.testing.assert_array_equal(sample.x[0], expected_m)  # x 的 P 维按配置顺序
+    np.testing.assert_array_equal(
+        sample.x[0], expected_m
+    )  # the P dimension of x follows the configured order
 
 
 def test_prepare_invalid_pulse_order_rejected(
@@ -261,19 +268,21 @@ def test_prepare_t1_single_row(data_root: Path) -> None:
     kwargs = {"ratios": (0.5, 0.5, 0.0), "min_per_split": (1, 1, 0)}
     assert _run_prepare(data_root, dataset, config_kwargs=kwargs) == 0
     sample = training_data.load_sample(data_root / "samples" / dataset, "grp_a")
-    assert sample.x.shape == (2, 1, 3)  # ndmin=2 防止单行降维
+    assert sample.x.shape == (2, 1, 3)  # ndmin=2 prevents a single row from being squeezed
     assert sample.t_s.shape == (1,)
 
 
 def test_protocol_snapshot_schema_and_mt_conversion(data_root: Path) -> None:
-    _write_raw_dataset(data_root, "ds_proto", numerics=True)  # 含 numerics 亦只读两节
+    _write_raw_dataset(
+        data_root, "ds_proto", numerics=True
+    )  # with numerics present, still only two sections are read
     protocol = load_protocol_snapshot(data_root / "raw" / "ds_proto", _PSIDS, None)
     assert protocol.pulse_order == ("p0", "p1")
     assert protocol.n_time_steps == 8
     assert protocol.sample_interval_s == 1.0e-9
     assert protocol.pulses["p0"]["b_ext_amplitude_t"] == pytest.approx(0.01)  # 10 mT → T
     assert protocol.pulses["p1"]["b_ext_amplitude_t"] == pytest.approx(0.011)
-    # 显式顺序 = 快照集合的无重复排列
+    # explicit order = duplicate-free permutation of the snapshot set
     reversed_protocol = load_protocol_snapshot(data_root / "raw" / "ds_proto", _PSIDS, ("p1", "p0"))
     assert reversed_protocol.pulse_order == ("p1", "p0")
     with pytest.raises(DataError):
@@ -288,12 +297,12 @@ def test_make_split_largest_remainder_and_tie() -> None:
         min_per_split=SplitMinCounts(1, 1, 1),
     )
     split = make_split(psids, config)
-    assert (len(split.train), len(split.val), len(split.test)) == (3, 2, 1)  # tie: val 先于 test
+    assert (len(split.train), len(split.val), len(split.test)) == (3, 2, 1)  # tie: val before test
     again = make_split(psids, config)
     assert (again.train, again.val, again.test) == (split.train, split.val, split.test)
     all_members = split.train + split.val + split.test
     assert sorted(all_members) == sorted(psids)
-    with pytest.raises(DataError, match="样本不足"):
+    with pytest.raises(DataError, match="insufficient samples"):
         make_split(
             psids,
             SplitConfig(
@@ -313,17 +322,17 @@ def test_load_sample_contract_checks(data_root: Path) -> None:
     contract = InputContract(pulse_order=reference.pulse_ids, n_time_steps=8, t_s=reference.t_s)
     assert training_data.load_sample(samples_dir, "grp_a", contract).x.shape == (2, 8, 3)
     wrong_t = InputContract(pulse_order=reference.pulse_ids, n_time_steps=7, t_s=reference.t_s[:-1])
-    with pytest.raises(DataError, match="契约"):
+    with pytest.raises(DataError, match="contract"):
         training_data.load_sample(samples_dir, "grp_a", wrong_t)
     wrong_order = InputContract(pulse_order=("p1", "p0"), n_time_steps=8, t_s=reference.t_s)
-    with pytest.raises(DataError, match="顺序"):
+    with pytest.raises(DataError, match="pulse order"):
         training_data.load_sample(samples_dir, "grp_a", wrong_order)
     shifted = reference.t_s.copy()
-    shifted[0] += 1e-12  # 远小于任何宽松容差：逐位相等契约必须拒绝
+    shifted[0] += 1e-12  # far below any loose tolerance: the bitwise-equality contract must reject
     wrong_time = InputContract(pulse_order=reference.pulse_ids, n_time_steps=8, t_s=shifted)
     with pytest.raises(DataError, match="t_s"):
         training_data.load_sample(samples_dir, "grp_a", wrong_time)
-    with pytest.raises(DataError, match="不存在"):
+    with pytest.raises(DataError, match="does not exist"):
         training_data.load_sample(samples_dir, "missing_psid")
 
 
@@ -356,7 +365,7 @@ def test_split_yaml_tampering_rejected(data_root: Path) -> None:
         "train: [grp_a, grp_b]\nval: [grp_b]\ntest: [grp_c]\n",
         encoding="utf-8",
     )
-    with pytest.raises(DataError, match="不互斥"):
+    with pytest.raises(DataError, match="not disjoint"):
         training_data.load_split(samples_dir, meta)
 
     split_path.write_text(
@@ -366,7 +375,7 @@ def test_split_yaml_tampering_rejected(data_root: Path) -> None:
         "extra_key: 1\n",
         encoding="utf-8",
     )
-    with pytest.raises(DataError, match="未知字段"):
+    with pytest.raises(DataError, match="unknown fields"):
         training_data.load_split(samples_dir, meta)
 
     split_path.write_text(
@@ -376,7 +385,7 @@ def test_split_yaml_tampering_rejected(data_root: Path) -> None:
         encoding="utf-8",
     )
     (samples_dir / "grp_a.npz").unlink()
-    with pytest.raises(DataError, match="不存在"):
+    with pytest.raises(DataError, match="does not exist"):
         training_data.load_split(samples_dir, meta)
 
 
@@ -387,7 +396,7 @@ def test_stale_npz_not_scanned(data_root: Path) -> None:
     samples_dir = data_root / "samples" / dataset
     np.savez_compressed(
         samples_dir / "deadbeef.npz", x=np.zeros((1, 1, 3), dtype=np.float32)
-    )  # 目录遗留旧 npz：不进清单、不被扫描
+    )  # stale npz left in the directory: not in the manifest, not scanned
     meta = training_data.load_dataset_meta(samples_dir)
     assert "deadbeef" not in meta.members
     split = training_data.load_split(samples_dir, meta)
@@ -405,11 +414,11 @@ def test_prepare_raw_contract_violations(
     assert "trajectory.csv" in capsys.readouterr().err
 
     index_path = data_root / "raw" / dataset / "grp_b" / "index.csv"
-    index_path.write_text("pulse_id,alpha\np0,0.1\n", encoding="utf-8")  # 缺固定列
+    index_path.write_text("pulse_id,alpha\np0,0.1\n", encoding="utf-8")  # missing fixed columns
     assert _run_prepare(data_root, dataset) == 2
-    assert "缺失固定列" in capsys.readouterr().err
+    assert "missing fixed columns" in capsys.readouterr().err
 
-    _write_raw_dataset(data_root, dataset)  # 还原后注入多出的 pulse 行
+    _write_raw_dataset(data_root, dataset)  # restore, then inject an extra pulse row
     index_path = data_root / "raw" / dataset / "grp_b" / "index.csv"
     index_path.write_text(
         index_path.read_text(encoding="utf-8")
@@ -417,18 +426,18 @@ def test_prepare_raw_contract_violations(
         encoding="utf-8",
     )
     assert _run_prepare(data_root, dataset) == 2
-    assert "多出" in capsys.readouterr().err
+    assert "extra" in capsys.readouterr().err
 
-    _write_raw_dataset(data_root, dataset)  # 还原后篡改第二行 alpha → 组内不一致
+    _write_raw_dataset(data_root, dataset)  # restore, then tamper with row 2's alpha
     index_path = data_root / "raw" / dataset / "grp_b" / "index.csv"
     lines = index_path.read_text(encoding="utf-8").splitlines()
     fields = lines[2].split(",")
     assert fields[0] == "grp_b" and fields[1] == "p1"
-    fields[2] = "0.02"  # alpha 与组内首行不一致
+    fields[2] = "0.02"  # alpha does not match the first row of the group
     lines[2] = ",".join(fields)
     index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     assert _run_prepare(data_root, dataset) == 2
-    assert "不一致" in capsys.readouterr().err
+    assert "mismatch" in capsys.readouterr().err
 
 
 def test_prepare_placeholder_and_mixed_all(
@@ -439,12 +448,12 @@ def test_prepare_placeholder_and_mixed_all(
         "dataset_name: PLACEHOLDER_DATASET_NAME\nrun_name: r\n", encoding="utf-8"
     )
     assert _load_script().main(["--config", str(config_path), "--parameter-set-ids", "all"]) == 2
-    assert "占位符" in capsys.readouterr().err
+    assert "placeholder" in capsys.readouterr().err
 
     dataset = "ds_mixed"
     _write_raw_dataset(data_root, dataset)
     assert _run_prepare(data_root, dataset, ids="all grp_a") == 2
-    assert "混用" in capsys.readouterr().err
+    assert "mixed" in capsys.readouterr().err
 
 
 def test_load_split_allows_empty_groups_rejects_duplicates(data_root: Path) -> None:
@@ -470,16 +479,18 @@ def test_load_split_allows_empty_groups_rejects_duplicates(data_root: Path) -> N
             encoding="utf-8",
         )
 
-    _write_split(psids[:4], psids[4:], [])  # test 空组合法（min_per_split 允许 0）
+    _write_split(psids[:4], psids[4:], [])  # empty test group is legal (min_per_split allows 0)
     split = training_data.load_split(samples_dir, meta)
     assert split.test == ()
     assert split.members_of("test") == ()
     assert split.train == tuple(psids[:4])
-    _write_split([], psids[:2], psids[2:])  # 空 train 同样由 load_split 接受
+    _write_split([], psids[:2], psids[2:])  # an empty train is likewise accepted by load_split
     split = training_data.load_split(samples_dir, meta)
     assert split.train == ()
-    _write_split(psids[:2] + [psids[0]], psids[2:4], psids[4:])  # 组内重复仍拒绝
-    with pytest.raises(training_data.DataError, match="重复"):
+    _write_split(
+        psids[:2] + [psids[0]], psids[2:4], psids[4:]
+    )  # duplicates within a group are still rejected
+    with pytest.raises(training_data.DataError, match="duplicate"):
         training_data.load_split(samples_dir, meta)
 
 
@@ -492,23 +503,27 @@ def test_load_dataset_meta_meta_path_equivalence_and_bad_schema(data_root: Path)
     explicit = training_data.load_dataset_meta(
         samples_dir, meta_path=samples_dir / "dataset_meta.yaml"
     )
-    assert explicit == default  # 默认/指定路径解析同一 schema、字段相同
+    assert explicit == default  # default/explicit paths parse the same schema with identical fields
 
     broken = samples_dir / "broken_meta.yaml"
     broken.write_text(yaml.safe_dump({"dataset_name": dataset, "surprise": 1}), encoding="utf-8")
-    with pytest.raises(training_data.DataError, match="未知字段"):
+    with pytest.raises(training_data.DataError, match="unknown fields"):
         training_data.load_dataset_meta(samples_dir, meta_path=broken)
     meta_file = samples_dir / "dataset_meta.yaml"
     original = meta_file.read_text(encoding="utf-8")
     meta_file.write_text(original + "surprise: 1\n", encoding="utf-8")
-    with pytest.raises(training_data.DataError, match="未知字段"):
-        training_data.load_dataset_meta(samples_dir)  # 默认路径坏 schema 同样拒绝
+    with pytest.raises(training_data.DataError, match="unknown fields"):
+        training_data.load_dataset_meta(
+            samples_dir
+        )  # bad schema at the default path is rejected too
 
 
 def test_dataset_loads_each_npz_once_and_skips_test(
     data_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """train/val 每 npz 恰好读盘一次（缓存复用 + 契约不回磁盘）；test 不读。"""
+    """train/val read each npz from disk exactly once (cache reuse + contract never
+    re-reads); test is not read.
+    """
     dataset = "ds_read_once"
     _write_raw_dataset(data_root, dataset)
     assert _run_prepare(data_root, dataset) == 0
@@ -525,25 +540,25 @@ def test_dataset_loads_each_npz_once_and_skips_test(
 
     monkeypatch.setattr(np, "load", counting_load)
     train_set = training_data.TrajectoryDataset(samples_dir, meta, split.train)
-    first = train_set.samples[0]  # 公开属性：契约自首个缓存样本冻结
+    first = train_set.samples[0]  # public attribute: contract frozen from the first cached sample
     contract = training_data.InputContract(
         pulse_order=first.pulse_ids, n_time_steps=int(first.x.shape[1]), t_s=first.t_s
     )
-    train_set.validate_contract(contract)  # 纯内存校验，不回磁盘
+    train_set.validate_contract(contract)  # pure in-memory validation, no disk re-read
     training_data.TrajectoryDataset(samples_dir, meta, split.val, contract=contract)
     expected = sorted(samples_dir / f"{psid}.npz" for psid in (*split.train, *split.val))
     assert sorted(loaded) == expected
-    assert len(loaded) == len(set(loaded))  # 每文件恰好一次
+    assert len(loaded) == len(set(loaded))  # each file exactly once
     test_paths = {samples_dir / f"{psid}.npz" for psid in split.test}
-    assert not (set(loaded) & test_paths)  # test 不读
+    assert not (set(loaded) & test_paths)  # test is not read
 
 
 def test_resolve_psids_accepts_all_tuple(data_root: Path) -> None:
-    """--parameter-set-ids 的 Sequence 兼容：("all",) 与 ["all"] 等价。"""
+    """--parameter-set-ids Sequence compatibility: ("all",) and ["all"] are equivalent."""
     dataset = "ds_all_tuple"
     _write_raw_dataset(data_root, dataset)
     script = _load_script()
     raw_dir = data_root / "raw" / dataset
     assert script._resolve_psids(raw_dir, ("all",)) == script._resolve_psids(raw_dir, ["all"])
-    with pytest.raises(training_data.DataError, match="混用"):
+    with pytest.raises(training_data.DataError, match="mixed"):
         script._resolve_psids(raw_dir, ("all", "grp_a"))

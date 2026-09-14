@@ -1,43 +1,49 @@
 // =============================================================================
-// simulation.mx3.in —— 单脉冲自由衰减模板。每个 pulse 渲染并执行一次：
-// 进程工作目录 = runs/<pulse_id>/，渲染脚本固定名 simulation.mx3；MuMax3
-// 默认原生输出目录 simulation.out/（契约必需：table.txt、m_t0.ovf、
-// m_tfinal.ovf）；run.log 与 trajectory.csv 由 pipeline 写在
-// pulse 目录根。与 equilibrium.mx3.in 渲染自同一 config（公共模型段逐字节
-// 一致）。
-// 命令写法依据 MuMax3 3.12 官方 API 文档；执行链（采样时序、关场时刻与
-// LoadFile 行为）已经短 test-only pilot（8×4×1、1 pulse、3 samples）基础
-// 验证。数值协议（EdgeSmooth/solver/MaxErr/MaxDt/GammaLL）由 YAML
-// numerics 块经公共模型段显式注入；诊断（DIAGNOSTIC stdout 行）进入
-// run.log；其收敛/QC 验证仍待完成，完成前不得用于正式科研数据。
+// simulation.mx3.in -- single-pulse free-decay template. Rendered and executed once
+// per pulse: process working directory = runs/<pulse_id>/, rendered script fixed name
+// simulation.mx3; MuMax3 default native output directory simulation.out/
+// (contract-required: table.txt, m_t0.ovf, m_tfinal.ovf); run.log and trajectory.csv
+// are written by the pipeline at the pulse directory root. Rendered from the same
+// config as equilibrium.mx3.in (shared model section byte-identical).
+// Command syntax follows the MuMax3 3.12 official API documentation; the execution
+// chain (sampling timing, field switch-off instant, and LoadFile behavior) has been
+// minimally validated by a short test-only pilot (8x4x1, 1 pulse, 3 samples). The
+// numerical protocol (EdgeSmooth/solver/MaxErr/MaxDt/GammaLL) is explicitly injected
+// from the YAML numerics block via the shared model section; diagnostics (DIAGNOSTIC
+// stdout lines) go to run.log; convergence/QC validation remains to be done, and
+// until then this must not be used for formal research data.
 // =============================================================================
 
-// 1. 公共模型段：与 equilibrium.mx3.in 区段 1 完全相同（唯一渲染器
-//    _render_model_setup，保证数值协议/网格/椭球几何/材料不漂移；alpha
-//    不属于公共段）。
+// 1. Shared model section: identical to section 1 of equilibrium.mx3.in (the single
+//    renderer _render_model_setup keeps the numerical protocol/grid/ellipsoid
+//    geometry/material from drifting; alpha is not part of the shared section).
 {{MODEL_SETUP}}
 
-// 2. 加载共享平衡态（固定相对路径，相对 runs/<pulse_id>/）；只加载，
-//    不得重新弛豫：平衡态已冻结在 OVF 中。
+// 2. Load the shared equilibrium state (fixed relative path, relative to
+//    runs/<pulse_id>/); load only, never relax again: the equilibrium state is
+//    frozen in the OVF.
 m.LoadFile("../../equilibrium/equilibrium.out/equilibrium.ovf")
 
-// 3. 实验真实 alpha（反演目标；平衡态已冻结在 OVF 中，此处不得再用
-//    辅助阻尼）
+// 3. Experimental true alpha (inversion target; the equilibrium state is frozen in
+//    the OVF, so no auxiliary damping may be used here)
 alpha = {{ALPHA}}
 
-// 4. 矩形脉冲与精确关场。先禁用表格自动保存（采样行只由手工 TableSave
-//    产生），再自 t=0 起施加常量外场（renderer 已由幅值与方向算得的三个
-//    运行时 SI 分量，单位 T），持续 pulse_duration s 后精确置 0。
+// 4. Rectangular pulse and exact field switch-off. First disable automatic table
+//    saving (sampling rows are produced only by manual TableSave calls), then apply,
+//    from t=0, a constant external field (the three runtime SI components in T are
+//    computed by the renderer from amplitude and direction) held for pulse_duration s
+//    and then set exactly to 0.
 TableAutoSave(0)
 B_ext = vector({{B_EXT_X_T}}, {{B_EXT_Y_T}}, {{B_EXT_Z_T}})
 Run({{PULSE_DURATION_S}})
 B_ext = vector(0, 0, 0)
 
-// 5. 采样静态契约（已经短 test-only pilot 基础执行验证；数值协议收敛/QC
-//    验证仍待完成）：关场后立即 TableSave（sample_index=0、t_s=0）并保存
-//    m_t0.ovf（QC）-> 再执行 sample_count-1 次
-//    Run(sample_interval)+TableSave -> 末点保存 m_tfinal.ovf（QC）；
-//    table.txt 行按采样顺序对应整数索引。
+// 5. Sampling static contract (minimally executed and validated by the short
+//    test-only pilot; numerical-protocol convergence/QC validation remains to be
+//    done): immediately after switch-off, a TableSave call (sample_index=0, t_s=0)
+//    and save m_t0.ovf (QC) -> then run sample_count-1 times
+//    Run(sample_interval)+TableSave -> save m_tfinal.ovf at the last point (QC);
+//    table.txt rows correspond to integer indices in sampling order.
 TableSave()
 SaveAs(m, "m_t0")
 for i := 1; i < {{SAMPLE_COUNT}}; i++ {
@@ -46,6 +52,7 @@ for i := 1; i < {{SAMPLE_COUNT}}; i++ {
 }
 SaveAs(m, "m_tfinal")
 
-// 6. 诊断经 stdout 进入 run.log（DIAGNOSTIC 前缀便于检索）；PeakErr 为本
-//    进程历史峰值误差，LastErr 为末步误差，dt 单位 s，step/NEval 为计数。
+// 6. Diagnostics go to run.log via stdout (DIAGNOSTIC prefix for easy lookup);
+//    PeakErr is this process's historical peak error, LastErr the last-step error,
+//    dt is in s, and step/NEval are counts.
 print("DIAGNOSTIC PeakErr=", PeakErr, " LastErr=", LastErr, " dt_s=", dt, " step=", step, " NEval=", NEval)

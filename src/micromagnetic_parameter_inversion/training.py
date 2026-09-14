@@ -1,20 +1,23 @@
-"""训练循环与 checkpoint 读写。
+"""Training loop and checkpoint I/O.
 
-- seed：``train_model`` 在模型构造之前调用 ``set_seed``；DataLoader
-  shuffle 使用显式 seeded ``torch.Generator``。
-- 训练：Adam + 标准化标签空间 MSE（按样本数加权）；非有限
-  loss/grad/pred 立即停止且不保存坏权重（best/final 只含完成 epoch 的
-  权重）；early stopping 使用独立 reference（仅当改善 > ``min_delta``
-  才更新），与绝对 best（严格更低即更新）分开。
-- checkpoint：落盘仅 Python primitives/list/dict + CPU Tensor，同名文件
-  拒绝覆盖；``load_checkpoint`` 以 ``weights_only=True`` 安全读取，校验
-  格式版本与关键字段/契约形状后重建 dataclass。
-- 数据流：``train_model`` 返回 ``TrainingResult``；best.pt/final.pt/
-  metrics.json 的磁盘写出由 ``train_mlp.py`` 编排。
+- seed: ``train_model`` calls ``set_seed`` before constructing the model;
+  DataLoader shuffle uses an explicitly seeded ``torch.Generator``.
+- Training: Adam + MSE in the normalized label space (weighted by sample
+  count); non-finite loss/grad/pred stops immediately without saving bad
+  weights (best/final only contain weights from completed epochs); early
+  stopping uses an independent reference (updated only when the improvement
+  exceeds ``min_delta``) and is kept separate from the absolute best (updated
+  on any strictly lower value).
+- checkpoint: only Python primitives/list/dict + CPU Tensors are saved, and an
+  existing file is never overwritten; ``load_checkpoint`` reads safely with
+  ``weights_only=True`` and rebuilds the dataclass after validating the format
+  version and key field/contract shapes.
+- Data flow: ``train_model`` returns ``TrainingResult``; the on-disk writes of
+  best.pt/final.pt/metrics.json are orchestrated by ``train_mlp.py``.
 
-依赖方向：training_config / training_data / preprocessing / runtime →
-（本模块）→ evaluation；本模块禁止导入 evaluation（评估侧反向调用
-``load_checkpoint`` / ``build_model``）。
+Dependency direction: training_config / training_data / preprocessing / runtime →
+(this module) → evaluation; this module must not import evaluation (the
+evaluation side calls back into ``load_checkpoint`` / ``build_model``).
 """
 
 from __future__ import annotations
@@ -51,22 +54,25 @@ from micromagnetic_parameter_inversion.training_data import (
     TrajectoryDataset,
 )
 
-# ckpt_format_version 取 training_config.CKPT_FORMAT_VERSION。
+# ckpt_format_version comes from training_config.CKPT_FORMAT_VERSION.
 type StateDict = Mapping[str, Tensor]
 
-# 停止原因：正常上限 / 早停 / 数值失败（ckpt 格式版本不变；停止元数据仅
-# 存于 TrainingResult 与 metrics.json，不进 ckpt）。
+# Stop reason: max epochs / early stopping / numerical failure (the ckpt format
+# version is unchanged; stop metadata lives only in TrainingResult and
+# metrics.json, never in the ckpt).
 type StopReason = Literal["max_epochs", "early_stopping", "numerical_failure"]
 
-_ACTIVATIONS = ("relu",)  # 固定 ReLU（Checkpoint.activation 显式留档）
-_N_OUTPUTS = 2  # 标准化标签列数 (alpha, ku_j_per_m3)
+_ACTIVATIONS = ("relu",)  # fixed ReLU (Checkpoint.activation records it explicitly)
+_N_OUTPUTS = 2  # number of normalized label columns (alpha, ku_j_per_m3)
 
 
 class TrainingError(RuntimeError):
-    """训练/ckpt 契约违反（非有限训练状态、格式版本不符、字段/形状损坏）。
+    """Training/ckpt contract violation (non-finite training state, format version
+    mismatch, corrupted fields/shapes).
 
-    ``epoch``/``detail``：数值失败时由 ``train_model`` 携带触发 epoch
-    （1-based）与具体原因，供 CLI 写失败状态 metrics；其他违反可缺省。
+    ``epoch``/``detail``: on numerical failure, ``train_model`` carries the
+    triggering epoch (1-based) and the exact reason so the CLI can write
+    failure-state metrics; other violations may omit them.
     """
 
     def __init__(
@@ -79,98 +85,108 @@ class TrainingError(RuntimeError):
 
 @dataclass(frozen=True)
 class EpochMetrics:
-    """单个 epoch 的标准化 MSE 记录（metrics.json history 来源）。
+    """Normalized MSE record for one epoch (source of metrics.json history).
 
-    ``train_loss`` 为该 epoch 内**在线累计**的 batch 损失按样本数加权平均
-    （到 epoch 结束时的累计值）；``val_loss`` 为整体验证集加权 MSE；二者
-    均处于标准化标签空间。
+    ``train_loss`` is the **online accumulated** batch loss of the epoch
+    weighted by sample count (the accumulated value at epoch end);
+    ``val_loss`` is the sample-weighted MSE over the whole validation set;
+    both are in the normalized label space.
     """
 
-    epoch: int  # 从 1 计
-    train_loss: float  # 在线 batch 加权平均标准化 MSE
-    val_loss: float  # val 集加权平均标准化 MSE（best 与 early stopping 判据）
+    epoch: int  # 1-based
+    train_loss: float  # online batch-weighted mean normalized MSE
+    val_loss: float  # val-set weighted mean normalized MSE (criterion for best and early stopping)
 
 
 @dataclass(frozen=True, eq=False)
 class Checkpoint:
-    """best.pt / final.pt 的 schema（仅凭 ckpt + npz 即可独立推理）。
+    """Schema of best.pt / final.pt (standalone inference from ckpt + npz only).
 
-    含嵌套 ``InputContract``（带 ndarray 字段），``eq=False`` 避免逐元素
-    比较歧义。evaluate 侧用途：``hidden_dims``/``activation``/``contract``
-    恢复模型结构与输入契约（不经当前 YAML）；``preprocessing`` 恢复 x/y
-    变换（不重新拟合）；``split_sha256`` 与 run 内保存的 split 副本绑定
-    校验；``dataset_meta_relpath``/``dataset_meta_sha256`` 以
-    ``data_root()/samples/<dataset_name>/`` 为锚定位并校验 dataset_meta。
-    ``config`` 仅记录，不作为恢复来源。
+    Contains a nested ``InputContract`` (with ndarray fields) and uses
+    ``eq=False`` to avoid element-wise comparison ambiguity. Evaluation-side
+    uses: ``hidden_dims``/``activation``/``contract`` restore the model
+    structure and input contract (without the current YAML); ``preprocessing``
+    restores the x/y transforms (without refitting); ``split_sha256`` binds and
+    validates against the split copy stored in the run; and
+    ``dataset_meta_relpath``/``dataset_meta_sha256`` locate and verify
+    dataset_meta anchored at ``data_root()/samples/<dataset_name>/``. ``config``
+    is recorded only and is not a restore source.
     """
 
-    ckpt_format_version: int  # 写出时的 schema 版本
-    model_state_dict: StateDict  # 模型权重（磁盘形态为 CPU Tensor 字典）
-    hidden_dims: tuple[int, ...]  # 模型结构显式字段（不只藏在 config 副本里）
-    activation: ActivationName  # 激活函数显式留档（固定 "relu"）
-    contract: InputContract  # 输入契约：pulse 顺序、T、分量序、t_s
+    ckpt_format_version: int  # schema version at write time
+    model_state_dict: StateDict  # model weights (on disk: a dict of CPU Tensors)
+    hidden_dims: tuple[
+        int, ...
+    ]  # explicit model structure field (not only buried in the config copy)
+    activation: ActivationName  # activation recorded explicitly (fixed "relu")
+    contract: InputContract  # input contract: pulse order, T, component order, t_s
     preprocessing: (
-        PreprocessingState  # 预处理状态：x [P,1,3] mean、effective scale、label、y 统计量
+        PreprocessingState  # preprocessing state: x [P,1,3] mean, effective scale, label, y stats
     )
     seed: int  # training.seed
-    config: ExperimentConfig  # 生效配置副本（仅记录）
-    dataset_meta_relpath: str  # 相对锚点 data_root()/samples/<dataset>/ 的路径
-    dataset_meta_sha256: str  # dataset_meta 内容指纹（轻量溯源）
-    split_sha256: str  # run 内 split 副本 sha256（split 绑定）
-    best_val_loss: float | None  # best.pt 必有；final.pt 可为 None
-    git_sha: str | None = None  # 可得时记录；与 dirty 标记相互独立
-    git_dirty: bool | None = None  # 工作区是否有未提交变更（可得时记录）
+    config: ExperimentConfig  # effective config copy (recorded only)
+    dataset_meta_relpath: str  # path relative to the anchor data_root()/samples/<dataset>/
+    dataset_meta_sha256: str  # dataset_meta content fingerprint (lightweight provenance)
+    split_sha256: str  # sha256 of the run's split copy (split binding)
+    best_val_loss: float | None  # always set in best.pt; may be None in final.pt
+    git_sha: str | None = None  # recorded when available; independent of the dirty flag
+    git_dirty: bool | None = None  # whether the worktree has uncommitted changes (when available)
     torch_version: str = ""
     numpy_version: str = ""
 
 
 @dataclass(frozen=True)
 class TrainingResult:
-    """``train_model`` 的返回值：入口脚本据此编排产物写出。
+    """Return value of ``train_model``; the entry script orchestrates artifact writes from it.
 
-    ``best_checkpoint`` → best.pt（best_val_loss 必填，绝对最优权重）；
-    ``final_checkpoint`` → final.pt（实际最后完成 epoch 的权重，
-    best_val_loss 为 None）；``history`` → metrics.json 的逐 epoch MSE。
-    ``stop_reason``/``stop_epoch``/``detail`` 记录停止状态（ckpt 格式版本
-    不变，停止元数据仅存于 TrainingResult 与 metrics.json）：
+    ``best_checkpoint`` → best.pt (best_val_loss required, the absolute best
+    weights); ``final_checkpoint`` → final.pt (weights of the last completed
+    epoch, best_val_loss is None); ``history`` → per-epoch MSE for metrics.json.
+    ``stop_reason``/``stop_epoch``/``detail`` record the stop state (the ckpt
+    format version is unchanged and stop metadata lives only in TrainingResult
+    and metrics.json):
 
-    - ``max_epochs``：跑满上限，``stop_epoch`` = max_epochs；
-    - ``early_stopping``：patience 触发，``stop_epoch`` = 触发停止的 epoch；
-    - ``numerical_failure``：非有限 loss/grad/pred/聚合，``detail`` 携带
-      具体原因；此时 best/final 为最后一个**完整且有限** epoch 的权重，
-      CLI 须以非零退出并写失败状态 metrics（不打印训练完成）。
+    - ``max_epochs``: the limit was reached, ``stop_epoch`` = max_epochs;
+    - ``early_stopping``: patience triggered, ``stop_epoch`` = the triggering epoch;
+    - ``numerical_failure``: non-finite loss/grad/pred/aggregate; ``detail``
+      carries the exact reason; best/final then hold the weights of the last
+      **complete and finite** epoch, and the CLI must exit non-zero and write
+      failure-state metrics (without printing training complete).
     """
 
     best_checkpoint: Checkpoint
     final_checkpoint: Checkpoint
     history: tuple[EpochMetrics, ...]
     stop_reason: StopReason
-    stop_epoch: int  # 触发停止的 epoch（1-based）
-    detail: str | None = None  # 数值失败等的具体原因；正常停止为 None
+    stop_epoch: int  # the epoch that triggered the stop (1-based)
+    detail: str | None = None  # exact reason for numerical failure etc.; None on normal stop
 
 
 def set_seed(seed: int) -> None:
-    """seed 入口：在模型构造之前调用（权重初始化可复现的前提）。
+    """Seed entry point: called before model construction (prerequisite for
+    reproducible weight initialization).
 
-    设定 ``torch.manual_seed(seed)`` 与 numpy 全局种子（``seed`` 取
-    ``training.seed``，非负；numpy 侧按 2^32 取模）。不承诺跨硬件位级
-    一致，可复现性以同机同版本为准。
+    Sets ``torch.manual_seed(seed)`` and the numpy global seed (``seed`` comes
+    from ``training.seed`` and is non-negative; the numpy side takes it modulo
+    2^32). No cross-hardware bitwise equivalence is promised; reproducibility
+    holds on the same machine and versions.
     """
     torch.manual_seed(seed)
     np.random.seed(seed % 2**32)
 
 
 def make_data_generator(seed: int) -> torch.Generator:
-    """DataLoader 专用显式 seeded generator（shuffle 可复现；CPU 生成器）。"""
+    """Explicitly seeded generator for DataLoader (reproducible shuffle; CPU generator)."""
     return torch.Generator().manual_seed(seed)
 
 
 def build_model(contract: InputContract, hidden_dims: tuple[int, ...]) -> MLPRegressor:
-    """按输入契约与隐层宽度构建 MLP（激活固定 ReLU，见 MLPRegressor）。
+    """Build the MLP from the input contract and hidden widths (activation fixed to
+    ReLU, see MLPRegressor).
 
-    ``contract.input_shape == (P, T, 3)`` 推导展平维度 ``D = P*T*3``；
-    hidden_dims 默认 ``(64, 32, 32)``。evaluate 侧以
-    ``build_model(ckpt.contract, ckpt.hidden_dims)`` 恢复结构。
+    ``contract.input_shape == (P, T, 3)`` determines the flattened dimension
+    ``D = P*T*3``; hidden_dims defaults to ``(64, 32, 32)``. The evaluation side
+    restores the structure with ``build_model(ckpt.contract, ckpt.hidden_dims)``.
     """
     return MLPRegressor(input_shape=contract.input_shape, hidden_dims=tuple(hidden_dims))
 
@@ -178,7 +194,7 @@ def build_model(contract: InputContract, hidden_dims: tuple[int, ...]) -> MLPReg
 def _batch_to_device(
     batch: tuple[Tensor, Tensor, object], state: PreprocessingState, device: str
 ) -> tuple[Tensor, Tensor]:
-    """raw CPU batch → CPU 上按 state 变换为 float32 numpy → device 张量。"""
+    """raw CPU batch → float32 numpy transformed per state on CPU → device tensors."""
     x, y, _psids = batch
     x_dev = torch.from_numpy(transform_x(state, x.numpy())).to(device)
     y_dev = torch.from_numpy(transform_y(state, y.numpy())).to(device)
@@ -191,11 +207,12 @@ def run_validation(
     state: PreprocessingState,
     device: str,
 ) -> float:
-    """在给定 DataLoader 上计算标准化 MSE（按样本数加权聚合）。
+    """Compute the normalized MSE over the given DataLoader (sample-weighted aggregate).
 
-    元素为 raw 未标准化的 ``SampleItem``，变换在 CPU 上按 ``state`` 施加。
-    模型临时切到 eval 模式，结束后恢复原模式。预测/平方误差含非有限值 →
-    TrainingError（调用方据此停止训练，不保存坏权重）。
+    Items are raw unnormalized ``SampleItem`` values and transforms are applied
+    on CPU per ``state``. The model is temporarily switched to eval mode and
+    restored afterwards. Non-finite predictions/squared errors →
+    TrainingError (the caller stops training on it and saves no bad weights).
     """
     was_training = model.training
     model.eval()
@@ -207,22 +224,24 @@ def run_validation(
                 x, y = _batch_to_device(batch, state, device)
                 pred = model(x)
                 if not bool(torch.isfinite(pred).all()):
-                    raise TrainingError("验证预测含非有限值 (NaN/Inf)")
+                    raise TrainingError(
+                        "validation predictions contain non-finite values (NaN/Inf)"
+                    )
                 se = (pred - y) ** 2
                 if not bool(torch.isfinite(se).all()):
-                    raise TrainingError("验证损失含非有限值 (NaN/Inf)")
-                # float32 元素有限但 float32 求和可能溢出（如多个 1e38）：
-                # 聚合一律升 float64。
+                    raise TrainingError("validation loss contains non-finite values (NaN/Inf)")
+                # float32 elements are finite but a float32 sum may overflow (e.g.
+                # many 1e38 values): aggregates always promote to float64.
                 total_se += float(se.double().sum().item())
                 total_n += int(x.shape[0])
     finally:
         if was_training:
             model.train()
     if total_n == 0:
-        raise TrainingError("验证集为空，无法计算 val MSE")
+        raise TrainingError("validation set is empty; cannot compute val MSE")
     aggregate = total_se / (total_n * _N_OUTPUTS)
     if not math.isfinite(aggregate):
-        raise TrainingError("验证聚合损失非有限 (NaN/Inf)")
+        raise TrainingError("validation aggregate loss is non-finite (NaN/Inf)")
     return aggregate
 
 
@@ -233,10 +252,12 @@ def _train_one_epoch(
     state: PreprocessingState,
     device: str,
 ) -> float | None:
-    """单 epoch 训练；返回在线累计的加权平均 MSE，非有限状态返回 None（停止）。
+    """Train a single epoch; returns the online accumulated weighted mean MSE, or
+    None for a non-finite state (stop).
 
-    顺序：zero_grad → 前向（pred 非有限即停）→ batch 平均损失（非有限即停）
-    → backward（梯度非有限即停，不 step）→ step → epoch 末检查权重仍有限。
+    Order: zero_grad → forward (stop if pred is non-finite) → batch mean loss
+    (stop if non-finite) → backward (stop if gradients are non-finite, no step)
+    → step → check at epoch end that the weights are still finite.
     """
     model.train()
     total_se = 0.0
@@ -256,9 +277,10 @@ def _train_one_epoch(
             param.grad is not None and not bool(torch.isfinite(param.grad).all())
             for param in model.parameters()
         ):
-            return None  # 梯度爆炸/非有限：不 step，避免坏权重
+            return None  # exploding/non-finite gradients: no step, avoiding bad weights
         optimizer.step()
-        # float32 元素有限但 float32 求和可能溢出：聚合升 float64。
+        # float32 elements are finite but a float32 sum may overflow: promote the
+        # aggregate to float64.
         total_se += float(se.detach().double().sum().item())
         total_n += int(x.shape[0])
         if any(not bool(torch.isfinite(param).all()) for param in model.parameters()):
@@ -270,12 +292,14 @@ def _train_one_epoch(
 
 
 def _clone_state_dict(model: MLPRegressor) -> dict[str, Tensor]:
-    """state_dict 的 CPU 深拷贝（后续训练不再影响已保存权重）。"""
+    """CPU deep copy of state_dict (later training no longer affects saved weights)."""
     return {name: value.detach().to("cpu").clone() for name, value in model.state_dict().items()}
 
 
 def _git_info() -> tuple[str | None, bool | None]:
-    """仓库 git SHA 与 dirty 标记（只读 subprocess，限定 repo 路径；失败 → None）。"""
+    """Repository git SHA and dirty flag (read-only subprocess limited to the repo
+    path; failure → None).
+    """
     repo_root = Path(__file__).resolve().parents[2]
     try:
         sha = subprocess.run(
@@ -312,28 +336,30 @@ def train_model(
     dataset_meta_relpath: str = "dataset_meta.yaml",
     dataset_meta_sha256: str | None = None,
 ) -> TrainingResult:
-    """训练主流程。
+    """Main training routine.
 
     Args:
-        config: 实验配置（seed/device/超参/early stopping）。
-        train_set/val_set: raw 未标准化样本的 Dataset（test 不进入训练）。
-        state: 仅 train 组拟合的预处理状态。
-        contract: 输入契约（由调用方自首个 train 样本冻结）。
-        split_sha256: run 内 split 副本指纹（split 绑定）。
-        dataset_meta_relpath: 相对锚点 ``data_root()/samples/<dataset>/`` 的
-            meta 路径（默认 "dataset_meta.yaml"）。
-        dataset_meta_sha256: dataset_meta 实际文件指纹；None → 记 ""。
+        config: experiment config (seed/device/hyperparameters/early stopping).
+        train_set/val_set: Dataset of raw unnormalized samples (test never enters training).
+        state: preprocessing state fitted on the train split only.
+        contract: input contract (frozen by the caller from the first train sample).
+        split_sha256: fingerprint of the run's split copy (split binding).
+        dataset_meta_relpath: meta path relative to the anchor
+            ``data_root()/samples/<dataset>/`` (default "dataset_meta.yaml").
+        dataset_meta_sha256: actual dataset_meta file fingerprint; None → "".
 
-    ``set_seed`` 先于模型构造；best（绝对最低，严格小于才更新）与 early
-    stopping reference（仅改善 > min_delta 才更新）分开推进；非有限
-    loss/grad/pred/聚合立即停止且不保存坏权重，原因记入
-    ``stop_reason``/``stop_epoch``/``detail``。
+    ``set_seed`` runs before model construction; best (absolute minimum, updated
+    only on a strictly lower value) and the early stopping reference (updated
+    only when the improvement exceeds min_delta) advance separately; non-finite
+    loss/grad/pred/aggregate stops immediately without saving bad weights, and
+    the reason is recorded in ``stop_reason``/``stop_epoch``/``detail``.
 
     Raises:
-        TrainingError: 首个 epoch 即因数值失败停止（无可保存权重）；
-            异常携带 ``epoch``/``detail``。
+        TrainingError: training stopped due to numerical failure at the first
+            epoch (no weights can be saved); the exception carries
+            ``epoch``/``detail``.
     """
-    set_seed(config.training.seed)  # 先于模型构造：权重初始化可复现
+    set_seed(config.training.seed)  # before model construction: reproducible weight initialization
     model = build_model(contract, config.model.hidden_dims)
     device = runtime.select_device(config.training.device)
     model.to(device)
@@ -360,7 +386,9 @@ def train_model(
     best_val = math.inf
     best_state: dict[str, Tensor] | None = None
     final_state: dict[str, Tensor] | None = None
-    stop_reference = math.inf  # early stopping 独立 reference（与绝对 best 分开）
+    stop_reference = (
+        math.inf
+    )  # independent early-stopping reference (separate from the absolute best)
     epochs_without_improvement = 0
     stop_reason: StopReason | None = None
     stop_epoch = 0
@@ -370,25 +398,25 @@ def train_model(
         train_loss = _train_one_epoch(model, train_loader, optimizer, state, device)
         if train_loss is None:
             stop_reason, stop_epoch = "numerical_failure", epoch
-            failure_detail = "训练侧损失/梯度/权重非有限"
-            break  # 保留既有 best，不保存坏权重
+            failure_detail = "training loss/gradient/weights are non-finite"
+            break  # keep the existing best, save no bad weights
         try:
             val_loss = run_validation(model, val_loader, state, device)
         except TrainingError as exc:
             stop_reason, stop_epoch, failure_detail = "numerical_failure", epoch, str(exc)
-            break  # 验证侧非有限：原因经 detail 上抛，不吞掉
+            break  # non-finite on the validation side: reason propagates via detail, not swallowed
         if not (math.isfinite(train_loss) and math.isfinite(val_loss)):
             stop_reason, stop_epoch = "numerical_failure", epoch
-            failure_detail = "聚合损失非有限 (NaN/Inf)"
-            break  # 聚合损失非有限：保留上一完整 epoch 的 best/final，
-            # 本 epoch 不写入 history、不保存当前权重
+            failure_detail = "aggregate loss is non-finite (NaN/Inf)"
+            break  # non-finite aggregate loss: keep best/final from the previous
+            # complete epoch; this epoch writes no history and saves no weights
         history.append(EpochMetrics(epoch=epoch, train_loss=train_loss, val_loss=val_loss))
-        final_state = _clone_state_dict(model)  # 实际最后完成 epoch 的权重
-        if val_loss < best_val:  # 绝对 best：严格更低才更新
+        final_state = _clone_state_dict(model)  # weights of the last actually completed epoch
+        if val_loss < best_val:  # absolute best: update only on a strictly lower value
             best_val = val_loss
             best_state = final_state
         if stop_reference - val_loss > config.training.early_stopping.min_delta:
-            stop_reference = val_loss  # 仅显著改善才推进 reference
+            stop_reference = val_loss  # advance the reference only on a significant improvement
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -401,8 +429,9 @@ def train_model(
 
     if not history or best_state is None or final_state is None:
         raise TrainingError(
-            "训练在首个 epoch 即因数值失败停止，无可保存权重"
-            f"（epoch={stop_epoch}, detail={failure_detail}）",
+            "training stopped due to numerical failure at the first epoch; "
+            "no weights can be saved"
+            f" (epoch={stop_epoch}, detail={failure_detail})",
             epoch=stop_epoch,
             detail=failure_detail,
         )
@@ -437,37 +466,43 @@ def train_model(
 
 
 def save_checkpoint(path: Path, ckpt: Checkpoint) -> None:
-    """``torch.save`` 序列化 Checkpoint；同名文件已存在 → FileExistsError。
+    """Serialize a Checkpoint with ``torch.save``; an existing file → FileExistsError.
 
-    磁盘字典仅含 Python primitives/list/dict + CPU Tensor（dataclass 与
-    numpy 对象一律展开/转换，见 ``_checkpoint_to_dict``）；权重张量落盘前
-    detach + CPU + clone。
+    The on-disk dict contains only Python primitives/list/dict + CPU Tensors
+    (dataclasses and numpy objects are always expanded/converted, see
+    ``_checkpoint_to_dict``); weight tensors are detached + moved to CPU +
+    cloned before saving.
     """
     if path.exists():
-        raise FileExistsError(f"checkpoint 已存在，拒绝覆盖: {path}")
+        raise FileExistsError(f"checkpoint already exists, refusing to overwrite: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(_checkpoint_to_dict(ckpt), path)
 
 
 def load_checkpoint(path: Path) -> Checkpoint:
-    """安全读取 Checkpoint（evaluation 侧恢复契约的唯一入口）。
+    """Safely read a Checkpoint (the only entry point for restoring the contract
+    on the evaluation side).
 
-    ``torch.load(weights_only=True, map_location="cpu")`` 显式安全模式；
-    校验格式版本、必需键与关键字段/契约形状（t_s 长度、[P,1,3]/[2] 统计
-    量形状、state_dict 为 CPU 张量字典）后重建嵌套 dataclass。
+    Uses ``torch.load(weights_only=True, map_location="cpu")`` in explicit safe
+    mode; validates the format version, required keys, and key field/contract
+    shapes (t_s length, [P,1,3]/[2] statistic shapes, state_dict as a dict of
+    CPU tensors) before rebuilding the nested dataclasses.
 
     Raises:
-        FileNotFoundError: 文件不存在。
-        TrainingError: 格式版本不符、键缺失或形状/类型损坏。
+        FileNotFoundError: file does not exist.
+        TrainingError: format version mismatch, missing keys, or corrupted
+            shapes/types.
     """
     if not path.is_file():
-        raise FileNotFoundError(f"checkpoint 不存在: {path}")
+        raise FileNotFoundError(f"checkpoint does not exist: {path}")
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as exc:  # torch.load 异常类型随版本变化，统一收敛
-        raise TrainingError(f"checkpoint 加载失败 ({path}): {exc}") from exc
+    except Exception as exc:  # torch.load exception types vary across versions; converge them here
+        raise TrainingError(f"failed to load checkpoint ({path}): {exc}") from exc
     if not isinstance(payload, dict):
-        raise TrainingError(f"checkpoint 内容须为映射 (got {type(payload)!r}) ({path})")
+        raise TrainingError(
+            f"checkpoint payload must be a mapping (got {type(payload)!r}) ({path})"
+        )
     required = {
         "ckpt_format_version",
         "model_state_dict",
@@ -484,25 +519,25 @@ def load_checkpoint(path: Path) -> Checkpoint:
     }
     missing = sorted(required.difference(payload))
     if missing:
-        raise TrainingError(f"checkpoint 缺失键 {missing} ({path})")
+        raise TrainingError(f"checkpoint is missing keys {missing} ({path})")
     if payload["ckpt_format_version"] != CKPT_FORMAT_VERSION:
         raise TrainingError(
-            f"ckpt_format_version 不兼容: {payload['ckpt_format_version']!r} "
+            f"incompatible ckpt_format_version: {payload['ckpt_format_version']!r} "
             f"!= {CKPT_FORMAT_VERSION} ({path})"
         )
     if payload["activation"] not in _ACTIVATIONS:
-        raise TrainingError(f"未知激活函数 {payload['activation']!r} ({path})")
+        raise TrainingError(f"unknown activation function {payload['activation']!r} ({path})")
 
     state_raw = payload["model_state_dict"]
     if not isinstance(state_raw, Mapping) or not state_raw:
-        raise TrainingError(f"model_state_dict 须为非空映射 ({path})")
+        raise TrainingError(f"model_state_dict must be a non-empty mapping ({path})")
     state_dict = {
         str(name): value for name, value in state_raw.items() if isinstance(value, Tensor)
     }
     if len(state_dict) != len(state_raw):
-        raise TrainingError(f"model_state_dict 含非张量项 ({path})")
+        raise TrainingError(f"model_state_dict contains non-tensor entries ({path})")
     if any(value.device.type != "cpu" for value in state_dict.values()):
-        raise TrainingError(f"model_state_dict 含非 CPU 张量 ({path})")
+        raise TrainingError(f"model_state_dict contains non-CPU tensors ({path})")
 
     contract = _contract_from_dict(payload["contract"], path)
     preprocessing = _preprocessing_from_dict(
@@ -511,7 +546,7 @@ def load_checkpoint(path: Path) -> Checkpoint:
     config = _config_from_dict(payload["config"], path)
     best_val_loss = payload["best_val_loss"]
     if best_val_loss is not None and not isinstance(best_val_loss, (int, float)):
-        raise TrainingError(f"best_val_loss 类型非法 ({path})")
+        raise TrainingError(f"illegal best_val_loss type ({path})")
     return Checkpoint(
         ckpt_format_version=int(payload["ckpt_format_version"]),
         model_state_dict=state_dict,
@@ -533,19 +568,23 @@ def load_checkpoint(path: Path) -> Checkpoint:
 
 
 def _contract_from_dict(raw: Any, path: Path) -> InputContract:
-    """契约重建 + 形状校验（t_s 长度 == T、通道恒 3、P 与 pulse 顺序一致）。"""
+    """Contract rebuild + shape validation (t_s length == T, channel count always 3,
+    P matches pulse order).
+    """
     if not isinstance(raw, Mapping):
-        raise TrainingError(f"contract 须为映射 ({path})")
+        raise TrainingError(f"contract must be a mapping ({path})")
     pulse_order = tuple(str(p) for p in raw["pulse_order"])
     n_time_steps = int(raw["n_time_steps"])
     n_channels = int(raw["n_channels"])
     t_s = np.asarray(raw["t_s"], dtype=np.float64)
     if n_time_steps < 1 or len(pulse_order) < 1:
-        raise TrainingError(f"contract 的 P/T 必须为正 ({path})")
+        raise TrainingError(f"contract P/T must be positive ({path})")
     if n_channels != 3:
-        raise TrainingError(f"contract 通道数恒为 3 (got {n_channels}) ({path})")
+        raise TrainingError(f"contract channel count is always 3 (got {n_channels}) ({path})")
     if t_s.shape != (n_time_steps,):
-        raise TrainingError(f"contract t_s 形状 {t_s.shape} 与 T={n_time_steps} 不符 ({path})")
+        raise TrainingError(
+            f"contract t_s shape {t_s.shape} does not match T={n_time_steps} ({path})"
+        )
     return InputContract(
         pulse_order=pulse_order,
         n_time_steps=n_time_steps,
@@ -556,32 +595,35 @@ def _contract_from_dict(raw: Any, path: Path) -> InputContract:
 
 
 def _preprocessing_from_dict(raw: Any, n_pulse: int, path: Path) -> PreprocessingState:
-    """ckpt 预处理状态重建：委托 preprocessing.state_from_mapping，并与契约
-    P 交叉校验；PreprocessingError 在 ckpt 边界包裹为 TrainingError。
+    """Rebuild preprocessing state from the ckpt: delegates to
+    preprocessing.state_from_mapping and cross-checks P against the contract;
+    PreprocessingError is wrapped as TrainingError at the ckpt boundary.
     """
     try:
         state = preprocessing.state_from_mapping(raw)
     except PreprocessingError as exc:
-        raise TrainingError(f"preprocessing 状态损坏 ({path}): {exc}") from exc
+        raise TrainingError(f"corrupted preprocessing state ({path}): {exc}") from exc
     if state.x_stats.mean.shape[0] != n_pulse:
         raise TrainingError(
-            f"preprocessing P={state.x_stats.mean.shape[0]} 与契约 P={n_pulse} 不符 ({path})"
+            f"preprocessing P={state.x_stats.mean.shape[0]} does not match contract "
+            f"P={n_pulse} ({path})"
         )
     return state
 
 
 def _config_from_dict(raw: Any, path: Path) -> ExperimentConfig:
-    """ckpt 配置副本重建：委托 training_config.config_from_mapping，在此
-    包裹 ConfigError → TrainingError（不反向依赖 evaluation）。
+    """Rebuild the config copy from the ckpt: delegates to
+    training_config.config_from_mapping and wraps ConfigError → TrainingError
+    here (without depending back on evaluation).
     """
     try:
         return training_config.config_from_mapping(raw)
     except ConfigError as exc:
-        raise TrainingError(f"config 副本损坏 ({path}): {exc}") from exc
+        raise TrainingError(f"corrupted config copy ({path}): {exc}") from exc
 
 
 def _checkpoint_to_dict(ckpt: Checkpoint) -> dict[str, Any]:
-    """Checkpoint → torch.save 落盘字典（仅 primitives/list/dict + CPU Tensor）。"""
+    """Checkpoint → on-disk dict for torch.save (primitives/list/dict + CPU Tensors only)."""
     return {
         "ckpt_format_version": int(ckpt.ckpt_format_version),
         "model_state_dict": {

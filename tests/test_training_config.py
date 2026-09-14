@@ -29,8 +29,8 @@ def test_minimal_config_uses_defaults(tmp_path: Path) -> None:
     assert config.preprocessing.std_eps == pytest.approx(1.0e-8)
     assert config.training.seed == 42
     assert config.training.device == "auto"
-    assert config.training.weight_decay == 0.0  # 零值合法
-    assert config.training.early_stopping.min_delta == 0.0  # 零值合法
+    assert config.training.weight_decay == 0.0  # zero value is valid
+    assert config.training.early_stopping.min_delta == 0.0  # zero value is valid
     assert config.split.ratios == SplitRatios()
     assert config.split.min_per_split.train == 2
     assert config.output_dir is None
@@ -72,9 +72,9 @@ output_dir: custom/out
 
 
 def test_placeholder_values_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="占位符"):
+    with pytest.raises(ConfigError, match="placeholder"):
         load_config(_write(tmp_path, "dataset_name: PLACEHOLDER_DATASET_NAME\nrun_name: r\n"))
-    with pytest.raises(ConfigError, match="占位符"):
+    with pytest.raises(ConfigError, match="placeholder"):
         load_config(_write(tmp_path, "dataset_name: ds\nrun_name: PLACEHOLDER_RUN_NAME\n"))
 
 
@@ -93,7 +93,7 @@ def test_missing_required_fields_rejected(tmp_path: Path) -> None:
 
 
 def test_unknown_keys_rejected_at_every_level(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="未知字段"):
+    with pytest.raises(ConfigError, match="unknown fields"):
         load_config(_write(tmp_path, _MINIMAL + "surprise: 1\n"))
     with pytest.raises(ConfigError, match="training"):
         load_config(_write(tmp_path, _MINIMAL + "training: {batch_size: 8, zzz: 1}\n"))
@@ -103,12 +103,12 @@ def test_unknown_keys_rejected_at_every_level(tmp_path: Path) -> None:
 
 def test_duplicate_yaml_keys_rejected(tmp_path: Path) -> None:
     text = _MINIMAL + "dataset_name: other_ds\n"
-    with pytest.raises(ConfigError, match="解析失败"):
+    with pytest.raises(ConfigError, match="failed to parse"):
         load_config(_write(tmp_path, text))
 
 
 def test_missing_section_key_in_required_mapping(tmp_path: Path) -> None:
-    # 出现的节内必填子映射字段缺失（ratios 三键必须齐全）。
+    # A required sub-mapping field inside a present section is missing (all three ratio keys).
     text = (
         _MINIMAL
         + "split: {ratios: {train: 0.5, val: 0.25, test: 0.25}, min_per_split: {train: 1}}\n"
@@ -177,25 +177,27 @@ def test_pulse_order_and_output_dir(tmp_path: Path) -> None:
 
 
 def test_missing_config_file(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="读取失败"):
+    with pytest.raises(ConfigError, match="failed to read"):
         load_config(tmp_path / "nope.yaml")
 
 
 def test_config_mapping_roundtrip_and_bad_schema(tmp_path: Path) -> None:
-    """config_to_mapping/from_mapping 往返：与 YAML 加载一致、坏 schema 拒绝。"""
+    """config_to_mapping/from_mapping roundtrip: consistent with YAML loading, bad
+    schema rejected.
+    """
     config = load_config(_write(tmp_path, _MINIMAL))
     mapping = training_config.config_to_mapping(config)
     rebuilt = training_config.config_from_mapping(mapping)
-    assert rebuilt == config  # ExperimentConfig 无 ndarray 字段，结构相等
-    # YAML 快照可被 load_config 重新加载且一致
+    assert rebuilt == config  # ExperimentConfig has no ndarray fields; structural equality applies
+    # The YAML snapshot can be reloaded by load_config and matches
     reloaded = load_config(_write(tmp_path, yaml.safe_dump(mapping, sort_keys=False)))
     assert reloaded == config
-    # 坏 schema：缺必填键 / 节非映射 / 字段类型非法
-    with pytest.raises(ConfigError, match="缺失必填键"):
+    # Bad schema: missing required key / non-mapping section / illegal field type
+    with pytest.raises(ConfigError, match="missing required key"):
         training_config.config_from_mapping({"dataset_name": "ds"})
-    with pytest.raises(ConfigError, match="必须为映射"):
+    with pytest.raises(ConfigError, match="must be a mapping"):
         training_config.config_from_mapping(dict(mapping, training="oops"))
-    with pytest.raises(ConfigError, match="字段类型非法"):
+    with pytest.raises(ConfigError, match="illegal field type"):
         broken = dict(mapping)
         broken["training"] = dict(mapping["training"], batch_size="two")
         training_config.config_from_mapping(broken)

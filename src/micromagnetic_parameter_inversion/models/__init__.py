@@ -1,6 +1,6 @@
-"""神经网络模型子包（仅导出 MLPRegressor）。
+"""Neural-network model subpackage (exports MLPRegressor only).
 
-不在此引入训练/数据模块，避免环形依赖。
+Training/data modules are not imported here, avoiding circular dependencies.
 """
 
 from micromagnetic_parameter_inversion.models.mlp import MLPRegressor

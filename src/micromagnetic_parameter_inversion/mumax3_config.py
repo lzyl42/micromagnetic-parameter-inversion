@@ -1,8 +1,9 @@
-"""MuMax3 模拟配置：frozen dataclass、YAML 加载与派生量。
+"""MuMax3 simulation config: frozen dataclasses, YAML loading, and derived quantities.
 
-一份 YAML = 一个 (alpha, Ku) parameter set 的多脉冲模拟输入；研究数值一律
-来自 configs/experiments/*.yaml，本模块不携带任何默认数值。load_config 是
-唯一校验与单位换算边界，之后流程假定配置合法，不重复防御。
+One YAML = the multi-pulse simulation input for one (alpha, Ku) parameter set; all
+research values come from configs/experiments/*.yaml, and this module carries no
+default values. load_config is the only validation and unit-conversion boundary;
+afterwards the pipeline assumes a valid config and does not defend again.
 """
 
 from __future__ import annotations
@@ -37,142 +38,165 @@ _NUMERICS_KEYS = frozenset(
 )
 _PULSE_KEYS = frozenset({"pulse_id", "b_ext_amplitude_mT", "direction", "duration_s"})
 
-# 单位向量范数容差：容忍 YAML 手写值（如 1/sqrt(3)）的浮点舍入。
+# Unit-vector norm tolerance: tolerates floating-point rounding in hand-written YAML
+# values (e.g. 1/sqrt(3)).
 _UNIT_VECTOR_TOLERANCE = 1e-6
 
 
 class ConfigError(ValueError):
-    """YAML 配置违反 schema/取值约束；消息含字段路径（如 material.alpha）。"""
+    """YAML config violates the schema/value constraints.
+
+    Messages carry the field path (e.g. material.alpha).
+    """
 
 
 @dataclass(frozen=True)
 class MaterialConfig:
-    """单一均匀材料的 SI 参数；alpha 与 Ku 为反演目标。"""
+    """SI parameters of one uniform material; alpha and Ku are the inversion targets."""
 
-    ms_a_per_m: float  # 饱和磁化强度，A/m
-    aex_j_per_m: float  # 交换刚度常数，J/m
-    alpha: float  # Gilbert 阻尼系数，无量纲，>= 0（反演目标）
-    ku_j_per_m3: float  # 单轴各向异性常数，J/m^3，只须有限（反演目标）
-    anisotropy_axis: Vector3  # 易轴单位向量，无量纲
+    ms_a_per_m: float  # Saturation magnetization, A/m
+    aex_j_per_m: float  # Exchange stiffness constant, J/m
+    alpha: float  # Gilbert damping coefficient, dimensionless, >= 0 (inversion target)
+    ku_j_per_m3: float  # Uniaxial anisotropy constant, J/m^3; finite only (inversion target)
+    anisotropy_axis: Vector3  # Easy-axis unit vector, dimensionless
 
 
 @dataclass(frozen=True)
 class GeometryConfig:
-    """包围盒尺寸与网格单元数；cell_size 由 size_m/cells 派生（单一真值）。"""
+    """Bounding-box size and grid cell counts.
 
-    size_m: Vector3  # 包围盒尺寸 [x, y, z]，m
-    cells: Cells3  # 网格单元数 [nx, ny, nz]
+    cell_size is derived from size_m/cells (single source of truth).
+    """
+
+    size_m: Vector3  # Bounding-box size [x, y, z], m
+    cells: Cells3  # Grid cell counts [nx, ny, nz]
 
 
 @dataclass(frozen=True)
 class RecordingConfig:
-    """关场后自由衰减的固定采样。"""
+    """Fixed sampling of the free decay after field switch-off."""
 
-    sample_interval_s: float  # 采样间隔，s
-    sample_count: int  # 采样点数（决定轨迹行数）
+    sample_interval_s: float  # Sampling interval, s
+    sample_count: int  # Number of sample points (determines the trajectory row count)
 
 
 @dataclass(frozen=True)
 class NumericsConfig:
-    """数值协议（显式渲染进 equilibrium/simulation 两模板；改变即协议改变）。"""
+    """Numerical protocol, explicitly rendered into both templates.
 
-    edge_smooth: int  # EdgeSmooth，非负整数（0=硬阶梯边界）；渲染于 SetGeom 之前
-    solver: int  # SetSolver(...) 的 solver ID，正整数
-    max_err: float  # MaxErr，正数，无量纲
-    max_dt_s: float  # MaxDt，正数，s
-    gamma_ll_rad_per_t_s: float  # GammaLL，正数，rad/(T*s)
-    relax_torque_threshold_t: float  # RelaxTorqueThreshold，T；只须有限（-1=官方默认）
+    Changing it changes the protocol.
+    """
+
+    edge_smooth: int  # EdgeSmooth, non-negative integer (0 = hard step boundary); before SetGeom
+    solver: int  # Solver ID for SetSolver(...), positive integer
+    max_err: float  # MaxErr, positive, dimensionless
+    max_dt_s: float  # MaxDt, positive, s
+    gamma_ll_rad_per_t_s: float  # GammaLL, positive, rad/(T*s)
+    relax_torque_threshold_t: float  # RelaxTorqueThreshold, T; finite only (-1 = official default)
 
 
 @dataclass(frozen=True)
 class PulseConfig:
-    """单个短矩形脉冲激励（每项一次独立 run）。"""
+    """A single short rectangular pulse excitation (one independent run per entry)."""
 
-    pulse_id: str  # 脉冲唯一标识，安全单路径段
-    b_ext_amplitude_t: float  # 脉冲幅值，运行时 SI 单位 T（load_config 已换算，>= 0）
-    direction: Vector3  # 脉冲方向单位向量，无量纲
-    duration_s: float  # 脉冲时长，s；关场后 B_ext 恒为 0
+    pulse_id: str  # Unique pulse identifier, safe single path segment
+    b_ext_amplitude_t: float  # Pulse amplitude in runtime SI units, T (load_config converts, >= 0)
+    direction: Vector3  # Pulse direction unit vector, dimensionless
+    duration_s: float  # Pulse duration, s; B_ext is identically 0 after switch-off
 
 
 @dataclass(frozen=True)
 class SimulationConfig:
-    """一份配置 = 一个 parameter set 的全部模拟输入（聚合根）。"""
+    """One config = all simulation inputs for one parameter set (aggregate root)."""
 
-    dataset_name: str  # 安全单路径段；代表固定材料/几何/模拟协议
+    # Safe single path segment; represents the fixed material/geometry/simulation protocol.
+    dataset_name: str
     material: MaterialConfig
     geometry: GeometryConfig
-    initial_m: Vector3  # 均匀初态方向，无量纲单位向量
+    initial_m: Vector3  # Uniform initial-state direction, dimensionless unit vector
     recording: RecordingConfig
     numerics: NumericsConfig
     pulses: tuple[PulseConfig, ...]
 
 
 def _fail(field: str, problem: str) -> NoReturn:
-    """抛出带字段路径的 ConfigError，便于定位 YAML 中的具体字段。"""
+    """Raise a ConfigError carrying the field path, for locating the exact YAML field."""
     raise ConfigError(f"{field}: {problem}")
 
 
 def _check_mapping_keys(mapping: dict[Any, Any], field: str, known: frozenset[str]) -> None:
-    """严格 schema：拒绝未知字段与缺失的必填字段（所有层级适用）。"""
+    """Strict schema: reject unknown fields and missing required keys (applies at every level)."""
     unknown = sorted((key for key in mapping if key not in known), key=repr)
     if unknown:
-        _fail(field, f"未知字段 {unknown!r}；允许的字段 {sorted(known)}")
+        _fail(field, f"unknown fields {unknown!r}; allowed fields {sorted(known)}")
     missing = sorted(known.difference(mapping))
     if missing:
-        _fail(field, f"缺失必填字段 {missing!r}")
+        _fail(field, f"missing required keys {missing!r}")
 
 
 def _require_mapping(value: object, field: str) -> dict[Any, Any]:
     if not isinstance(value, dict):
-        _fail(field, f"必须为映射 (got {value!r})")
+        _fail(field, f"must be a mapping (got {value!r})")
     return value
 
 
 def _require_finite(value: object, field: str) -> float:
-    """数值分量：接受 int/float，拒绝 bool 冒充数值与非有限值。"""
+    """Numeric component: accepts int/float, rejects bool masquerading as a number.
+
+    Non-finite values are also rejected.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        _fail(field, f"必须为数值 (got {value!r})")
+        _fail(field, f"must be a number (got {value!r})")
     number = float(value)
     if not math.isfinite(number):
-        _fail(field, f"必须为有限数值 (got {value!r})")
+        _fail(field, f"must be a finite number (got non-finite {value!r})")
     return number
 
 
 def _require_positive_number(value: object, field: str) -> float:
-    """按语义应为正的有限数值（0、负数、nan/inf、bool 均拒绝）。"""
+    """Finite number that must be positive by semantics.
+
+    0, negatives, nan/inf, and bool are all rejected.
+    """
     number = _require_finite(value, field)
     if number <= 0:
-        _fail(field, f"必须为正数 (got {value!r})")
+        _fail(field, f"must be positive (got {value!r})")
     return number
 
 
 def _require_positive_int(value: object, field: str) -> int:
-    """正整数：拒绝 bool、浮点（含 3.0 这类整值浮点）与非正值。"""
+    """Positive integer: rejects bool, floats (including integral floats such as 3.0).
+
+    Non-positive values are also rejected.
+    """
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        _fail(field, f"必须为正整数 (got {value!r})")
+        _fail(field, f"must be a positive integer (got {value!r})")
     return value
 
 
 def _require_non_negative_int(value: object, field: str) -> int:
-    """非负整数（允许 0）：拒绝 bool、浮点与非负性违反。"""
+    """Non-negative integer (0 allowed): rejects bool, floats, and non-negativity violations."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        _fail(field, f"必须为非负整数 (got {value!r})")
+        _fail(field, f"must be a non-negative integer (got {value!r})")
     return value
 
 
 def _require_non_negative_number(value: object, field: str) -> float:
-    """按语义应非负的有限数值（负数、nan/inf、bool 均拒绝）。"""
+    """Finite number that must be non-negative by semantics.
+
+    Negatives, nan/inf, and bool are all rejected.
+    """
     number = _require_finite(value, field)
     if number < 0:
-        _fail(field, f"必须为非负数 (got {value!r})")
+        _fail(field, f"must be non-negative (got {value!r})")
     return number
 
 
 def _require_length3(value: object, field: str) -> list[Any] | tuple[Any, ...]:
     if not isinstance(value, (list, tuple)):
-        _fail(field, f"必须为 3 分量序列 (got {value!r})")
+        _fail(field, f"must be a 3-component sequence (got {value!r})")
     if len(value) != 3:
-        _fail(field, f"必须恰为 3 个分量 (got {len(value)} 个)")
+        _fail(field, f"must have exactly 3 components (got {len(value)})")
     return value
 
 
@@ -181,7 +205,7 @@ def _require_vector3(
     field: str,
     component: Callable[[object, str], float] = _require_finite,
 ) -> Vector3:
-    """恰 3 个有限分量的向量；component 决定分量的额外约束。"""
+    """Vector with exactly 3 finite components; component sets the extra constraint."""
     items = _require_length3(value, field)
     return (
         component(items[0], f"{field}[0]"),
@@ -200,29 +224,35 @@ def _require_cells3(value: object, field: str) -> Cells3:
 
 
 def _require_unit_vector(value: object, field: str) -> Vector3:
-    """恰 3 个有限分量且范数为 1 的向量（隐含非零向量）。"""
+    """Vector with exactly 3 finite components and norm 1 (implicitly a non-zero vector)."""
     vector = _require_vector3(value, field)
     norm = math.sqrt(sum(x * x for x in vector))
     if not math.isclose(norm, 1.0, rel_tol=_UNIT_VECTOR_TOLERANCE, abs_tol=_UNIT_VECTOR_TOLERANCE):
-        _fail(field, f"必须为单位向量 (got {vector!r}, |v| = {norm!r})")
+        _fail(field, f"must be a unit vector (got {vector!r}, |v| = {norm!r})")
     return vector
 
 
 def _require_safe_path_segment(value: object, field: str) -> str:
-    """安全单路径段：非空、非 "."/".."、不含 "/"、"\\" 或 NUL（防路径逃逸）。"""
+    """Safe single path segment: non-empty, not "."/"..", no "/", "\\", or NUL.
+
+    This prevents path escape.
+    """
     if not isinstance(value, str) or not value:
-        _fail(field, f"必须为非空字符串 (got {value!r})")
+        _fail(field, f"must be a non-empty string (got {value!r})")
     if value in {".", ".."}:
-        _fail(field, f"不接受 {value!r} 作为路径段")
+        _fail(field, f"{value!r} is not accepted as a path segment")
     if "/" in value or "\\" in value:
-        _fail(field, f"不允许包含 '/' 或 '\\' (got {value!r})")
+        _fail(field, f"must not contain '/' or '\\' (got {value!r})")
     if "\x00" in value:
-        _fail(field, f"不允许包含 NUL 字符 (got {value!r})")
+        _fail(field, f"must not contain a NUL character (got {value!r})")
     return value
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """拒绝重复 YAML 键的 SafeLoader：研究值（如 alpha）不得被静默覆盖。"""
+    """SafeLoader that rejects duplicate YAML keys.
+
+    Research values (e.g. alpha) must not be silently overwritten.
+    """
 
     def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
         seen: list[object] = []
@@ -230,29 +260,32 @@ class _UniqueKeyLoader(yaml.SafeLoader):
             key = self.construct_object(key_node, deep=deep)
             if any(type(key) is type(other) and key == other for other in seen):
                 raise yaml.constructor.ConstructorError(
-                    None, None, f"重复的 YAML 键: {key!r}", key_node.start_mark
+                    None, None, f"duplicate YAML key: {key!r}", key_node.start_mark
                 )
             seen.append(key)
         return super().construct_mapping(node, deep=deep)
 
 
 def load_config(path: Path) -> SimulationConfig:
-    """读取 YAML、执行唯一入口校验并构造 SimulationConfig。
+    """Read the YAML, run the single-entry validation, and build a SimulationConfig.
 
-    校验边界（此后流程假定配置合法，不重复防御）：所有层级严格 schema，
-    拒绝缺失/未知字段、null、bool 冒充数值与非有限值；正数/非负数/正
-    整数/非负整数按字段语义分别约束（Ku 与 relax_torque_threshold_t 只须
-    有限，允许 0/负与 -1）；三维向量须恰 3 个有限分量，
-    anisotropy_axis/initial_m/direction 须为单位向量（范数容差 1e-6）；
-    pulses 非空且 pulse_id 唯一；dataset_name/pulse_id 为安全单路径段。
+    Validation boundary (afterwards the pipeline assumes a valid config and does not
+    defend again): strict schema at every level, rejecting missing/unknown fields,
+    null, bool masquerading as a number, and non-finite values; positive/non-negative
+    numbers and positive/non-negative integers are constrained per field semantics
+    (Ku and relax_torque_threshold_t only need to be finite, allowing 0/negative and
+    -1); 3D vectors must have exactly 3 finite components, and
+    anisotropy_axis/initial_m/direction must be unit vectors (norm tolerance 1e-6);
+    pulses must be non-empty with unique pulse_id; dataset_name/pulse_id must be safe
+    single path segments.
 
-    单位边界：b_ext_amplitude_mT 在此乘 1e-3 存为运行时 T，mT 不进入
-    运行时模型。
+    Unit boundary: b_ext_amplitude_mT is multiplied by 1e-3 here and stored as
+    runtime T; mT never enters the runtime model.
     """
     try:
         raw = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
     except yaml.YAMLError as exc:
-        raise ConfigError(f"{path}: YAML 解析失败: {exc}") from exc
+        raise ConfigError(f"{path}: failed to parse YAML: {exc}") from exc
 
     root = _require_mapping(raw, str(path))
     _check_mapping_keys(root, str(path), _TOP_LEVEL_KEYS)
@@ -308,7 +341,7 @@ def load_config(path: Path) -> SimulationConfig:
 
     pulses_raw = root["pulses"]
     if not isinstance(pulses_raw, list) or not pulses_raw:
-        _fail("pulses", "必须为非空的 pulse 列表")
+        _fail("pulses", "must be a non-empty pulse list")
 
     pulses: list[PulseConfig] = []
     seen_pulse_ids: set[str] = set()
@@ -318,7 +351,7 @@ def load_config(path: Path) -> SimulationConfig:
         _check_mapping_keys(pulse_raw, field, _PULSE_KEYS)
         pulse_id = _require_safe_path_segment(pulse_raw["pulse_id"], f"{field}.pulse_id")
         if pulse_id in seen_pulse_ids:
-            _fail(f"{field}.pulse_id", f"重复的 pulse_id {pulse_id!r}")
+            _fail(f"{field}.pulse_id", f"duplicate pulse_id {pulse_id!r}")
         seen_pulse_ids.add(pulse_id)
         amplitude_millitesla = _require_non_negative_number(
             pulse_raw["b_ext_amplitude_mT"], f"{field}.b_ext_amplitude_mT"
@@ -328,7 +361,7 @@ def load_config(path: Path) -> SimulationConfig:
         pulses.append(
             PulseConfig(
                 pulse_id=pulse_id,
-                # 单位边界：mT 只存在于 YAML，在此乘 1e-3 存为运行时 T。
+                # Unit boundary: mT exists only in YAML; multiply by 1e-3 and store as runtime T.
                 b_ext_amplitude_t=amplitude_millitesla * 1e-3,
                 direction=direction,
                 duration_s=duration_s,
@@ -347,7 +380,7 @@ def load_config(path: Path) -> SimulationConfig:
 
 
 def derive_cell_size_m(geometry: GeometryConfig) -> Vector3:
-    """派生网格单元尺寸：cell_size[i] = size_m[i] / cells[i]（单一真值）。"""
+    """Derive the grid cell size: cell_size[i] = size_m[i] / cells[i] (single source of truth)."""
     return (
         geometry.size_m[0] / geometry.cells[0],
         geometry.size_m[1] / geometry.cells[1],
@@ -356,9 +389,10 @@ def derive_cell_size_m(geometry: GeometryConfig) -> Vector3:
 
 
 def parameter_set_id(alpha: float, ku_j_per_m3: float) -> str:
-    """由 (alpha, Ku) 生成参数组身份；数据集 split 的唯一分组键。
+    """Generate the parameter-set identity from (alpha, Ku); the unique split grouping key.
 
-    ``.17g`` 规范文本的 SHA-256 前 16 位小写十六进制；仅依赖 alpha 与 Ku。
+    SHA-256 of the canonical ``.17g`` text, first 16 lowercase hex characters; depends
+    only on alpha and Ku.
     """
     _require_finite(alpha, "alpha")
     _require_finite(ku_j_per_m3, "ku_j_per_m3")

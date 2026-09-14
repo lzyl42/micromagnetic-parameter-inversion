@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""evaluate_model.py —— run/ckpt 定位的常规 evaluate。
+"""evaluate_model.py — run/ckpt-located standard evaluate.
 
-``--run`` 定位训练 run，``--checkpoint`` 可选（缺省 ``<run>/best.pt``；
-无论显式与否，ckpt 必须与 run 内 split 副本 SHA 绑定一致）；不要求提供
-当前训练 config，结构/预处理/label 全部从 checkpoint 恢复。
+``--run`` locates the training run; ``--checkpoint`` is optional (default
+``<run>/best.pt``; explicit or not, the ckpt must be SHA-bound to the run's
+split copy). The current training config is not required: structure/
+preprocessing/label are all restored from the checkpoint.
 
-写出 test_metrics.json（main/control + provenance：实际加载 ckpt 的
-路径/文件 sha256/来自该 ckpt 的 split_sha256）与 test_predictions.csv
-（``export_test_predictions``，LF、每 psid 一行）；产物已存在则先于一切
-计算拒绝覆盖（写出前复核 TOCTOU）。
+Writes test_metrics.json (main/control + provenance: path of the actually
+loaded ckpt / its file sha256 / the split_sha256 from that ckpt) and
+test_predictions.csv (via ``export_test_predictions``: LF, one row per psid);
+if artifacts already exist, overwrite is refused before any computation
+(TOCTOU re-check before writing).
 
-错误处理：已知契约错误（EvaluationError/DataError/PreprocessingError/
-TrainingError/ConfigError/FileExistsError/FileNotFoundError）向 stderr
-友好输出并返回退出码 2；其余异常直接上抛（bug）。
+Error handling: known contract errors (EvaluationError/DataError/
+PreprocessingError/TrainingError/ConfigError/FileExistsError/
+FileNotFoundError) are reported to stderr and return exit code 2; all other
+exceptions propagate (bugs).
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from micromagnetic_parameter_inversion.training_config import ConfigError
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    """构建命令行解析器：必填 --run，可选 --checkpoint。"""
+    """Build the CLI parser: required --run, optional --checkpoint."""
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate a trained run on its bound test split and export "
@@ -54,7 +57,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _subset_to_dict(subset: evaluation.SubsetMetrics) -> dict[str, Any]:
-    """SubsetMetrics → JSON 映射（空子集指标为 null）。"""
+    """SubsetMetrics → JSON mapping (metrics are null for an empty subset)."""
     return {
         "n": subset.n,
         "mae_alpha": subset.mae_alpha,
@@ -65,11 +68,12 @@ def _subset_to_dict(subset: evaluation.SubsetMetrics) -> dict[str, Any]:
 
 
 def _metrics_document(report: EvaluationReport) -> dict[str, Any]:
-    """EvaluationReport → test_metrics.json 文档。
+    """EvaluationReport → test_metrics.json document.
 
-    键：``main``/``control``（n 与 MAE/RMSE，空子集指标为 null）+
-    ``provenance``（实际加载 ckpt 的路径/文件 sha256/来自该 ckpt 的
-    split_sha256——JSON 来源一定对应实际加载的模型）。
+    Keys: ``main``/``control`` (n and MAE/RMSE; metrics are null for an empty
+    subset) + ``provenance`` (path of the actually loaded ckpt / its file
+    sha256 / the split_sha256 from that ckpt — the JSON source always
+    corresponds to the model actually loaded).
     """
     return {
         "main": _subset_to_dict(report.main),
@@ -83,38 +87,43 @@ def _metrics_document(report: EvaluationReport) -> dict[str, Any]:
 
 
 def _precheck(artifacts: Sequence[Path]) -> None:
-    """评估产物预检：任一已存在 → FileExistsError（不覆盖旧评估）。"""
+    """Artifact pre-check: any existing path → FileExistsError.
+
+    Old evaluations are never overwritten.
+    """
     existing = [path for path in artifacts if path.exists()]
     if existing:
-        raise FileExistsError(f"评估产物已存在，拒绝覆盖: {existing}")
+        raise FileExistsError(
+            f"evaluation artifacts already exist, refusing to overwrite: {existing}"
+        )
 
 
 def run(run_dir: Path, checkpoint_path: Path | None = None) -> Path:
-    """执行常规 evaluate 并把产物写入 run 目录，返回该目录。
+    """Run the standard evaluate and write artifacts into the run directory, returning it.
 
-    产物：``test_metrics.json``（main/control 的 n 与 MAE/RMSE）、
-    ``test_predictions.csv``（每 psid 一行）。二者均只写一次。
+    Artifacts: ``test_metrics.json`` (n and MAE/RMSE for main/control) and
+    ``test_predictions.csv`` (one row per psid). Both are written only once.
     """
     run_dir = Path(run_dir)
     metrics_path = run_dir / "test_metrics.json"
     csv_path = run_dir / "test_predictions.csv"
     _precheck((metrics_path, csv_path))
     report, rows = evaluation.run_evaluation(run_dir, checkpoint_path)
-    _precheck((metrics_path, csv_path))  # 评估期间不得出现（TOCTOU 复核）
+    _precheck((metrics_path, csv_path))  # must not appear during evaluation (TOCTOU re-check)
     metrics_path.write_text(
         json.dumps(_metrics_document(report), ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
         newline="\n",
     )
     evaluation.export_test_predictions(csv_path, rows)
-    print(f"评估完成: {run_dir}")
+    print(f"evaluation complete: {run_dir}")
     print(f"  test n: main={report.main.n}, control={report.control.n}")
-    print(f"  产物: {metrics_path.name}, {csv_path.name}")
+    print(f"  artifacts: {metrics_path.name}, {csv_path.name}")
     return run_dir
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """解析参数并执行评估；已知契约错误友好输出并返回 2。"""
+    """Parse arguments and run evaluation; known contract errors are reported and return 2."""
     args = _build_arg_parser().parse_args(argv)
     try:
         run(args.run, args.checkpoint)

@@ -1,8 +1,9 @@
 """Tests for the evaluation CLI, split/meta binding and exports (offline, CPU).
 
-端到端：真实 CLI 训练 1 epoch（tmp 合成样本）→ 评估；辅以
-compute_subset_metrics/export 的单元校验。fixture 自带（不跨测试模块
-import）；device 恒为 cpu；不触 GPU/MuMax3/真实数据。
+End to end: the real CLI trains 1 epoch on synthetic tmp samples → evaluate;
+supplemented by unit checks of compute_subset_metrics/export. Fixtures are
+self-contained (no imports across test modules); device is always cpu; no
+GPU/MuMax3/real data.
 """
 
 from __future__ import annotations
@@ -37,7 +38,9 @@ _EVAL_SCRIPT = paths.PROJECT_ROOT / "scripts" / "evaluate_model.py"
 
 
 def _load_script(path: Path, name: str) -> Any:
-    """按路径加载 scripts/ 模块（scripts/ 非包；自带、不跨测试导入）。"""
+    """Load scripts/ modules by path (scripts/ is not a package; self-contained, no
+    cross-test imports).
+    """
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -48,7 +51,7 @@ def _load_script(path: Path, name: str) -> Any:
 
 @pytest.fixture()
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
-    """重定向 MICROMAG_DATA_ROOT / MICROMAG_OUTPUT_ROOT 到临时目录。"""
+    """Redirect MICROMAG_DATA_ROOT / MICROMAG_OUTPUT_ROOT to temporary directories."""
     data_root = tmp_path / "data"
     out_root = tmp_path / "out"
     data_root.mkdir()
@@ -67,7 +70,9 @@ def _write_prepared_samples(
     with_zero_ku: bool = False,
     seed: int = 0,
 ) -> Path:
-    """直接合成 npz + dataset_meta.yaml + split.yaml（与训练测试同构但自带）。"""
+    """Synthesize npz + dataset_meta.yaml + split.yaml directly (isomorphic to training
+    tests but self-contained).
+    """
     rng = np.random.default_rng(seed)
     psids = tuple(f"ps{i:04d}" for i in range(n_groups))
     pulses = tuple(f"p{j}" for j in range(n_pulses))
@@ -126,7 +131,7 @@ def _train_config_text(dataset: str, run_name: str) -> str:
 
 @pytest.fixture()
 def trained_run(env: tuple[Path, Path]) -> tuple[Path, Path]:
-    """真实 CLI 训练 1 epoch → (run_dir, samples_dir)。"""
+    """Train 1 epoch via the real CLI → (run_dir, samples_dir)."""
     data_root, _ = env
     samples_dir = _write_prepared_samples(data_root, "ds_e2e", with_zero_ku=True)
     config_path = data_root / "cfg.yaml"
@@ -153,7 +158,7 @@ def test_evaluate_end_to_end(
         for key in ("mae_alpha", "rmse_alpha", "mae_ku", "rmse_ku"):
             value = metrics[subset][key]
             assert value is None or math.isfinite(value)
-    # provenance：JSON 来源对应实际加载的 ckpt（默认 best.pt），非仅默认路径假设
+    # provenance: the JSON source matches the actually loaded ckpt (default best.pt)
     assert set(metrics) == {"main", "control", "provenance"}
     assert metrics["provenance"]["checkpoint_path"] == str(run_dir / "best.pt")
     assert metrics["provenance"]["checkpoint_sha256"] == training_data.sha256_file(
@@ -164,13 +169,13 @@ def test_evaluate_end_to_end(
     )
 
     csv_bytes = (run_dir / "test_predictions.csv").read_bytes()
-    assert b"\r" not in csv_bytes  # LF 行尾
+    assert b"\r" not in csv_bytes  # LF line endings
     lines = csv_bytes.decode("utf-8").splitlines()
     assert lines[0] == "parameter_set_id,split,alpha_true,alpha_pred,ku_true,ku_pred"
-    assert len(lines) - 1 == len(test_members)  # 每 psid 一行
+    assert len(lines) - 1 == len(test_members)  # one row per psid
     assert [line.split(",")[0] for line in lines[1:]] == sorted(test_members)
     assert all(line.split(",")[1] == "test" for line in lines[1:])
-    assert "评估完成" in capsys.readouterr().out
+    assert "evaluation complete" in capsys.readouterr().out
 
 
 def test_metrics_values_empty_and_nonfinite() -> None:
@@ -190,11 +195,11 @@ def test_metrics_values_empty_and_nonfinite() -> None:
         None,
     )
 
-    with pytest.raises(EvaluationError, match="非有限"):
+    with pytest.raises(EvaluationError, match="non-finite"):
         compute_subset_metrics([[1.0, 2.0]], [[float("nan"), 2.0]])
-    with pytest.raises(EvaluationError, match="长度不一致"):
+    with pytest.raises(EvaluationError, match="length mismatch"):
         compute_subset_metrics([[1.0, 2.0]], [[1.0, 2.0], [1.0, 2.0]])
-    with pytest.raises(EvaluationError, match="形状"):
+    with pytest.raises(EvaluationError, match="shape"):
         compute_subset_metrics([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]])
 
 
@@ -208,8 +213,8 @@ def test_export_csv_lf_and_refuses_overwrite(tmp_path: Path) -> None:
     lines = target.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "parameter_set_id,split,alpha_true,alpha_pred,ku_true,ku_pred"
     assert lines[1] == f"ps0000,test,{0.5!r},{0.25!r},{100.0!r},{98.0!r}"
-    assert target.read_bytes().count(b"\n") == 3  # 表头 + 2 行，LF
-    with pytest.raises(FileExistsError, match="拒绝覆盖"):
+    assert target.read_bytes().count(b"\n") == 3  # header + 2 rows, LF
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
         export_test_predictions(target, rows)
 
 
@@ -220,12 +225,12 @@ def test_split_sha_mismatch_rejected(
     split_copy = run_dir / "split.yaml"
     split_copy.write_bytes(split_copy.read_bytes() + b"\n# drifted\n")
     script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
-    with pytest.raises(EvaluationError, match="不一致"):
+    with pytest.raises(EvaluationError, match="mismatch"):
         evaluation.run_evaluation(run_dir)
-    # CLI 显式 --checkpoint 仍必须绑定 run split：友好错误 + 退出码 2
+    # even with explicit --checkpoint the CLI must bind to the run split: friendly error + exit 2
     code = script.main(["--run", str(run_dir), "--checkpoint", str(run_dir / "best.pt")])
     assert code == 2
-    assert "不一致" in capsys.readouterr().err
+    assert "mismatch" in capsys.readouterr().err
 
 
 def test_meta_sha_mismatch_rejected(trained_run: tuple[Path, Path]) -> None:
@@ -242,7 +247,7 @@ def test_meta_relpath_escape_rejected(trained_run: tuple[Path, Path], tmp_path: 
     payload["dataset_meta_relpath"] = "../outside.yaml"
     forged = tmp_path / "forged.pt"
     torch.save(payload, forged)
-    with pytest.raises(EvaluationError, match="逃逸"):
+    with pytest.raises(EvaluationError, match="escapes"):
         evaluation.run_evaluation(run_dir, forged)
 
 
@@ -252,17 +257,17 @@ def test_pulse_time_contract_mismatch_rejected(trained_run: tuple[Path, Path]) -
     victim = samples_dir / f"{run_split['test'][0]}.npz"
     with np.load(victim, allow_pickle=False) as archive:
         arrays = {key: archive[key] for key in archive.files}
-    arrays["x"] = arrays["x"][:, :-1, :]  # T 少一步：与 ckpt 契约错配
+    arrays["x"] = arrays["x"][:, :-1, :]  # one step fewer in T: contract mismatch with the ckpt
     arrays["t_s"] = arrays["t_s"][:-1]
     np.savez_compressed(victim, **arrays)
-    with pytest.raises(training_data.DataError, match="契约"):
+    with pytest.raises(training_data.DataError, match="contract"):
         evaluation.run_evaluation(run_dir)
 
 
 def test_samples_resplit_but_run_split_authoritative(trained_run: tuple[Path, Path]) -> None:
     run_dir, samples_dir = trained_run
     original_test = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))["test"]
-    # samples 下的 split.yaml 被重切（不同 seed）：run 副本仍是唯一权威
+    # the split.yaml under samples is re-split (different seed): the run copy remains the authority
     recut = training_data.make_split(
         tuple(sorted(training_data.load_dataset_meta(samples_dir).members)),
         SplitConfig(
@@ -296,18 +301,18 @@ def test_samples_resplit_but_run_split_authoritative(trained_run: tuple[Path, Pa
 def test_multi_batch_tail_batch_order_and_provenance(
     env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """多成员多 batch（含尾批）：行序严格 split.test 序、main/control 非空、
-    provenance 对应实际加载的 ckpt。"""
+    """Many members across batches (including a tail batch): row order strictly follows
+    split.test, main/control are non-empty, and provenance matches the loaded ckpt."""
     data_root, _ = env
     samples_dir = _write_prepared_samples(data_root, "ds_multi", n_groups=7, with_zero_ku=True)
-    # 故意非排序的 test 顺序，且含 control（ps0000, Ku=0）
+    # deliberately unsorted test order, including a control (ps0000, Ku=0)
     test_order = ["ps0003", "ps0000", "ps0006", "ps0002", "ps0005"]
     _rewrite_split(samples_dir, ["ps0001"], ["ps0004"], test_order)
     config_path = data_root / "cfg_multi.yaml"
     config_path.write_text(_train_config_text("ds_multi", "r1"), encoding="utf-8")
     run_dir = _load_script(_TRAIN_SCRIPT, "train_mlp_script").run(config_path)
 
-    # 侦测 batch 边界：transform_x 每 batch 恰调用一次
+    # detect batch boundaries: transform_x is called exactly once per batch
     batch_shapes: list[tuple[int, ...]] = []
     real_transform_x = preprocessing.transform_x
 
@@ -318,17 +323,17 @@ def test_multi_batch_tail_batch_order_and_provenance(
     monkeypatch.setattr(preprocessing, "transform_x", spy_transform_x)
     report, rows = evaluation.run_evaluation(run_dir)
 
-    # batch_size=2、test 5 成员 → 2+2+1：尾批 1 个样本
+    # batch_size=2, 5 test members → 2+2+1: the tail batch has 1 sample
     assert batch_shapes == [(2, 2, 8, 3), (2, 2, 8, 3), (1, 2, 8, 3)]
-    # 行序严格 split.test 顺序（非排序）
+    # row order strictly follows split.test (unsorted)
     assert [row.parameter_set_id for row in rows] == test_order
     assert all(row.split == "test" for row in rows)
-    # main=4（排除 control ps0000）、control=1，均非空且指标有限
+    # main=4 (control ps0000 excluded), control=1; both non-empty with finite metrics
     assert report.main.n == 4 and report.control.n == 1
     for subset in (report.main, report.control):
         assert subset.mae_alpha is not None and math.isfinite(subset.mae_alpha)
         assert subset.rmse_ku is not None and math.isfinite(subset.rmse_ku)
-    # provenance：实际加载的默认 best.pt
+    # provenance: the default best.pt that was actually loaded
     assert report.provenance.checkpoint_path == str(run_dir / "best.pt")
     assert report.provenance.checkpoint_sha256 == training_data.sha256_file(run_dir / "best.pt")
     assert report.provenance.split_sha256 == training_data.sha256_file(run_dir / "split.yaml")
@@ -337,7 +342,9 @@ def test_multi_batch_tail_batch_order_and_provenance(
 def test_cli_checkpoint_final_provenance_and_rowcount(
     trained_run: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--checkpoint final.pt``：JSON provenance 记录实际路径/哈希，行数 == test 成员数。"""
+    """``--checkpoint final.pt``: JSON provenance records the actual path/hash;
+    rows == test members.
+    """
     run_dir, _ = trained_run
     script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
     final_path = run_dir / "final.pt"
@@ -359,10 +366,11 @@ def test_cli_checkpoint_final_provenance_and_rowcount(
 def test_provenance_tracks_actually_loaded_checkpoint(
     trained_run: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """同 split hash、不同模型权重的 ckpt：provenance 反映实际加载文件。
+    """Same split hash but different model weights: provenance reflects the file actually loaded.
 
-    跨 run 相同 split 合法（不引新限制）；修改一份权重后 split 绑定不变，
-    provenance 的 checkpoint_sha256/路径必须随实际加载的 ckpt 变化。
+    The same split across runs is legal (no new restriction); after modifying one
+    weight the split binding is unchanged, but provenance's checkpoint_sha256/path
+    must follow the ckpt actually loaded.
     """
     run_dir, _ = trained_run
     report_default, _ = evaluation.run_evaluation(run_dir)
@@ -386,7 +394,8 @@ def test_provenance_tracks_actually_loaded_checkpoint(
     assert (
         report_mutated.provenance.checkpoint_sha256 != report_default.provenance.checkpoint_sha256
     )
-    # split 绑定不变：provenance.split_sha256 来自实际 ckpt 且与 run 副本一致
+    # split binding unchanged: provenance.split_sha256 comes from the actual ckpt and
+    # matches the run copy
     assert report_mutated.provenance.split_sha256 == report_default.provenance.split_sha256
 
 
@@ -397,7 +406,7 @@ def test_cli_second_eval_blocked(
     script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
     assert script.run(run_dir) == run_dir
     assert script.main(["--run", str(run_dir)]) == 2
-    assert "已存在" in capsys.readouterr().err
+    assert "refusing to overwrite" in capsys.readouterr().err
 
 
 def test_main_missing_run_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -409,7 +418,9 @@ def test_main_missing_run_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]
 
 
 def _rewrite_split(samples_dir: Path, train: list[str], val: list[str], test: list[str]) -> None:
-    """重写 samples 下 split.yaml（成员完备/互斥由测试数据保证）。"""
+    """Rewrite the split.yaml under samples (member completeness/disjointness guaranteed
+    by test data).
+    """
     (samples_dir / "split.yaml").write_text(
         yaml.safe_dump(
             {
@@ -430,7 +441,7 @@ def test_evaluate_with_empty_test_split_null_metrics(env: tuple[Path, Path]) -> 
     samples_dir = _write_prepared_samples(data_root, "ds_no_test")
     meta = training_data.load_dataset_meta(samples_dir)
     psids = sorted(meta.members)
-    _rewrite_split(samples_dir, psids[:4], psids[4:], [])  # test 空：合法（min 允许 0）
+    _rewrite_split(samples_dir, psids[:4], psids[4:], [])  # empty test: legal (min allows 0)
     config_path = data_root / "cfg.yaml"
     config_path.write_text(_train_config_text("ds_no_test", "r1"), encoding="utf-8")
     run_dir = _load_script(_TRAIN_SCRIPT, "train_mlp_script").run(config_path)
@@ -451,11 +462,11 @@ def test_train_rejects_empty_train_split(env: tuple[Path, Path]) -> None:
     )
     config_path = data_root / "cfg.yaml"
     config_path.write_text(_train_config_text("ds_no_train", "r1"), encoding="utf-8")
-    with pytest.raises(training_data.DataError, match="split.train 为空"):
+    with pytest.raises(training_data.DataError, match="split.train is empty"):
         _load_script(_TRAIN_SCRIPT, "train_mlp_script").run(config_path)
     assert not (out_root / "training" / "mlp" / "ds_no_train" / "r1").exists()
 
 
 def meta_psids(samples_dir: Path) -> list[str]:
-    """测试内小 helper：按序取清单成员。"""
+    """Small test helper: take manifest members in order."""
     return list(training_data.load_dataset_meta(samples_dir).members)

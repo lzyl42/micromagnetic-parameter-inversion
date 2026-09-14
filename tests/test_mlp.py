@@ -1,9 +1,10 @@
-"""models.mlp 单元测试：CPU 合成张量，最小 forward/backward 验证。
+"""Unit tests for models.mlp: CPU synthetic tensors, minimal forward/backward checks.
 
-覆盖：``[N,P,T,3]`` 展平 ``D = P*T*3``、输出
-``[N,2]`` 且 batch 维保留、hidden_dims 配置生效、构造/前向形状校验、
-参数梯度有限、``input_shape``/``hidden_dims`` 字段保留（checkpoint
-结构字段来源）与 state_dict 往返一致。
+Coverage: ``[N,P,T,3]`` flattened to ``D = P*T*3``, output ``[N,2]`` with the
+batch dimension preserved, hidden_dims configuration taking effect,
+constructor/forward shape validation, finite parameter gradients,
+``input_shape``/``hidden_dims`` fields preserved (checkpoint structure field
+source), and state_dict roundtrip consistency.
 """
 
 from __future__ import annotations
@@ -40,14 +41,14 @@ def test_flatten_dimension_is_product_and_batch_dim_kept() -> None:
     assert isinstance(last_linear, nn.Linear)
     assert last_linear.in_features == 7
     assert last_linear.out_features == 2
-    # Flatten(start_dim=1) 保留 batch 维：[N,P,T,3] → [N,2]。
+    # Flatten(start_dim=1) keeps the batch dimension: [N,P,T,3] → [N,2].
     x = torch.randn(4, 2, 5, 3)
     assert model(x).shape == (4, 2)
 
 
 def test_hidden_dims_configurable() -> None:
     model = _make_model(hidden_dims=(16, 8, 4))
-    # Flatten + 3×(Linear, ReLU) + 末层 Linear = 8 个子模块。
+    # Flatten + 3×(Linear, ReLU) + final Linear = 8 submodules.
     assert len(model.network) == 8
     linears = [m for m in model.network if isinstance(m, nn.Linear)]
     assert [m.in_features for m in linears] == [2 * 5 * 3, 16, 8, 4]
@@ -57,19 +58,19 @@ def test_hidden_dims_configurable() -> None:
 def test_forward_rejects_wrong_shape() -> None:
     model = _make_model()
     with pytest.raises(ValueError, match="input_shape"):
-        model(torch.randn(3, 2, 6, 3))  # T 与 input_shape 不一致
+        model(torch.randn(3, 2, 6, 3))  # T does not match input_shape
     with pytest.raises(ValueError, match="input_shape"):
-        model(torch.randn(3, 2, 5))  # 维度不足
+        model(torch.randn(3, 2, 5))  # insufficient dimensions
     with pytest.raises(ValueError, match="input_shape"):
-        model(torch.randn(2, 2, 5, 4))  # 通道维不一致
+        model(torch.randn(2, 2, 5, 4))  # channel dimension mismatch
 
 
 def test_constructor_rejects_invalid_shapes() -> None:
-    with pytest.raises(ValueError, match="通道"):
+    with pytest.raises(ValueError, match="channel"):
         MLPRegressor(input_shape=(2, 5, 4))
-    with pytest.raises(ValueError, match="正"):
+    with pytest.raises(ValueError, match="positive"):
         MLPRegressor(input_shape=(0, 5, 3))
-    with pytest.raises(ValueError, match="正"):
+    with pytest.raises(ValueError, match="positive"):
         MLPRegressor(input_shape=(2, 5, 3), hidden_dims=(8, 0, 4))
 
 

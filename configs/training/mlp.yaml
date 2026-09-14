@@ -1,24 +1,24 @@
-# MLP 训练配置（用法见 README.md；dataset 与 run_name 为占位符，运行前
-# 替换为实际值，不虚构研究参数。）
-dataset_name: PLACEHOLDER_DATASET_NAME   # 占位：替换为 data/raw 下实际 dataset
-run_name: PLACEHOLDER_RUN_NAME           # 必填（无默认、不可为 null/空）：
-                                         # 输出目录已存在则拒绝启动，不隐式覆盖
+# MLP training config (usage in README.md; dataset and run_name are placeholders,
+# replace them with actual values before running; do not invent research parameters.)
+dataset_name: PLACEHOLDER_DATASET_NAME   # Placeholder: replace with the actual dataset under data/raw
+run_name: PLACEHOLDER_RUN_NAME           # Required (no default, must not be null/empty):
+                                         # refuses to start if the output directory exists; no implicit overwrite
 data:
-  pulse_order: null    # null = 从所选首份 config.yaml 冻结并记录进 dataset_meta；
-                       # 非 null = 显式 pulse_id 列表（须与协议一致）
+  pulse_order: null    # null = frozen from the selected first config.yaml and recorded into dataset_meta;
+                       # non-null = explicit pulse_id list (must be consistent with the protocol)
 model:
-  hidden_dims: [64, 32, 32]           # 本计划工程候选（非已验证科研参数）
+  hidden_dims: [64, 32, 32]           # Engineering candidate in this plan (not a validated research parameter)
 label: {transform: identity}             # identity | logalpha
 preprocessing: {std_eps: 1.0e-8}
 training:
-  seed: 42            # 与 configs/base.yaml 一致
-  device: auto        # 交 runtime.select_device
+  seed: 42            # Consistent with configs/base.yaml
+  device: auto        # Delegated to runtime.select_device
   batch_size: 32
   max_epochs: 500
   learning_rate: 1.0e-3
   weight_decay: 0.0
   early_stopping: {patience: 50, min_delta: 0.0}
-split:                # 仅 prepare 脚本使用
+split:                # Used only by the prepare script
   seed: 42
   ratios: {train: 0.7, val: 0.15, test: 0.15}
   min_per_split: {train: 2, val: 1, test: 1}
