@@ -28,9 +28,8 @@ runs/
 tensorboard/
 *.log
 
-# Local exploratory notebooks and results (kept out of the public repository)
+# Local exploratory notebooks (kept out of the public repository)
 /notebooks/
-/results/
 
 # Jupyter
 .ipynb_checkpoints/

@@ -10,10 +10,11 @@ enabled yet.
 
 **Project status**: all four pipeline stages -- MuMax3 simulation generation, sample
 preparation, MLP training, and independent test evaluation -- are implemented (entry
-points and usage below). Formal data generation is in progress; **no training on
-formal research data has been performed, and the repository contains no reliable
-research results or conclusions**. Follow-up models such as 1D CNN / Transformer are
-outside the current implementation scope.
+points and usage below). Formal data generation is in progress; a single-excitation
+MLP baseline has been trained on the synthetic benchmark, and its validation-set
+results are reported in [results/mlp.md](results/mlp.md); those results make no claim
+of independent-test or real-device inversion performance. Follow-up models such as
+1D CNN / Transformer are outside the current implementation scope.
 
 ## Physical model and fixed protocol
 
