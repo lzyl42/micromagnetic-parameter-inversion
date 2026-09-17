@@ -134,6 +134,11 @@ def _write_failure_metrics(path: Path, error: training.TrainingError) -> None:
     )
 
 
+# TODO(CNN1D-P4): 未来共享编排 run 放在 training.py（与 train_model 同模块），
+# 本入口改为调用 training.run；进入前先做 kind 匹配检查（本命令要求 mlp，
+# 遇 cnn1d 早拒），在加载数据/建目录之前完成，配置只解析一次；命令用法与
+# 输出路径 (output_root()/training/mlp/<dataset_name>/<run_name>) 保持不变，
+# 并保留 output_dir 覆盖与失败/best-final 语义。本轮不改函数体/行为/产物。
 def run(config_path: Path) -> Path:
     """执行完整训练流程，返回 run 目录（产物见模块 docstring 第 7 步）。"""
     config = load_config(config_path)

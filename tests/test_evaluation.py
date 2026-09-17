@@ -35,6 +35,17 @@ from micromagnetic_parameter_inversion.training_config import (
 _TRAIN_SCRIPT = paths.PROJECT_ROOT / "scripts" / "train_mlp.py"
 _EVAL_SCRIPT = paths.PROJECT_ROOT / "scripts" / "evaluate_model.py"
 
+# TODO(CNN1D-P3)：evaluation 实现后在此文件补充（本轮仅为注释，不改导入、
+# 不改 AST、不改任何可执行断言）：
+# - 共用 evaluate 入口将来按 checkpoint 类别显式路由：mlp → MLP 路径（行为
+#   不变），cnn1d → CNN 路径；两条路径产物完全独立，不共用 MLP checkpoint/
+#   统计/预测；CNN loader 拒绝 MLP 文件，损坏或错模型文件必须报错、不回退；
+# - CNN 评估：split 实际成员 + SHA 绑定、dataset_meta 锚点 + SHA、契约校验、
+#   物理单位指标、test 仅独立评估；校验 t_s（不只比 shape）；
+# - MLP 既有加载与预测回归不变；
+# - 未来建议（仅 TODO，不改 evaluation CLI、不实现）：研究对比前需要 val 物理
+#   单位 MAE/RMSE 的报告路径；不得为报告而开放 test。
+
 
 def _load_script(path: Path, name: str) -> Any:
     """按路径加载 scripts/ 模块（scripts/ 非包；自带、不跨测试导入）。"""

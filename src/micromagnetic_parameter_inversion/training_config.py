@@ -62,6 +62,9 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 _DATA_KEYS = frozenset({"pulse_order"})
+# TODO(CNN1D-P1): 未来 _MODEL_KEYS 按 kind 分集合（mlp/CNN 字段互斥），并在
+# _parse_model 实现严格类别校验；缺 kind 仅对旧配置默认 mlp，旧入口遇
+# kind=cnn1d 早拒。本轮不改常量内容。
 _MODEL_KEYS = frozenset({"hidden_dims"})
 _LABEL_KEYS = frozenset({"transform"})
 _PREPROCESSING_KEYS = frozenset({"std_eps"})
@@ -96,6 +99,12 @@ class DataConfig:
     pulse_order: tuple[str, ...] | None = None
 
 
+# TODO(CNN1D-P1): 未来在此扩展 model 结构字段：新增 kind（"mlp"|"cnn1d"）；
+# **缺 kind 默认 mlp，仅对旧配置且只接受合法 MLP 字段**；kind=cnn1d 时引入
+# channels/kernel_sizes/pool_bins/head_hidden_dims。校验：正整数且拒 bool、
+# channels/kernel_sizes 非空、层数匹配、kernel 全为奇数、head 允许为空；
+# pool_bins<=T 由模型构造校验（非配置层）。YAML 与 mapping 加载保持同一
+# 严格 schema，跨类别/未知字段一律报错、不静默吞掉。本轮仅注释。
 @dataclass(frozen=True)
 class ModelConfig:
     """``model`` 块：网络结构（[64,32,32] 时参数量 = ``64·D + 3266``）。"""

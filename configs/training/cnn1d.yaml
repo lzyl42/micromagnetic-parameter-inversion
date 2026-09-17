@@ -1,0 +1,36 @@
+# CNN1D 训练配置 —— 仅字段大纲（全文件注释），**不可执行、不可训练**。
+#
+# 状态：这是 CNN1D 分支的配置字段占位大纲，不是有效训练配置，也不是可运行
+# 示例。本文件没有任何有效 YAML 键（全部为注释），因此 `load_config` 当前必然
+# 失败：既缺 dataset_name/run_name，且 model.kind 与 CNN 字段尚未实现。
+# 不在此填写任何超参数默认值或猜测研究值；channels/kernel_sizes/pool_bins/
+# head_hidden_dims 的取值待配置层实现并经批准后填写。
+#
+# 独立性（关键约定）：
+#   - CNN 只使用与 MLP 相同的 dataset 与冻结 split；不得重切、不得选择性汇报。
+#   - CNN 的 checkpoint、训练产物与预处理统计**完全独立**：不复用 MLP 权重/
+#     checkpoint/已有预处理统计/训练产物；统计量由 CNN 自己在训练组上拟合，
+#     val/test 不参与拟合。
+#   - 输出目录为 output_root()/training/cnn1d/<dataset_name>/<run_name>，与
+#     既有 training/mlp/... 互不影响。
+#
+# 复用字段（语义沿用 MLP 流程，train.md 第 3/4/7 节）：
+#   - dataset_name / run_name：同 MLP 的占位约定与校验，运行前必填。
+#   - data.pulse_order：null = 由所选首份协议快照冻结并记入 dataset_meta。
+#   - label.transform、preprocessing.std_eps、training.*、split.*、output_dir：
+#     与 MLP 配置保持同一套字段与语义。
+#
+# 待实现的模型字段（只列字段与约束，不给出任何取值）：
+#
+# model:
+#   kind: <待批准后填写>              # "cnn1d"；缺省仅对合法旧 MLP 字段集合
+#                                     # 生效，缺 kind 时不得出现 CNN 字段
+#   channels: <待批准后填写>          # 非空 int 序列，各维 > 0，拒绝 bool
+#   kernel_sizes: <待批准后填写>      # 非空 int 序列，各维正奇数，与 channels
+#                                     # 等长，拒绝 bool
+#   pool_bins: <待批准后填写>         # int，> 0；<= T 由模型层校验，
+#                                     # 配置层不校验 > T
+#   head_hidden_dims: <待批准后填写>  # int 序列，各维 > 0，允许为空（= 直接线性
+#                                     # 输出），拒绝 bool
+#
+# 实验时记录（不设固定物理下界）：感受野 / 池化配置 / 参数量。

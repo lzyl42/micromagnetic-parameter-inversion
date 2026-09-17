@@ -7,4 +7,7 @@
 
 from micromagnetic_parameter_inversion.models.mlp import MLPRegressor
 
+# TODO(CNN1D-P2): 待 CNN1DRegressor 实现并评审通过后，在此导出并加入
+# __all__（届时同样只做导入/导出、无副作用）。本轮骨架不导入，
+# 保持现有导出与导入行为不变。
 __all__ = ["MLPRegressor"]

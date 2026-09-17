@@ -98,6 +98,11 @@ class EpochMetrics:
     val_loss: float  # val 集加权平均标准化 MSE（best 与 early stopping 判据）
 
 
+# TODO(CNN1D-P3): 本 Checkpoint/save_checkpoint/load_checkpoint 与
+# ckpt_format_version 保持 MLP 专用、不变更。CNN 未来另建独立
+# CNNCheckpoint / save_cnn_checkpoint / load_cnn_checkpoint（固定草案名），
+# 用自己的格式标识（如 model_kind="cnn1d"）与版本号，不复用 hidden_dims
+# 占位、不接受 MLP ckpt、无旧 MLP→CNN 迁移，损坏不得回退 MLP。
 @dataclass(frozen=True, eq=False)
 class Checkpoint:
     """best.pt / final.pt 的 schema（仅凭 ckpt + npz 即可独立推理）。
@@ -172,6 +177,10 @@ def make_data_generator(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
 
+# TODO(CNN1D-P3): 未来 build_model 拟成为模型工厂，按 kind 分派
+# （mlp → MLPRegressor；cnn1d → CNN1DRegressor），并在此校验契约语义
+# （t_s、多 P 顺序等）；签名/返回类型与辅助 nn.Module 类型未来按需调整。
+# 共享 evaluate 入口未来先明确格式再显式路由，不按类别猜测。
 def build_model(contract: InputContract, hidden_dims: tuple[int, ...]) -> MLPRegressor:
     """按输入契约与隐层宽度构建 MLP（激活固定 ReLU，见 MLPRegressor）。
 
@@ -308,6 +317,10 @@ def _git_info() -> tuple[str | None, bool | None]:
     return sha, bool(status.strip())
 
 
+# TODO(CNN1D-P4): 未来共享编排 run(config_path) 放在本模块（与 train_model
+# 同模块、互不 import）：解析配置一次 → 按入口要求早拒 kind 不匹配（在加载
+# 数据/建目录前）→ 加载同一冻结 split/Dataset → 各自 train-only 拟合 →
+# train_model → 写各自产物；保持 output_dir 覆盖与失败/best-final 语义。
 def train_model(
     config: ExperimentConfig,
     train_set: TrajectoryDataset,
@@ -460,6 +473,9 @@ def save_checkpoint(path: Path, ckpt: Checkpoint) -> None:
     torch.save(_checkpoint_to_dict(ckpt), path)
 
 
+# TODO(CNN1D-P3): load_checkpoint 保持 MLP 专用、行为与版本常量不变，不接收
+# CNN 文件。未来共享 evaluate 入口先明确格式再路由到对应 loader（MLP 走本
+# 函数，CNN 走 load_cnn_checkpoint）；格式不符/损坏只能报错，不得回退 MLP。
 def load_checkpoint(path: Path) -> Checkpoint:
     """安全读取 Checkpoint（evaluation 侧恢复契约的唯一入口）。
 
@@ -592,6 +608,9 @@ def _config_from_dict(raw: Any, path: Path) -> ExperimentConfig:
         raise TrainingError(f"config 副本损坏 ({path}): {exc}") from exc
 
 
+# TODO(CNN1D-P3): 本序列化保持 MLP 专用、schema 不变。CNN 未来由
+# save_cnn_checkpoint 独立落盘完整结构（model_kind="cnn1d" + 自身版本号），
+# 恢复时不被嵌套 config 覆盖，也不存在旧 MLP ckpt 迁移。
 def _checkpoint_to_dict(ckpt: Checkpoint) -> dict[str, Any]:
     """Checkpoint → torch.save 落盘字典（仅 primitives/list/dict + CPU Tensor）。"""
     return {

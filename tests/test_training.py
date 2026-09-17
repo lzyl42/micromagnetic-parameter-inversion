@@ -29,6 +29,27 @@ from micromagnetic_parameter_inversion.training_config import (
 
 _SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_mlp.py"
 
+# TODO(CNN1D-P3)：checkpoint / build_model 实现后在此文件补充（本轮仅为注释，
+# 不改导入、不改 AST、不改任何可执行断言）：
+# - 模型描述：不做统一 checkpoint v2、也不做统一 loader 读 v1；统一的是与
+#   checkpoint 解耦的「模型描述」（模型类别 + 结构字段），供 build_model /
+#   evaluate 路由；
+# - 旧 MLP Checkpoint/save_checkpoint/load_checkpoint/格式原样不动（不加 kind、
+#   不改版本语义）；MLP 既有加载与预测回归不变；
+# - CNN 使用独立的 CNNCheckpoint / save_cnn_checkpoint / load_cnn_checkpoint
+#   （草案名，与核心实现统一）及明确的 cnn1d 格式与独立版本；
+# - CNN 完整架构与预处理统计往返：save→load→独立推理一致；weights_only 安全；
+# - 互不接受：CNN loader 拒绝 MLP 文件；MLP loader 拒绝 CNN 文件；损坏的 CNN
+#   文件必须报错，不得 fallback 到 MLP；
+# - 验证使用实际 split 成员与 SHA，且校验 t_s（不能只比 shape）。
+# TODO(CNN1D-P4)：入口/共享 run 实现后在此文件补充：
+# - 不新增共享 runner 模块；共享 run 未来从现 scripts/train_mlp.py 的 run()
+#   抽到既有 training.py，保持命令/默认行为、显式 output_dir、构造模型前设定
+#   seed、best/final 与数值失败语义不变；
+# - train_mlp.py / train_cnn1d.py 为薄入口，各自在读数据、建目录前校验
+#   model.kind（不匹配即拒绝），不通过 runner；旧 train_mlp 输出路径/产物不变，
+#   CNN 输出 output_root()/training/cnn1d/<dataset_name>/<run_name>。
+
 
 def _load_script() -> Any:
     """按路径加载 train_mlp 脚本模块（scripts/ 非包；自带、不跨测试导入）。"""

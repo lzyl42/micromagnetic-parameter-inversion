@@ -12,6 +12,21 @@ from micromagnetic_parameter_inversion.training_config import ConfigError, Split
 
 _MINIMAL = "dataset_name: demo_ds\nrun_name: run_001\n"
 
+# TODO(CNN1D-P1)：CNN1D 配置层实现后在此文件补充以下用例（本轮仅为注释，
+# 不改导入、不改 AST、不改任何可执行断言）：
+# - 缺 model.kind 仅对合法旧 MLP 字段集合默认 "mlp"，解析与改动前逐字段一致；
+#   缺 kind 时出现任何 CNN 字段（channels/kernel_sizes/pool_bins/
+#   head_hidden_dims）即拒绝，不得用缺省容纳 CNN 结构；
+# - 显式 kind: mlp 与缺省等价；kind: cnn1d 合法字段可解析；未知 kind 拒绝；
+# - 类别错配拒绝：kind: mlp 出现 CNN 字段，或 kind: cnn1d 出现 hidden_dims；
+# - 未知字段一律拒绝，不得静默吞掉；
+# - channels：空序列、各维 <=0、bool → 拒绝；
+# - kernel_sizes：空、偶数、<=0、bool → 拒绝；len 与 channels 不等 → 拒绝；
+# - pool_bins：<=0、bool → 拒绝；配置层不校验 > T（<= T 由模型层测试）；
+# - head_hidden_dims：允许空；各维 <=0、bool → 拒绝；
+# - yaml 与 mapping 两条路径严格一致：config_to_mapping/config_from_mapping
+#   往返一致，且对 bool / 偶数核 / 层数不等同样拒绝；合法空 head 往返保持为空。
+
 
 def _write(tmp_path: Path, text: str, name: str = "mlp.yaml") -> Path:
     config_path = tmp_path / name

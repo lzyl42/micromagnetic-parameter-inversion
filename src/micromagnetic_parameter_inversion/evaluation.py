@@ -242,6 +242,10 @@ def _resolve_meta_path(ckpt: training.Checkpoint) -> Path:
     return candidate
 
 
+# TODO(CNN1D-P3): 未来共享 evaluate 入口先明确 ckpt 格式再显式路由（MLP 走
+# 现有路径；CNN 走 load_cnn_checkpoint / CNNCheckpoint 恢复），不以类别猜测；
+# 完整结构从 ckpt 恢复、不被嵌套 config 覆盖；CNN 损坏不得回退 MLP。
+# 旧 MLP 评估路径与指标口径完全保留。本轮不改函数体与调用。
 def _evaluate_test_rows(
     ckpt: training.Checkpoint,
     samples_dir: Path,

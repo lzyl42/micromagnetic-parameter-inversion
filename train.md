@@ -8,6 +8,26 @@
 占位状态下不会成功。现有 `data/raw/` 各数据集（哨兵/QC 轮）仅验证过格式
 与执行链，不构成科研训练有效性依据。
 
+> **未实现的 CNN1D 分支**：1D CNN 反演目前只有骨架与注释
+> （`src/micromagnetic_parameter_inversion/models/cnn1d.py`、
+> `scripts/train_cnn1d.py`、`configs/training/cnn1d.yaml` 不可执行、
+> `tests/test_cnn1d.py` 无测试函数、pytest 不收集），**不能训练**；所有正式
+> 实现待逐步批准。CNN 与 MLP 的 checkpoint、训练产物与预处理统计**完全独立**：
+> 只共用同一 dataset 与冻结 split，统计量由 CNN 在自身训练组上拟合，不复用
+> MLP 权重/checkpoint/已有预处理统计/训练产物。
+>
+> **未来 CNN1D 入口与 checkpoint（未实现）**：共享编排未来从现
+> `scripts/train_mlp.py` 的 `run()` 抽到既有 `training.py`，保持命令/默认行为、
+> 显式 `output_dir`、构造模型前设定 seed、best/final 与数值失败语义不变；
+> `train_mlp.py` / `train_cnn1d.py` 为薄入口，各自在读数据、建目录**之前**校验
+> `model.kind`。checkpoint 不做统一 v2：MLP 的
+> `Checkpoint`/`save_checkpoint`/`load_checkpoint` 与格式原样不动，CNN 用独立的
+> `CNNCheckpoint`/`save_cnn_checkpoint`/`load_cnn_checkpoint`（草案名，与核心实现
+> 统一）及独立 `cnn1d` 格式，二者互不接受对方文件、损坏 CNN 不回退 MLP。细节
+> 大纲见 `tests/test_training_config.py`、`tests/test_training.py`、
+> `tests/test_evaluation.py` 的 `TODO(CNN1D-*)` 注释。本文档描述的
+> prepare/train/evaluate 流程目前仍只覆盖 MLP。
+
 ## 1. 目标与非目标
 
 - 目标：把已生成的 MuMax3 raw 输出规范化为模型可直接读取的 npz 样本，训练
