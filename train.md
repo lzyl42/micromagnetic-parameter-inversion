@@ -8,13 +8,17 @@
 占位状态下不会成功。现有 `data/raw/` 各数据集（哨兵/QC 轮）仅验证过格式
 与执行链，不构成科研训练有效性依据。
 
-> **未实现的 CNN1D 分支**：1D CNN 反演目前只有骨架与注释
-> （`src/micromagnetic_parameter_inversion/models/cnn1d.py`、
-> `scripts/train_cnn1d.py`、`configs/training/cnn1d.yaml` 不可执行、
-> `tests/test_cnn1d.py` 无测试函数、pytest 不收集），**不能训练**；所有正式
-> 实现待逐步批准。CNN 与 MLP 的 checkpoint、训练产物与预处理统计**完全独立**：
-> 只共用同一 dataset 与冻结 split，统计量由 CNN 在自身训练组上拟合，不复用
-> MLP 权重/checkpoint/已有预处理统计/训练产物。
+> **CNN1D 分支（P1 配置 + P2 模型已实现；训练链未接，不能训练）**：P1 配置层
+> 已支持 `model.kind` 判别（缺省 `mlp`）与 CNN 结构字段
+> `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 的严格校验（YAML 与
+> `config_from_mapping` 共用同一 schema）；P2 已实现
+> `src/micromagnetic_parameter_inversion/models/cnn1d.py` 的 `CNN1DRegressor`
+> 并有 CPU 合成单元测试。但模型**尚未接入** `training.train_model`/模型工厂，
+> 独立 checkpoint 与训练入口（`scripts/train_cnn1d.py`）也未实现，因此
+> **不能经项目训练脚本训练 CNN**；`configs/training/cnn1d.yaml` 仍为全注释
+> 占位、不可加载。原 MLP 流程与产物不变。CNN 与 MLP 的 checkpoint、训练产物与
+> 预处理统计**完全独立**：只共用同一 dataset 与冻结 split，统计量由 CNN 在自身
+> 训练组上拟合，不复用 MLP 权重/checkpoint/已有预处理统计/训练产物。
 >
 > **未来 CNN1D 入口与 checkpoint（未实现）**：共享编排未来从现
 > `scripts/train_mlp.py` 的 `run()` 抽到既有 `training.py`，保持命令/默认行为、

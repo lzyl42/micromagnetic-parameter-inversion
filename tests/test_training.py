@@ -11,7 +11,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -19,8 +19,16 @@ import torch
 import yaml
 from torch import nn
 
-from micromagnetic_parameter_inversion import paths, preprocessing, training, training_data
+from micromagnetic_parameter_inversion import (
+    paths,
+    preprocessing,
+    runtime,
+    training,
+    training_data,
+)
 from micromagnetic_parameter_inversion.training_config import (
+    ConfigError,
+    ModelConfig,
     SplitConfig,
     SplitMinCounts,
     SplitRatios,
@@ -182,6 +190,7 @@ def test_run_trains_and_writes_artifacts(env: tuple[Path, Path]) -> None:
     # config_resolved.yaml 可被 load_config 重新加载且字段一致
     resolved = load_config(run_dir / "config_resolved.yaml")
     assert (resolved.dataset_name, resolved.run_name) == ("ds1", "r1")
+    assert isinstance(resolved.model, ModelConfig)
     assert resolved.model.hidden_dims == (8, 4)
     assert resolved.training.max_epochs == 2
     # split 副本 = 源 split.yaml 原字节
@@ -547,3 +556,69 @@ def test_weights_finite_update_from_same_seed_init(env: tuple[Path, Path]) -> No
     trained = dict(ckpt.model_state_dict)
     assert all(torch.isfinite(t).all() for t in trained.values())
     assert any(not torch.equal(trained[name], fresh.state_dict()[name]) for name in trained)
+
+
+# --- P1: CNN 配置在入口 / train_model 顶部按 kind 早拒 ----------------------
+# 超参为**明确 unit-test-only 数值**，不代表研究配置。
+
+
+def _cnn_config_text(dataset: str, run_name: str) -> str:
+    """P1 合法 CNN 配置文本（结构字段齐全；unit-test-only 超参）。"""
+    return (
+        f"dataset_name: {dataset}\n"
+        f"run_name: {run_name}\n"
+        "model: {kind: cnn1d, channels: [4, 8], kernel_sizes: [3, 5],"
+        " pool_bins: 4, head_hidden_dims: [8]}\n"
+        "training: {\n"
+        "  seed: 11, device: cpu, batch_size: 2, max_epochs: 2,\n"
+        "  learning_rate: 0.01, weight_decay: 0.0,\n"
+        "  early_stopping: {patience: 50, min_delta: 0.0},\n"
+        "}\n"
+        "split: {seed: 5, ratios: {train: 0.5, val: 0.25, test: 0.25},"
+        " min_per_split: {train: 1, val: 1, test: 1}}\n"
+        "output_dir: null\n"
+    )
+
+
+def test_run_rejects_cnn_config_before_touching_data(
+    env: tuple[Path, Path],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CNN 配置：load_config 后、读 data_root/建目录前按 kind 早拒（ConfigError）。"""
+    _, out_root = env
+    config_path = _write_config(tmp_path, _cnn_config_text("ds_cnn", "r1"), name="cnn.yaml")
+    calls = {"data_root": 0}
+
+    def _forbidden_data_root() -> Path:
+        calls["data_root"] += 1
+        raise AssertionError("paths.data_root() 不应在 kind 早拒前被调用")
+
+    monkeypatch.setattr(paths, "data_root", _forbidden_data_root)
+    script = _load_script()
+    with pytest.raises(ConfigError, match="cnn1d"):
+        script.run(config_path)
+    assert calls["data_root"] == 0
+    assert not (out_root / "training").exists()
+
+    # CLI 同样友好失败：exit 2、错误信息点明 cnn1d、无输出目录
+    assert script.main(["--config", str(config_path)]) == 2
+    assert "cnn1d" in capsys.readouterr().err
+    assert calls["data_root"] == 0
+    assert not (out_root / "training").exists()
+
+
+def test_train_model_rejects_cnn_config_before_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CNN 配置直接进 training.train_model：顶部早拒，不触 seed/device/构模。"""
+    config = load_config(_write_config(tmp_path, _cnn_config_text("ds_cnn", "r1"), name="cnn.yaml"))
+    calls: list[str] = []
+    monkeypatch.setattr(training, "set_seed", lambda seed: calls.append("set_seed"))
+    monkeypatch.setattr(training, "build_model", lambda *a, **k: calls.append("build_model"))
+    monkeypatch.setattr(runtime, "select_device", lambda *a, **k: calls.append("select_device"))
+    sentinel = cast(Any, object())
+    with pytest.raises(ConfigError, match="cnn1d"):
+        training.train_model(config, sentinel, sentinel, sentinel, sentinel, "sha")
+    assert calls == []

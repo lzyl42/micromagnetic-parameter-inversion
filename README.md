@@ -94,12 +94,15 @@ run.log 仍由原机制写入。无 CLI 参数、无 plan/resume、无「目录�
   为唯一模拟执行入口，单份配置 CLI 已删除）；首版「样本准备 → 训练 →
   独立评估」工程已实现（见 `train.md`），**但未在正式研究数据上训练，
   不存在可靠科研结果或研究结论**。
-- **CNN1D 分支未实现**：1D CNN 反演目前只有骨架与注释
-  （`src/micromagnetic_parameter_inversion/models/cnn1d.py`、
-  `scripts/train_cnn1d.py`、`configs/training/cnn1d.yaml` 不可执行、
-  `tests/test_cnn1d.py` 无测试函数且 pytest 不收集），**不能训练**；所有正式
-  实现待逐步批准。CNN 与 MLP 的 checkpoint、训练产物与预处理统计**完全独立**，
-  仅共用同一 dataset 与冻结 split，并在自身训练组上拟合统计量。
+- **CNN1D 分支**：P1 配置层与 P2 模型已实现（`model.kind` 判别 + CNN 四字段
+  `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 严格校验，YAML 与
+  mapping 同一 schema；`CNN1DRegressor` 已实现于
+  `src/micromagnetic_parameter_inversion/models/cnn1d.py`，并有 CPU 合成单元测试）。
+  但模型**尚未接入** `training.train_model`/模型工厂，独立 checkpoint 与 CNN
+  训练入口（`scripts/train_cnn1d.py`）也未实现，因此**不能经项目训练脚本训练
+  CNN**；`configs/training/cnn1d.yaml` 仍为全注释占位、不可加载。原 MLP 流程与
+  产物不变。CNN 与 MLP 的 checkpoint、训练产物与预处理统计**完全独立**，仅共用
+  同一 dataset 与冻结 split，并在自身训练组上拟合统计量。
 - 已完成的部分 QC：offline vertical slice 测试（31 passed）、2026-09-02
   test-only pilot 执行链冒烟、Pilot v1 哨兵轮轨迹层检查（历史协议）。
 - **未证明**：连续模型网格收敛、Relax 收敛鲁棒性、EdgeSmooth 选择的

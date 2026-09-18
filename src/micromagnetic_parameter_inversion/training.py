@@ -51,6 +51,7 @@ from micromagnetic_parameter_inversion.training_config import (
     ActivationName,
     ConfigError,
     ExperimentConfig,
+    ModelConfig,
 )
 from micromagnetic_parameter_inversion.training_data import (
     InputContract,
@@ -357,8 +358,13 @@ def train_model(
         TrainingError: 首个 epoch 即因数值失败停止（无可保存权重）；
             异常携带 ``epoch``/``detail``。
     """
+    model_config = config.model  # P1：CNN 配置尚未支持训练，先收窄并守卫
+    if not isinstance(model_config, ModelConfig):
+        raise ConfigError(
+            f"train_model 只支持 MLP 模型；检测到 kind={model_config.kind!r}（cnn1d 训练尚未实现）"
+        )
     set_seed(config.training.seed)  # 先于模型构造：权重初始化可复现
-    model = build_model(contract, config.model.hidden_dims)
+    model = build_model(contract, model_config.hidden_dims)
     device = runtime.select_device(config.training.device)
     model.to(device)
     train_loader: DataLoader[SampleItem] = DataLoader(
@@ -434,7 +440,7 @@ def train_model(
     git_sha, git_dirty = _git_info()
     common: dict[str, Any] = dict(
         ckpt_format_version=CKPT_FORMAT_VERSION,
-        hidden_dims=tuple(config.model.hidden_dims),
+        hidden_dims=tuple(model_config.hidden_dims),
         activation="relu",
         contract=contract,
         preprocessing=state,

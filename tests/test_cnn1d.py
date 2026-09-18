@@ -1,37 +1,310 @@
-"""CNN1D 模型职责清单（**本文件当前不包含任何测试函数**）。
+"""CNN1DRegressor 的 CPU 单元测试（离线、合成数据，无 GPU / 无训练循环）。
 
-本文件只记录 ``CNN1DRegressor``（``src/micromagnetic_parameter_inversion/
-models/cnn1d.py``）未来实现后要满足的模型职责与用例方向；**它不是可执行测试**：
-没有 ``test_*`` 函数、没有断言、没有 ``pytest.skip``、也没有 ``pass`` 占位，
-因此 **pytest 当前不会从本文件收集到任何用例（收集数为 0）**。配置、checkpoint、
-入口与评估的大纲分别放在 ``tests/test_training_config.py``、
-``tests/test_training.py``、``tests/test_evaluation.py`` 的注释中，不在此重复。
-
-测试纪律：仅用 ``tmp_path`` / 合成数据，device 恒为 ``cpu``，不触 GPU、MuMax3
-或真实数据；不写空 ``pass`` 测试、不写 ``assert True``、不用 ``skip``。
-
-模型职责与用例方向（仅注释）：
+覆盖 P2 约定：结构/形状、真实 forward 的 pulse-major 通道编码、非连续输入、
+构造参数校验、前向形状校验、有限前向与梯度、state_dict 往返、同 seed 初始化、
+模块导出与末层线性输出。全部使用 **unit-test-only 小数值**，不读真实数据、
+不触 GPU、不跑训练循环，也不修改全局 torch 状态（必要时用 ``fork_rng`` 隔离）。
 """
 
-# - 接口：``CNN1DRegressor(input_shape=(P, T, 3), *, channels, kernel_sizes,
-#   pool_bins, head_hidden_dims)``；``forward``: ``[N, P, T, 3] -> [N, 2]``。
-# - 输入重排：``permute(0, 1, 3, 2)`` -> ``contiguous()`` -> ``reshape(N, 3P, T)``；
-#   通道顺序固定 pulse-major、component-minor（索引 = p*3 + c）；不同 pulse 的
-#   时间维不得首尾相接，``T`` 在卷积阶段原样保留。
-# - 卷积：``stride=1`` + 奇数 kernel + ``padding=(k-1)//2`` ⇒ 长度保持 ``T``；
-#   ``AdaptiveAvgPool1d(pool_bins)`` 聚合时间；``Flatten`` 后接 ``Linear + ReLU``
-#   回归头（``head_hidden_dims`` 允许为空 = 直接线性输出），末层输出 2。
-# - 形状：[N, P, T, 3] → [N, 2]，覆盖多 N、多 P 与 N=1。
-# - 错误输入拒绝：ndim 错误；``T`` 与 ``input_shape`` 不符；``pool_bins > T``
-#   （``<= T`` 由模型层校验，配置层不校验 ``> T``）；非连续 tensor 必须被接受
-#   （内部显式 ``contiguous()``）。
-# - 通道编码真实检查：用可区分的 pulse/分量/时间构造输入，核对首层真实收到
-#   p/c/t 编码（pulse-major、component-minor），而不是只测输出形状。
-# - 参数校验（``ValueError``）：``channels`` 非空、各维 > 0、非 bool；
-#   ``kernel_sizes`` 非空、各维正奇数、非 bool、与 ``channels`` 等长；
-#   ``head_hidden_dims`` 各维 > 0、允许为空、非 bool。
-# - 反向梯度：标量 ``loss.backward()`` 后所有需梯度参数 grad 有限（非 NaN/Inf）。
-# - ``state_dict`` 往返：save→load 后同输入输出逐位一致；同 seed 两次构造结构一致。
-# - 池化：``pool_bins > 1`` 保留多段局部时间信息；``pool_bins == 1`` 仅作对照变体。
-# - 模块边界：不读取数据、不做任何标准化/归一化。
-# - 实验时记录：感受野 / 池化配置 / 参数量（不设固定物理下界）。
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+import torch
+from torch import Tensor, nn
+
+from micromagnetic_parameter_inversion import models
+from micromagnetic_parameter_inversion.models import CNN1DRegressor
+
+# unit-test-only 结构/数值（不代表研究超参，不对应 configs/ 下研究配置）。
+_UNIT_SHAPE = (2, 6, 3)  # (P, T, 3)
+_UNIT_CHANNELS = (3, 4)
+_UNIT_KERNELS = (3, 5)
+_UNIT_POOL_BINS = 2
+_UNIT_HEAD = (5,)
+
+
+def _bad(value: object) -> Any:
+    """把故意非法的参数值交给类型检查器之外的运行时校验（少量 cast，不滥用）。"""
+    return cast(Any, value)
+
+
+def _make_model(
+    *,
+    input_shape: tuple[int, int, int] = _UNIT_SHAPE,
+    channels: tuple[int, ...] = _UNIT_CHANNELS,
+    kernel_sizes: tuple[int, ...] = _UNIT_KERNELS,
+    pool_bins: int = _UNIT_POOL_BINS,
+    head_hidden_dims: tuple[int, ...] = _UNIT_HEAD,
+) -> CNN1DRegressor:
+    return CNN1DRegressor(
+        input_shape,
+        channels=channels,
+        kernel_sizes=kernel_sizes,
+        pool_bins=pool_bins,
+        head_hidden_dims=head_hidden_dims,
+    )
+
+
+def _construct(**overrides: object) -> CNN1DRegressor:
+    """按合法默认 + overrides 构造模型；非法值经 ``_bad`` 交给构造器校验。"""
+    kwargs: dict[str, object] = {
+        "input_shape": _UNIT_SHAPE,
+        "channels": _UNIT_CHANNELS,
+        "kernel_sizes": _UNIT_KERNELS,
+        "pool_bins": _UNIT_POOL_BINS,
+        "head_hidden_dims": _UNIT_HEAD,
+    }
+    kwargs.update(overrides)
+    return CNN1DRegressor(
+        _bad(kwargs["input_shape"]),
+        channels=_bad(kwargs["channels"]),
+        kernel_sizes=_bad(kwargs["kernel_sizes"]),
+        pool_bins=_bad(kwargs["pool_bins"]),
+        head_hidden_dims=_bad(kwargs["head_hidden_dims"]),
+    )
+
+
+@pytest.mark.parametrize(
+    ("input_shape", "head", "batch"),
+    [
+        ((2, 6, 3), (5,), 4),
+        ((3, 8, 3), (), 2),
+        ((1, 4, 3), (7, 3), 1),
+    ],
+    ids=["multi_pulse_single_head", "empty_head", "n1_multi_layer_head"],
+)
+def test_forward_shape_and_structural_attributes(
+    input_shape: tuple[int, int, int], head: tuple[int, ...], batch: int
+) -> None:
+    model = _make_model(input_shape=input_shape, head_hidden_dims=head)
+    assert model.input_shape == input_shape
+    assert model.channels == _UNIT_CHANNELS
+    assert model.kernel_sizes == _UNIT_KERNELS
+    assert model.pool_bins == _UNIT_POOL_BINS
+    assert model.head_hidden_dims == head
+    assert isinstance(model.features, nn.Sequential)
+    assert isinstance(model.pool, nn.AdaptiveAvgPool1d)
+    assert isinstance(model.head, nn.Sequential)
+
+    model.eval()
+    with torch.no_grad():
+        out = model(torch.randn(batch, *input_shape))
+    assert out.shape == (batch, 2)
+    assert torch.isfinite(out).all()
+
+
+def test_first_convolution_receives_pulse_major_component_minor_encoding() -> None:
+    """真实 forward 中第一层 Conv 收到按 ``p*3 + c``（pulse-major）编码的通道。
+
+    期望值用手工索引/stack 构造，避免在测试里完整复刻 permute+reshape。
+    """
+    n_pulse, n_time = _UNIT_SHAPE[0], _UNIT_SHAPE[1]
+    model = _make_model().eval()
+    captured: dict[str, Tensor] = {}
+
+    def _capture(_module: nn.Module, inputs: tuple[Tensor, ...]) -> None:
+        captured["x"] = inputs[0].detach().clone()
+
+    handle = model.features[0].register_forward_pre_hook(_capture)
+    try:
+        # 每个 (p, t, c) 取唯一可辨识值。
+        base = torch.arange(1, n_pulse * n_time * 3 + 1, dtype=torch.float32)
+        x = base.reshape(1, n_pulse, n_time, 3)
+        with torch.no_grad():
+            _ = model(x)
+    finally:
+        handle.remove()
+
+    expected = torch.stack(
+        [
+            torch.stack([x[0, pulse, :, comp] for comp in range(3)], dim=0)
+            for pulse in range(n_pulse)
+        ],
+        dim=0,
+    ).reshape(3 * n_pulse, n_time)
+    assert torch.equal(captured["x"][0], expected)
+
+
+def test_features_preserve_time_length_and_pool_collapses_to_bins() -> None:
+    model = _make_model().eval()
+    shapes: dict[str, tuple[int, ...]] = {}
+
+    def _conv_out(_module: nn.Module, _inputs: tuple[Tensor, ...], output: Tensor) -> None:
+        shapes["conv"] = tuple(output.shape)
+
+    def _pool_out(_module: nn.Module, _inputs: tuple[Tensor, ...], output: Tensor) -> None:
+        shapes["pool"] = tuple(output.shape)
+
+    conv_handle = model.features[0].register_forward_hook(_conv_out)
+    pool_handle = model.pool.register_forward_hook(_pool_out)
+    try:
+        with torch.no_grad():
+            model(torch.randn(2, *_UNIT_SHAPE))
+    finally:
+        conv_handle.remove()
+        pool_handle.remove()
+
+    # stride=1 + 奇数 kernel + padding=(k-1)//2 ⇒ 首层卷积输出长度仍为 T。
+    assert shapes["conv"] == (2, _UNIT_CHANNELS[0], _UNIT_SHAPE[1])
+    assert shapes["pool"] == (2, _UNIT_CHANNELS[-1], _UNIT_POOL_BINS)
+
+
+def test_noncontiguous_input_matches_contiguous() -> None:
+    model = _make_model().eval()
+    big = torch.randn(2, *_UNIT_SHAPE[:2], 6)  # (N, P, T, 6)
+    x = big[..., :3]  # 末维切片得到形状一致的 (N, P, T, 3) 非连续张量
+    assert x.shape == (2, *_UNIT_SHAPE)
+    assert not x.is_contiguous()
+    with torch.no_grad():
+        got = model(x)
+        expected = model(x.contiguous())
+    assert torch.isfinite(got).all()
+    assert torch.equal(got, expected)
+
+
+def test_constructor_normalizes_list_sequences_to_tuple() -> None:
+    model = _construct(channels=[3, 4], kernel_sizes=[3, 5], head_hidden_dims=[5])
+    assert model.channels == (3, 4)
+    assert model.kernel_sizes == (3, 5)
+    assert model.head_hidden_dims == (5,)
+
+
+def test_pool_bins_accepts_one_and_t() -> None:
+    assert _construct(pool_bins=1).pool_bins == 1
+    assert _construct(pool_bins=_UNIT_SHAPE[1]).pool_bins == _UNIT_SHAPE[1]
+
+
+_BAD_CTOR_CASES: tuple[tuple[str, dict[str, object]], ...] = (
+    ("input_shape_ndim_2", {"input_shape": (2, 6)}),
+    ("input_shape_ndim_4", {"input_shape": (2, 6, 3, 1)}),
+    ("input_shape_zero", {"input_shape": (0, 6, 3)}),
+    ("input_shape_negative", {"input_shape": (2, -1, 3)}),
+    ("input_shape_bool", {"input_shape": (True, 6, 3)}),
+    ("input_shape_float", {"input_shape": (2.0, 6, 3)}),
+    ("input_shape_string_element", {"input_shape": (2, "6", 3)}),
+    ("input_shape_component_not_3", {"input_shape": (2, 6, 4)}),
+    ("input_shape_scalar", {"input_shape": 5}),
+    ("input_shape_none", {"input_shape": None}),
+    ("input_shape_string", {"input_shape": "shape"}),
+    ("channels_scalar", {"channels": 3}),
+    ("channels_none", {"channels": None}),
+    ("channels_string", {"channels": "abc"}),
+    ("channels_empty", {"channels": ()}),
+    ("channels_zero_element", {"channels": (0, 4)}),
+    ("channels_negative_element", {"channels": (-1, 4)}),
+    ("channels_bool_element", {"channels": (True, 4)}),
+    ("channels_float_element", {"channels": (3.0, 4)}),
+    ("channels_string_element", {"channels": ("3", 4)}),
+    ("kernel_empty", {"kernel_sizes": ()}),
+    ("kernel_even", {"kernel_sizes": (2, 4)}),
+    ("kernel_zero", {"kernel_sizes": (0, 5)}),
+    ("kernel_bool", {"kernel_sizes": (True, 5)}),
+    ("kernel_float", {"kernel_sizes": (3.0, 5)}),
+    ("kernel_string_element", {"kernel_sizes": ("3", 5)}),
+    ("kernel_length_mismatch", {"kernel_sizes": (3,)}),
+    ("kernel_none", {"kernel_sizes": None}),
+    ("kernel_scalar", {"kernel_sizes": 3}),
+    ("pool_zero", {"pool_bins": 0}),
+    ("pool_negative", {"pool_bins": -1}),
+    ("pool_bool", {"pool_bins": True}),
+    ("pool_float", {"pool_bins": 2.0}),
+    ("pool_string", {"pool_bins": "2"}),
+    ("pool_none", {"pool_bins": None}),
+    ("pool_greater_than_t", {"pool_bins": _UNIT_SHAPE[1] + 1}),
+    ("head_scalar", {"head_hidden_dims": 5}),
+    ("head_none", {"head_hidden_dims": None}),
+    ("head_string", {"head_hidden_dims": "5"}),
+    ("head_zero_element", {"head_hidden_dims": (0,)}),
+    ("head_negative_element", {"head_hidden_dims": (-1,)}),
+    ("head_bool_element", {"head_hidden_dims": (True,)}),
+    ("head_float_element", {"head_hidden_dims": (2.5,)}),
+    ("head_string_element", {"head_hidden_dims": ("5",)}),
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "overrides"),
+    _BAD_CTOR_CASES,
+    ids=[case for case, _ in _BAD_CTOR_CASES],
+)
+def test_constructor_rejects_invalid_arguments(case: str, overrides: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        _construct(**overrides)
+
+
+def test_forward_rejects_wrong_ndim_or_shape() -> None:
+    model = _make_model().eval()
+    n_pulse, n_time = _UNIT_SHAPE[0], _UNIT_SHAPE[1]
+    bad_shapes = [
+        (2, n_time, 3),  # ndim=3
+        (2, n_pulse, n_time),  # ndim=3，缺分量维
+        (2, n_pulse, n_time, 3, 1),  # ndim=5
+        (2, n_pulse, n_time, 4),  # 分量 != 3
+        (2, n_pulse + 1, n_time, 3),  # P 不匹配
+        (2, n_pulse, n_time + 1, 3),  # T 不匹配
+    ]
+    for bad_shape in bad_shapes:
+        with pytest.raises(ValueError):
+            model(torch.randn(*bad_shape))
+
+
+def test_forward_output_and_gradients_are_finite() -> None:
+    model = _make_model().train()
+    out = model(torch.randn(3, *_UNIT_SHAPE))
+    assert torch.isfinite(out).all()
+    (out**2).sum().backward()
+
+    grads = [(name, param.grad) for name, param in model.named_parameters() if param.requires_grad]
+    assert grads  # 至少有一个可训练参数
+    # 梯度可恰为 0（合法），但不得为 None/NaN/Inf。
+    assert all(grad is not None and torch.isfinite(grad).all() for _, grad in grads)
+
+
+def test_state_dict_roundtrip_via_torch_load(tmp_path: Path) -> None:
+    model = _make_model().eval()
+    probe = torch.randn(3, *_UNIT_SHAPE)
+    with torch.no_grad():
+        expected = model(probe)
+
+    path = tmp_path / "cnn1d_state.pt"
+    torch.save(model.state_dict(), path)
+    reloaded = _make_model().eval()
+    reloaded.load_state_dict(torch.load(path, weights_only=True))
+    with torch.no_grad():
+        got = reloaded(probe)
+    assert torch.equal(got, expected)
+
+
+def test_same_seed_initialization_is_identical() -> None:
+    with torch.random.fork_rng(devices=[]):  # 隔离全局 RNG，不留下副作用
+        torch.manual_seed(1234)
+        first = _make_model()
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(1234)
+        second = _make_model()
+
+    first_state = first.state_dict()
+    assert first_state
+    for name, tensor in first_state.items():
+        assert torch.equal(tensor, second.state_dict()[name]), name
+
+
+def test_module_export() -> None:
+    assert models.CNN1DRegressor is CNN1DRegressor
+    assert "CNN1DRegressor" in models.__all__
+
+
+def test_output_head_is_linear_without_final_activation() -> None:
+    model = _make_model(head_hidden_dims=()).eval()
+    last = model.head[-1]
+    assert isinstance(last, nn.Linear)
+    with torch.no_grad():
+        last.weight.zero_()
+        last.bias.fill_(-3.0)
+    with torch.no_grad():
+        out = model(torch.randn(5, *_UNIT_SHAPE))
+    # 末层为线性输出（无 ReLU）：负 bias 不被裁掉，输出恒为 -3。
+    assert torch.allclose(out, torch.full_like(out, -3.0))

@@ -48,7 +48,11 @@ from micromagnetic_parameter_inversion import (
     training_config,
     training_data,
 )
-from micromagnetic_parameter_inversion.training_config import ConfigError, load_config
+from micromagnetic_parameter_inversion.training_config import (
+    ConfigError,
+    ModelConfig,
+    load_config,
+)
 from micromagnetic_parameter_inversion.training_data import (
     DataError,
     DatasetMeta,
@@ -142,6 +146,10 @@ def _write_failure_metrics(path: Path, error: training.TrainingError) -> None:
 def run(config_path: Path) -> Path:
     """执行完整训练流程，返回 run 目录（产物见模块 docstring 第 7 步）。"""
     config = load_config(config_path)
+    if not isinstance(config.model, ModelConfig):
+        raise ConfigError(
+            f"train_mlp 只支持 MLP 配置；检测到 kind={config.model.kind!r}（cnn1d 训练尚未支持）"
+        )
     samples_dir = paths.data_root() / "samples" / config.dataset_name
     if not samples_dir.is_dir():
         raise DataError(f"样本目录不存在: {samples_dir}")

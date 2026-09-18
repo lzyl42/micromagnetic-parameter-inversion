@@ -17,7 +17,7 @@ training_data / preprocessing / training / evaluation 单向引用。
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -62,10 +62,11 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 _DATA_KEYS = frozenset({"pulse_order"})
-# TODO(CNN1D-P1): 未来 _MODEL_KEYS 按 kind 分集合（mlp/CNN 字段互斥），并在
-# _parse_model 实现严格类别校验；缺 kind 仅对旧配置默认 mlp，旧入口遇
-# kind=cnn1d 早拒。本轮不改常量内容。
-_MODEL_KEYS = frozenset({"hidden_dims"})
+# model 块：kind 取值与按类别严格互斥的字段集合（未知/跨类别字段一律拒绝）。
+_MODEL_KINDS = frozenset({"mlp", "cnn1d"})
+_MODEL_KEYS_MLP = frozenset({"kind", "hidden_dims"})
+_MODEL_KEYS_CNN1D = frozenset({"kind", "channels", "kernel_sizes", "pool_bins", "head_hidden_dims"})
+_CNN1D_REQUIRED = frozenset({"channels", "kernel_sizes", "pool_bins", "head_hidden_dims"})
 _LABEL_KEYS = frozenset({"transform"})
 _PREPROCESSING_KEYS = frozenset({"std_eps"})
 _TRAINING_KEYS = frozenset(
@@ -99,17 +100,28 @@ class DataConfig:
     pulse_order: tuple[str, ...] | None = None
 
 
-# TODO(CNN1D-P1): 未来在此扩展 model 结构字段：新增 kind（"mlp"|"cnn1d"）；
-# **缺 kind 默认 mlp，仅对旧配置且只接受合法 MLP 字段**；kind=cnn1d 时引入
-# channels/kernel_sizes/pool_bins/head_hidden_dims。校验：正整数且拒 bool、
-# channels/kernel_sizes 非空、层数匹配、kernel 全为奇数、head 允许为空；
-# pool_bins<=T 由模型构造校验（非配置层）。YAML 与 mapping 加载保持同一
-# 严格 schema，跨类别/未知字段一律报错、不静默吞掉。本轮仅注释。
 @dataclass(frozen=True)
 class ModelConfig:
-    """``model`` 块：网络结构（[64,32,32] 时参数量 = ``64·D + 3266``）。"""
+    """``model`` 块：MLP 网络结构（[64,32,32] 时参数量 = ``64·D + 3266``）。"""
 
     hidden_dims: tuple[int, ...] = (64, 32, 32)
+    # 固定类别标记；init=False 保持旧位置参数构造 (ModelConfig()) 与字段序不变。
+    kind: Literal["mlp"] = field(default="mlp", init=False)
+
+
+@dataclass(frozen=True)
+class CNN1DModelConfig:
+    """``model`` 块：1D CNN 网络结构（P1 仅配置层；模型/训练/ckpt 未实现）。
+
+    四字段全部必填（``head_hidden_dims`` 可为空元组）；``kind`` 固定
+    ``"cnn1d"``。``pool_bins <= T`` 由模型层校验，配置层不读取数据。
+    """
+
+    channels: tuple[int, ...]
+    kernel_sizes: tuple[int, ...]
+    pool_bins: int
+    head_hidden_dims: tuple[int, ...]
+    kind: Literal["cnn1d"] = field(default="cnn1d", init=False)
 
 
 @dataclass(frozen=True)
@@ -183,7 +195,7 @@ class ExperimentConfig:
     dataset_name: str
     run_name: str
     data: DataConfig = DataConfig()
-    model: ModelConfig = ModelConfig()
+    model: ModelConfig | CNN1DModelConfig = ModelConfig()
     label: LabelConfig = LabelConfig()
     preprocessing: PreprocessingConfig = PreprocessingConfig()
     training: TrainingParams = TrainingParams()
@@ -234,6 +246,56 @@ def _parse_hidden_dims(value: object, field: str) -> tuple[int, ...]:
     return tuple(_require_positive_int(item, f"{field}[{i}]") for i, item in enumerate(value))
 
 
+def _parse_int_sequence(value: object, field: str, *, allow_empty: bool) -> tuple[int, ...]:
+    """整数序列：元素为正整数（拒 bool/float/string）；按需允许空序列。"""
+    if not isinstance(value, list):
+        _fail(field, f"必须为整数列表 (got {value!r})")
+    if not value and not allow_empty:
+        _fail(field, f"必须为非空整数列表 (got {value!r})")
+    return tuple(_require_positive_int(item, f"{field}[{i}]") for i, item in enumerate(value))
+
+
+def _parse_model_value(value: object, field: str) -> ModelConfig | CNN1DModelConfig:
+    """``model`` 块严格解析（YAML 与 config_from_mapping 共用）。
+
+    - ``kind`` 缺省等价 ``"mlp"``（仅旧 MLP 字段 ``hidden_dims`` 合法）；
+    - ``kind="cnn1d"`` 时四字段必填：``channels``/``kernel_sizes`` 非空正整数
+      且层数匹配、kernel 全为奇数，``pool_bins`` 为正整数，
+      ``head_hidden_dims`` 显式提供（可空）且各元素为正整数；
+    - 类别字段严格互斥、未知字段拒绝；``kind`` 与序列元素均拒绝 bool。
+    """
+    raw = _require_mapping(value, field)  # null/非映射 → 报错（不放宽）
+    kind = raw.get("kind", "mlp")
+    if isinstance(kind, bool) or not isinstance(kind, str) or kind not in _MODEL_KINDS:
+        _fail(f"{field}.kind", f"必须为 {sorted(_MODEL_KINDS)} 之一 (got {kind!r})")
+    if kind == "cnn1d":
+        _check_keys(raw, field, _MODEL_KEYS_CNN1D, _CNN1D_REQUIRED)
+        channels = _parse_int_sequence(raw["channels"], f"{field}.channels", allow_empty=False)
+        kernel_sizes = _parse_int_sequence(
+            raw["kernel_sizes"], f"{field}.kernel_sizes", allow_empty=False
+        )
+        if len(kernel_sizes) != len(channels):
+            _fail(
+                f"{field}.kernel_sizes",
+                f"层数须与 channels 相同 (got {len(kernel_sizes)} vs {len(channels)})",
+            )
+        if any(kernel % 2 == 0 for kernel in kernel_sizes):
+            _fail(f"{field}.kernel_sizes", f"卷积核须为奇数 (got {list(kernel_sizes)!r})")
+        return CNN1DModelConfig(
+            channels=channels,
+            kernel_sizes=kernel_sizes,
+            pool_bins=_require_positive_int(raw["pool_bins"], f"{field}.pool_bins"),
+            head_hidden_dims=_parse_int_sequence(
+                raw["head_hidden_dims"], f"{field}.head_hidden_dims", allow_empty=True
+            ),
+        )
+    _check_keys(raw, field, _MODEL_KEYS_MLP, frozenset())
+    kwargs: dict[str, Any] = {}
+    if "hidden_dims" in raw:
+        kwargs["hidden_dims"] = _parse_hidden_dims(raw["hidden_dims"], f"{field}.hidden_dims")
+    return ModelConfig(**kwargs)
+
+
 def _parse_ratios(value: object, field: str) -> SplitRatios:
     """ratios：非负有限数，和为 1（容差内）。"""
     raw = _require_mapping(value, field)
@@ -269,14 +331,11 @@ def _parse_data(root: dict[Any, Any]) -> DataConfig:
     return DataConfig(**kwargs)
 
 
-def _parse_model(root: dict[Any, Any]) -> ModelConfig:
-    raw = _optional_section(root, "model", _MODEL_KEYS)
-    if raw is None:
+def _parse_model(root: dict[Any, Any]) -> ModelConfig | CNN1DModelConfig:
+    """``model`` 节：缺省 → MLP 默认；出现则交共用严格解析器（null 拒绝）。"""
+    if "model" not in root:
         return ModelConfig()
-    kwargs: dict[str, Any] = {}
-    if "hidden_dims" in raw:
-        kwargs["hidden_dims"] = _parse_hidden_dims(raw["hidden_dims"], "model.hidden_dims")
-    return ModelConfig(**kwargs)
+    return _parse_model_value(root["model"], "model")
 
 
 def _parse_label(root: dict[Any, Any]) -> LabelConfig:
@@ -372,9 +431,12 @@ def load_config(path: Path) -> ExperimentConfig:
     校验边界（此后流程假定配置合法）：所有层级严格 schema（未知字段一律
     拒绝，重复 YAML 键拒绝）；dataset_name/run_name 必填、安全单路径段、
     不得保留占位符；data.pulse_order 为 null 或无重复 pulse_id 列表；
-    hidden_dims 正整数；label.transform 取值合法；std_eps/learning_rate/
-    batch_size/max_epochs/patience 为正，weight_decay/min_delta 非负
-    （0 合法）；device ∈ {auto,cpu,cuda}（语义同 runtime.select_device）；
+    model.kind ∈ {mlp,cnn1d}
+    且按类别各自严格校验（MLP hidden_dims 非空正整数；CNN channels/
+    kernel_sizes 非空正整数且层数匹配、kernel 奇数、pool_bins 正整数、
+    head_hidden_dims 显式可空）；label.transform 取值合法；std_eps/
+    learning_rate/batch_size/max_epochs/patience 为正，weight_decay/min_delta
+    非负（0 合法）；device ∈ {auto,cpu,cuda}（语义同 runtime.select_device）；
     ratios 非负有限且和为 1（容差 1e-9）；min_per_split 非负整数；
     output_dir 为 null 或非空字符串。可选节缺省时使用 dataclass 默认值。
 
@@ -411,6 +473,21 @@ def load_config(path: Path) -> ExperimentConfig:
     )
 
 
+def _model_to_mapping(model: ModelConfig | CNN1DModelConfig) -> dict[str, Any]:
+    """model → 纯字典：MLP 保持旧布局（无 kind，供旧 ckpt 嵌套 config 兼容），
+    CNN 输出 kind + 四字段（可被 ``config_from_mapping`` 重新加载）。
+    """
+    if isinstance(model, CNN1DModelConfig):
+        return {
+            "kind": model.kind,
+            "channels": list(model.channels),
+            "kernel_sizes": list(model.kernel_sizes),
+            "pool_bins": model.pool_bins,
+            "head_hidden_dims": list(model.head_hidden_dims),
+        }
+    return {"hidden_dims": list(model.hidden_dims)}
+
+
 def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
     """ExperimentConfig → 嵌套纯字典（本模块拥有的唯一映射 schema）。
 
@@ -426,7 +503,7 @@ def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
                 list(config.data.pulse_order) if config.data.pulse_order is not None else None
             )
         },
-        "model": {"hidden_dims": list(config.model.hidden_dims)},
+        "model": _model_to_mapping(config.model),
         "label": {"transform": config.label.transform},
         "preprocessing": {"std_eps": config.preprocessing.std_eps},
         "training": {
@@ -485,7 +562,6 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
         if key not in mapping:
             _fail("config", f"缺失必填键 {key!r}")
     data_raw = _mapping_section(mapping, "data")
-    model_raw = _mapping_section(mapping, "model")
     label_raw = _mapping_section(mapping, "label")
     prep_raw = _mapping_section(mapping, "preprocessing")
     training_raw = _mapping_section(mapping, "training")
@@ -503,10 +579,10 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
             data=DataConfig(
                 pulse_order=(None if pulse_order is None else tuple(str(p) for p in pulse_order))
             ),
-            model=ModelConfig(
-                hidden_dims=tuple(
-                    int(d) for d in model_raw.get("hidden_dims") or ModelConfig().hidden_dims
-                )
+            model=(
+                ModelConfig()
+                if "model" not in mapping
+                else _parse_model_value(mapping["model"], "config.model")
             ),
             label=LabelConfig(
                 transform=cast(

@@ -1,10 +1,14 @@
 # CNN1D 训练配置 —— 仅字段大纲（全文件注释），**不可执行、不可训练**。
 #
-# 状态：这是 CNN1D 分支的配置字段占位大纲，不是有效训练配置，也不是可运行
-# 示例。本文件没有任何有效 YAML 键（全部为注释），因此 `load_config` 当前必然
-# 失败：既缺 dataset_name/run_name，且 model.kind 与 CNN 字段尚未实现。
-# 不在此填写任何超参数默认值或猜测研究值；channels/kernel_sizes/pool_bins/
-# head_hidden_dims 的取值待配置层实现并经批准后填写。
+# 状态：P1 配置层**已支持** `model.kind` 判别与 CNN 结构字段
+# （channels/kernel_sizes/pool_bins/head_hidden_dims）的结构解析与严格校验
+# （YAML 与 config_from_mapping 同一 schema）；P2 已实现网络
+# （src/micromagnetic_parameter_inversion/models/cnn1d.py 的 CNN1DRegressor）并
+# 有 CPU 合成单元测试。但网络**尚未接入** `training.train_model`/模型工厂，独立
+# checkpoint 与训练入口也未实现，训练链未接通。本文件仍是**全注释占位、字段
+# 未填写**，因此 `load_config` 当前仍必然失败（没有任何有效 YAML 键，也缺
+# dataset_name/run_name）。不在此填写任何超参数默认值或猜测研究值；具体取值待
+# 用户批准后填写。
 #
 # 独立性（关键约定）：
 #   - CNN 只使用与 MLP 相同的 dataset 与冻结 split；不得重切、不得选择性汇报。
@@ -20,17 +24,16 @@
 #   - label.transform、preprocessing.std_eps、training.*、split.*、output_dir：
 #     与 MLP 配置保持同一套字段与语义。
 #
-# 待实现的模型字段（只列字段与约束，不给出任何取值）：
+# 已支持解析的模型字段（本文件不填值）：
 #
 # model:
-#   kind: <待批准后填写>              # "cnn1d"；缺省仅对合法旧 MLP 字段集合
-#                                     # 生效，缺 kind 时不得出现 CNN 字段
-#   channels: <待批准后填写>          # 非空 int 序列，各维 > 0，拒绝 bool
-#   kernel_sizes: <待批准后填写>      # 非空 int 序列，各维正奇数，与 channels
-#                                     # 等长，拒绝 bool
-#   pool_bins: <待批准后填写>         # int，> 0；<= T 由模型层校验，
-#                                     # 配置层不校验 > T
-#   head_hidden_dims: <待批准后填写>  # int 序列，各维 > 0，允许为空（= 直接线性
-#                                     # 输出），拒绝 bool
+#   kind: <待填写>              # "cnn1d"；缺省仅对合法旧 MLP 字段集合生效，
+#                               # 缺 kind 时不得出现 CNN 字段
+#   channels: <待填写>          # 非空 int 序列，各维 > 0，拒绝 bool
+#   kernel_sizes: <待填写>      # 非空 int 序列，各维正奇数，与 channels
+#                               # 等长，拒绝 bool
+#   pool_bins: <待填写>         # int，> 0；<= T 由模型层校验，配置层不校验 > T
+#   head_hidden_dims: <待填写>  # int 序列，各维 > 0，允许为空（= 直接线性
+#                               # 输出），拒绝 bool
 #
 # 实验时记录（不设固定物理下界）：感受野 / 池化配置 / 参数量。
