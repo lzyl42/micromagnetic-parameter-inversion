@@ -7,6 +7,7 @@ import）；device 恒为 cpu；不触 GPU/MuMax3/真实数据。
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -19,7 +20,14 @@ import pytest
 import torch
 import yaml
 
-from micromagnetic_parameter_inversion import evaluation, paths, preprocessing, training_data
+from micromagnetic_parameter_inversion import (
+    evaluation,
+    paths,
+    preprocessing,
+    training,
+    training_config,
+    training_data,
+)
 from micromagnetic_parameter_inversion.evaluation import (
     EvaluationError,
     PredictionRow,
@@ -34,17 +42,6 @@ from micromagnetic_parameter_inversion.training_config import (
 
 _TRAIN_SCRIPT = paths.PROJECT_ROOT / "scripts" / "train_mlp.py"
 _EVAL_SCRIPT = paths.PROJECT_ROOT / "scripts" / "evaluate_model.py"
-
-# TODO(CNN1D-P3)：evaluation 实现后在此文件补充（本轮仅为注释，不改导入、
-# 不改 AST、不改任何可执行断言）：
-# - 共用 evaluate 入口将来按 checkpoint 类别显式路由：mlp → MLP 路径（行为
-#   不变），cnn1d → CNN 路径；两条路径产物完全独立，不共用 MLP checkpoint/
-#   统计/预测；CNN loader 拒绝 MLP 文件，损坏或错模型文件必须报错、不回退；
-# - CNN 评估：split 实际成员 + SHA 绑定、dataset_meta 锚点 + SHA、契约校验、
-#   物理单位指标、test 仅独立评估；校验 t_s（不只比 shape）；
-# - MLP 既有加载与预测回归不变；
-# - 未来建议（仅 TODO，不改 evaluation CLI、不实现）：研究对比前需要 val 物理
-#   单位 MAE/RMSE 的报告路径；不得为报告而开放 test。
 
 
 def _load_script(path: Path, name: str) -> Any:
@@ -470,3 +467,368 @@ def test_train_rejects_empty_train_split(env: tuple[Path, Path]) -> None:
 def meta_psids(samples_dir: Path) -> list[str]:
     """测试内小 helper：按序取清单成员。"""
     return list(training_data.load_dataset_meta(samples_dir).members)
+
+
+# ---------------------------------------------------------------------------
+# P3: CNN 独立 checkpoint 的评估集成（CPU 合成；不训练、不读真实 MLP 产物）
+# ---------------------------------------------------------------------------
+
+_CNN_CHANNELS = (3, 4)  # unit-test-only 结构，非研究超参
+_CNN_KERNELS = (3, 5)
+_CNN_POOL_BINS = 2
+_CNN_HEAD = (5,)
+# 固定 split 成员：test 含 control ps0000 与两个主域成员（batch_size=2 → 2+1 批）。
+_CNN_SPLIT_OVERRIDE = (["ps0001", "ps0002"], ["ps0003"], ["ps0000", "ps0004", "ps0005"])
+
+
+def _cnn_config(
+    dataset: str, run_name: str, *, model_overrides: dict[str, object] | None = None
+) -> training_config.ExperimentConfig:
+    """合成 CNN 配置（unit-test-only 结构；不经研究 YAML）。"""
+    model: dict[str, object] = {
+        "kind": "cnn1d",
+        "channels": list(_CNN_CHANNELS),
+        "kernel_sizes": list(_CNN_KERNELS),
+        "pool_bins": _CNN_POOL_BINS,
+        "head_hidden_dims": list(_CNN_HEAD),
+    }
+    if model_overrides is not None:
+        model.update(model_overrides)
+    return training_config.config_from_mapping(
+        {
+            "dataset_name": dataset,
+            "run_name": run_name,
+            "model": model,
+            "training": {
+                "seed": 11,
+                "device": "cpu",
+                "batch_size": 2,
+                "max_epochs": 1,
+                "learning_rate": 0.01,
+                "weight_decay": 0.0,
+            },
+        }
+    )
+
+
+def _make_cnn_run(
+    data_root: Path,
+    run_dir: Path,
+    dataset: str,
+    *,
+    split_override: tuple[list[str], list[str], list[str]] | None = _CNN_SPLIT_OVERRIDE,
+    model_overrides: dict[str, object] | None = None,
+) -> tuple[Path, training.CNNCheckpoint, training_config.ExperimentConfig]:
+    """合成 CNN run：train-only preprocessing + 随机权重 CNNCheckpoint（不训练）。
+
+    只用本文件 helper 合成 npz/meta/split；不运行 CNN 优化/训练、不读真实 MLP
+    checkpoint/产物/统计。``preprocessing.fit`` 仅喂 train 成员（防泄漏）。
+    """
+    samples_dir = _write_prepared_samples(data_root, dataset, n_groups=6, with_zero_ku=True)
+    if split_override is not None:
+        _rewrite_split(samples_dir, *split_override)
+    meta = training_data.load_dataset_meta(samples_dir)
+    split = training_data.load_split(samples_dir, meta)
+
+    config = _cnn_config(dataset, run_dir.name, model_overrides=model_overrides)
+    assert isinstance(config.model, training_config.CNN1DModelConfig)
+    cnn_model = config.model
+
+    train_set = training_data.TrajectoryDataset(samples_dir, meta, split.train)
+    first = train_set.samples[0]
+    contract = training_data.InputContract(
+        pulse_order=first.pulse_ids,
+        n_time_steps=int(first.x.shape[1]),
+        t_s=first.t_s,
+    )
+    state = preprocessing.fit(train_set, config.preprocessing, config.label)
+
+    with torch.random.fork_rng(devices=[]):  # 隔离全局 RNG，不留下副作用
+        torch.manual_seed(0)
+        model = training.build_cnn_model(
+            contract,
+            channels=cnn_model.channels,
+            kernel_sizes=cnn_model.kernel_sizes,
+            pool_bins=cnn_model.pool_bins,
+            head_hidden_dims=cnn_model.head_hidden_dims,
+        )
+    state_dict = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    ckpt = training.CNNCheckpoint(
+        ckpt_format_version=training.CNN_CKPT_FORMAT_VERSION,
+        model_state_dict=state_dict,
+        channels=cnn_model.channels,
+        kernel_sizes=cnn_model.kernel_sizes,
+        pool_bins=cnn_model.pool_bins,
+        head_hidden_dims=cnn_model.head_hidden_dims,
+        activation="relu",
+        contract=contract,
+        preprocessing=state,
+        seed=config.training.seed,
+        config=config,
+        dataset_meta_relpath="dataset_meta.yaml",
+        dataset_meta_sha256=training_data.sha256_file(samples_dir / "dataset_meta.yaml"),
+        split_sha256=training_data.sha256_file(samples_dir / "split.yaml"),
+        best_val_loss=0.5,
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "split.yaml").write_bytes((samples_dir / "split.yaml").read_bytes())
+    training.save_cnn_checkpoint(run_dir / "best.pt", ckpt)
+    return samples_dir, ckpt, config
+
+
+@pytest.fixture()
+def cnn_run(
+    env: tuple[Path, Path], tmp_path: Path
+) -> tuple[Path, Path, training.CNNCheckpoint, training_config.ExperimentConfig]:
+    """每个测试独立 CNN run（避免评估产物"拒绝覆盖"相互影响）。"""
+    data_root, _ = env
+    run_dir = tmp_path / "run_cnn"
+    samples_dir, ckpt, config = _make_cnn_run(data_root, run_dir, "ds_cnn")
+    return run_dir, samples_dir, ckpt, config
+
+
+def _expected_cnn_predictions(
+    ckpt: training.CNNCheckpoint, samples_dir: Path, psids: tuple[str, ...]
+) -> dict[str, tuple[float, float]]:
+    """独立对照：自身显式结构模型 + ckpt 预处理逆变换得到的物理单位预测。"""
+    with torch.random.fork_rng(devices=[]):
+        model = training.build_cnn_model(
+            ckpt.contract,
+            channels=ckpt.channels,
+            kernel_sizes=ckpt.kernel_sizes,
+            pool_bins=ckpt.pool_bins,
+            head_hidden_dims=ckpt.head_hidden_dims,
+        )
+    model.load_state_dict(dict(ckpt.model_state_dict), strict=True)
+    model.eval()
+    expected: dict[str, tuple[float, float]] = {}
+    for psid in psids:
+        sample = training_data.load_sample(samples_dir, psid, ckpt.contract)
+        x_norm = preprocessing.transform_x(ckpt.preprocessing, sample.x[None])
+        with torch.no_grad():
+            pred_norm = model(torch.from_numpy(x_norm))
+        physical = preprocessing.inverse_transform_y(ckpt.preprocessing, pred_norm.numpy())[0]
+        expected[psid] = (float(physical[0]), float(physical[1]))
+    return expected
+
+
+def _corrupt_state_dict(state_dict: training.StateDict, corruption: str) -> dict[str, Any]:
+    """构造损坏的 model_state_dict：缺键 / 多键 / 形状不符。"""
+    state = dict(state_dict)
+    if corruption == "missing_key":
+        state.pop(sorted(state)[0])
+    elif corruption == "extra_key":
+        state["bogus.weight"] = torch.zeros(1)
+    else:  # wrong_shape：保持元素数但改变形状 → load_state_dict 尺寸不匹配
+        name = sorted(state)[0]
+        state[name] = state[name].reshape(1, -1)
+    return state
+
+
+def _load_ckpt_payload_for_corruption(ckpt_path: Path) -> dict[str, Any]:
+    """取合法 ckpt 的磁盘 payload 供“损坏”改写（与 ``_corrupt_state_dict`` 同法）。
+
+    **故意绕过 ``save_cnn_checkpoint`` 校验**：batch_size=inf、y_std=0、x_std=inf
+    等非法值会被正常 save 提前拒绝，因此这里直接 ``torch.load`` 现有合法
+    ``best.pt`` payload、原地改写后再 ``torch.save``，以模拟真实磁盘损坏，只测
+    load/evaluate 边界，不放宽也不修改 save 行为。
+    """
+    return torch.load(ckpt_path, weights_only=True, map_location="cpu")
+
+
+def test_cnn_evaluate_end_to_end(cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any]) -> None:
+    run_dir, samples_dir, ckpt, _ = cnn_run
+    report, rows = evaluation.run_evaluation(run_dir)
+
+    meta = training_data.load_dataset_meta(samples_dir)
+    run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+    test_members = run_split["test"]
+    expected_control = sum(1 for psid in test_members if meta.labels[psid][1] == 0.0)
+
+    assert [row.parameter_set_id for row in rows] == test_members
+    assert len(rows) == len(test_members)
+    assert report.main.n == len(test_members) - expected_control
+    assert report.control.n == expected_control
+    for subset in (report.main, report.control):
+        for key in ("mae_alpha", "rmse_alpha", "mae_ku", "rmse_ku"):
+            value = getattr(subset, key)
+            assert value is None or math.isfinite(value)
+
+    assert report.provenance.checkpoint_path == str(run_dir / "best.pt")
+    assert report.provenance.checkpoint_sha256 == training_data.sha256_file(run_dir / "best.pt")
+    assert report.provenance.split_sha256 == training_data.sha256_file(run_dir / "split.yaml")
+
+    # 物理单位预测与"自身模型 + ckpt 预处理逆变换"的独立对照一致（不只断言存在）。
+    expected = _expected_cnn_predictions(ckpt, samples_dir, tuple(test_members))
+    for row in rows:
+        exp_alpha, exp_ku = expected[row.parameter_set_id]
+        assert row.split == "test"
+        assert row.alpha_true == pytest.approx(meta.labels[row.parameter_set_id][0])
+        assert row.ku_true == pytest.approx(meta.labels[row.parameter_set_id][1])
+        assert row.alpha_pred == pytest.approx(exp_alpha, rel=1.0e-5, abs=1.0e-6)
+        assert row.ku_pred == pytest.approx(exp_ku, rel=1.0e-5, abs=1.0e-6)
+
+
+def test_cnn_evaluate_script_end_to_end(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir, _samples_dir, _ckpt, _config = cnn_run
+    script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
+    assert script.run(run_dir) == run_dir
+
+    metrics = json.loads((run_dir / "test_metrics.json").read_text(encoding="utf-8"))
+    assert set(metrics) == {"main", "control", "provenance"}
+    assert metrics["provenance"]["checkpoint_path"] == str(run_dir / "best.pt")
+    assert metrics["provenance"]["checkpoint_sha256"] == training_data.sha256_file(
+        run_dir / "best.pt"
+    )
+    run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+    lines = (run_dir / "test_predictions.csv").read_text(encoding="utf-8").splitlines()
+    assert len(lines) - 1 == len(run_split["test"])
+    assert "评估完成" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("case", ["split_sha", "meta_sha", "contract_t_s"])
+def test_cnn_binding_tamper_rejected(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], case: str
+) -> None:
+    run_dir, samples_dir, _ckpt, _config = cnn_run
+    if case == "split_sha":
+        target = run_dir / "split.yaml"
+        target.write_bytes(target.read_bytes() + b"\n# drifted\n")
+        with pytest.raises(EvaluationError, match="不一致"):
+            evaluation.run_evaluation(run_dir)
+    elif case == "meta_sha":
+        target = samples_dir / "dataset_meta.yaml"
+        target.write_text(target.read_text(encoding="utf-8") + "\n# drifted\n", encoding="utf-8")
+        with pytest.raises(EvaluationError, match="dataset_meta SHA"):
+            evaluation.run_evaluation(run_dir)
+    else:
+        run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+        victim = samples_dir / f"{run_split['test'][0]}.npz"
+        with np.load(victim, allow_pickle=False) as archive:
+            arrays = {key: archive[key] for key in archive.files}
+        # 等长、有限、严格递增，但数值不同：能通过 checkpoint loader，必须被
+        # load_sample 的 t_s 完整逐位比较拒绝（不是只比 shape/长度）。
+        arrays["t_s"] = arrays["t_s"] + np.float64(1.0e-15)
+        np.savez_compressed(victim, **arrays)
+        with pytest.raises((training_data.DataError, EvaluationError), match="t_s"):
+            evaluation.run_evaluation(run_dir)
+        assert not (run_dir / "test_metrics.json").exists()
+        assert not (run_dir / "test_predictions.csv").exists()
+        # CLI 同样拒绝且不产出成功报告。
+        assert (
+            _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(["--run", str(run_dir)]) == 2
+        )
+        assert not (run_dir / "test_metrics.json").exists()
+        assert not (run_dir / "test_predictions.csv").exists()
+
+
+@pytest.mark.parametrize("corruption", ["missing_key", "extra_key", "wrong_shape"])
+def test_cnn_corrupt_state_dict_rejected_at_evaluate(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], tmp_path: Path, corruption: str
+) -> None:
+    run_dir, _samples_dir, ckpt, _config = cnn_run
+    forged = tmp_path / f"corrupt_{corruption}.pt"
+    training.save_cnn_checkpoint(
+        forged,
+        dataclasses.replace(
+            ckpt, model_state_dict=_corrupt_state_dict(ckpt.model_state_dict, corruption)
+        ),
+    )
+    with pytest.raises(EvaluationError):
+        evaluation.run_evaluation(run_dir, forged)
+    # 不产出成功报告 / 半成品。
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()
+
+    # CLI 同样友好失败（exit 2）、无产物落盘。
+    assert (
+        _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(
+            ["--run", str(run_dir), "--checkpoint", str(forged)]
+        )
+        == 2
+    )
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()
+
+
+def test_cnn_recovery_uses_explicit_structure_not_nested_config(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], tmp_path: Path
+) -> None:
+    """同 kind=cnn1d 但嵌套 config 结构与顶层显式字段不同：必须按显式字段恢复。"""
+    run_dir, samples_dir, ckpt, _config = cnn_run
+    other_config = _cnn_config(
+        ckpt.config.dataset_name,
+        "other_run",
+        model_overrides={
+            "channels": [5, 6],
+            "kernel_sizes": [3, 3],
+            "pool_bins": 3,
+            "head_hidden_dims": [9],
+        },
+    )
+    forged = tmp_path / "explicit_structure.pt"
+    training.save_cnn_checkpoint(forged, dataclasses.replace(ckpt, config=other_config))
+
+    # 若用嵌套 config 结构恢复会 load_state_dict 形状错配；这里应成功。
+    _report, rows = evaluation.run_evaluation(run_dir, forged)
+    run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+    expected = _expected_cnn_predictions(ckpt, samples_dir, tuple(run_split["test"]))
+    for row in rows:
+        exp_alpha, exp_ku = expected[row.parameter_set_id]
+        assert row.alpha_pred == pytest.approx(exp_alpha, rel=1.0e-5, abs=1.0e-6)
+        assert row.ku_pred == pytest.approx(exp_ku, rel=1.0e-5, abs=1.0e-6)
+
+
+def test_cnn_overflow_config_rejected_without_leak(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """config.training.batch_size=inf：CNN loader 须收敛为明确错误，不泄漏 OverflowError。"""
+    run_dir, _samples_dir, _ckpt, _config = cnn_run
+    # 绕过 save_cnn_checkpoint（它已正确提前拒绝），直接改写磁盘 payload 模拟损坏。
+    payload = _load_ckpt_payload_for_corruption(run_dir / "best.pt")
+    payload["config"]["training"]["batch_size"] = float("inf")
+    forged = tmp_path / "overflow_batch.pt"
+    torch.save(payload, forged)
+
+    code = _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(
+        ["--run", str(run_dir), "--checkpoint", str(forged)]
+    )
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "error:" in err
+    assert "OverflowError" not in err  # 不泄漏原始溢出异常
+    assert ("checkpoint" in err) or ("config" in err)  # 明确 checkpoint/config 错误
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()
+
+
+@pytest.mark.parametrize("bad", ["y_std_zero", "x_std_inf"])
+def test_cnn_bad_preprocessing_state_rejected(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    bad: str,
+) -> None:
+    """CNN 标准化状态非法（y_std=0 / x_std=inf）：CLI 拒绝且无报告产物。"""
+    run_dir, _samples_dir, _ckpt, _config = cnn_run
+    # 绕过 save_cnn_checkpoint（它已正确提前拒绝），直接改写磁盘 payload 模拟损坏。
+    payload = _load_ckpt_payload_for_corruption(run_dir / "best.pt")
+    if bad == "y_std_zero":
+        payload["preprocessing"]["y_stats"]["y_std"] = np.zeros(2, dtype=np.float64).tolist()
+    else:
+        x_std = np.asarray(payload["preprocessing"]["x_stats"]["std"], dtype=np.float64)
+        payload["preprocessing"]["x_stats"]["std"] = np.full_like(x_std, np.inf).tolist()
+    forged = tmp_path / f"bad_preprocessing_{bad}.pt"
+    torch.save(payload, forged)
+
+    code = _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(
+        ["--run", str(run_dir), "--checkpoint", str(forged)]
+    )
+    assert code == 2
+    assert "error:" in capsys.readouterr().err
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()

@@ -4,8 +4,11 @@
 # （channels/kernel_sizes/pool_bins/head_hidden_dims）的结构解析与严格校验
 # （YAML 与 config_from_mapping 同一 schema）；P2 已实现网络
 # （src/micromagnetic_parameter_inversion/models/cnn1d.py 的 CNN1DRegressor）并
-# 有 CPU 合成单元测试。但网络**尚未接入** `training.train_model`/模型工厂，独立
-# checkpoint 与训练入口也未实现，训练链未接通。本文件仍是**全注释占位、字段
+# 有 CPU 合成单元测试；P3 已实现独立 CNN checkpoint/工厂与显式类别路由
+# （training.py 的 CNNCheckpoint / save_cnn_checkpoint / load_cnn_checkpoint /
+# build_cnn_model / load_any_checkpoint，与 MLP 互不接受）。但 CNN 训练循环与
+# 共享 run 编排、训练入口均**尚未实现（P4）**，模型仍未接入
+# `training.train_model`，训练链未接通。本文件仍是**全注释占位、字段
 # 未填写**，因此 `load_config` 当前仍必然失败（没有任何有效 YAML 键，也缺
 # dataset_name/run_name）。不在此填写任何超参数默认值或猜测研究值；具体取值待
 # 用户批准后填写。
@@ -14,7 +17,8 @@
 #   - CNN 只使用与 MLP 相同的 dataset 与冻结 split；不得重切、不得选择性汇报。
 #   - CNN 的 checkpoint、训练产物与预处理统计**完全独立**：不复用 MLP 权重/
 #     checkpoint/已有预处理统计/训练产物；统计量由 CNN 自己在训练组上拟合，
-#     val/test 不参与拟合。
+#     val/test 不参与拟合。checkpoint 互不接受：MLP loader 拒绝 CNN 文件，
+#     CNN loader 拒绝 MLP 文件；损坏文件必须报错、绝不回退。
 #   - 输出目录为 output_root()/training/cnn1d/<dataset_name>/<run_name>，与
 #     既有 training/mlp/... 互不影响。
 #

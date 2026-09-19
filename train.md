@@ -8,28 +8,34 @@
 占位状态下不会成功。现有 `data/raw/` 各数据集（哨兵/QC 轮）仅验证过格式
 与执行链，不构成科研训练有效性依据。
 
-> **CNN1D 分支（P1 配置 + P2 模型已实现；训练链未接，不能训练）**：P1 配置层
-> 已支持 `model.kind` 判别（缺省 `mlp`）与 CNN 结构字段
-> `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 的严格校验（YAML 与
-> `config_from_mapping` 共用同一 schema）；P2 已实现
+> **CNN1D 分支（P1 配置 + P2 模型 + P3 独立 checkpoint/工厂/评估已实现；
+> 训练链未接，不能训练）**：P1 配置层已支持 `model.kind` 判别（缺省 `mlp`）与
+> CNN 结构字段 `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 的严格
+> 校验（YAML 与 `config_from_mapping` 共用同一 schema）；P2 已实现
 > `src/micromagnetic_parameter_inversion/models/cnn1d.py` 的 `CNN1DRegressor`
-> 并有 CPU 合成单元测试。但模型**尚未接入** `training.train_model`/模型工厂，
-> 独立 checkpoint 与训练入口（`scripts/train_cnn1d.py`）也未实现，因此
-> **不能经项目训练脚本训练 CNN**；`configs/training/cnn1d.yaml` 仍为全注释
-> 占位、不可加载。原 MLP 流程与产物不变。CNN 与 MLP 的 checkpoint、训练产物与
-> 预处理统计**完全独立**：只共用同一 dataset 与冻结 split，统计量由 CNN 在自身
-> 训练组上拟合，不复用 MLP 权重/checkpoint/已有预处理统计/训练产物。
+> 并有 CPU 合成单元测试；P3 已实现独立 CNN checkpoint 与工厂（`training.py`
+> 的 `CNN_CKPT_FORMAT_VERSION=1`、冻结 `CNNCheckpoint`、
+> `save_cnn_checkpoint`/`load_cnn_checkpoint`、`ModelCheckpoint` 联合与
+> `load_any_checkpoint` 显式类别路由、`build_cnn_model`），以及评估侧对 CNN 的
+> 显式路由。CNN 完整结构、契约、预处理与元数据可独立保存/回读并在 CPU 上逐位
+> 复现预测；载荷以**顶层显式结构为权威**，嵌套 `config` 仅记录、不覆盖。MLP 的
+> `Checkpoint`/`save_checkpoint`/`load_checkpoint` 与序列化布局、版本**原样
+> 不变**；MLP 与 CNN checkpoint **互不接受**对方文件，未知/缺失/显式 `mlp`
+> kind 或残留 CNN 结构字段一律报错、绝不回退。
 >
-> **未来 CNN1D 入口与 checkpoint（未实现）**：共享编排未来从现
-> `scripts/train_mlp.py` 的 `run()` 抽到既有 `training.py`，保持命令/默认行为、
-> 显式 `output_dir`、构造模型前设定 seed、best/final 与数值失败语义不变；
-> `train_mlp.py` / `train_cnn1d.py` 为薄入口，各自在读数据、建目录**之前**校验
-> `model.kind`。checkpoint 不做统一 v2：MLP 的
-> `Checkpoint`/`save_checkpoint`/`load_checkpoint` 与格式原样不动，CNN 用独立的
-> `CNNCheckpoint`/`save_cnn_checkpoint`/`load_cnn_checkpoint`（草案名，与核心实现
-> 统一）及独立 `cnn1d` 格式，二者互不接受对方文件、损坏 CNN 不回退 MLP。细节
-> 大纲见 `tests/test_training_config.py`、`tests/test_training.py`、
-> `tests/test_evaluation.py` 的 `TODO(CNN1D-*)` 注释。本文档描述的
+> **仍未实现（P4）**：CNN 训练循环与共享 run 编排、`scripts/train_cnn1d.py`
+> 入口均未实现，模型仍未接入 `training.train_model`（该函数顶部仍只接受 MLP
+> 配置并按 kind 早拒 CNN），因此**不能经项目训练脚本训练 CNN**；
+> `configs/training/cnn1d.yaml` 仍为全注释占位、**无研究超参**、不可加载。
+> CNN 与 MLP 的 checkpoint、训练产物与预处理统计**完全独立**：只共用同一
+> dataset 与冻结 split，统计量由 CNN 在自身训练组上拟合，不复用 MLP 权重/
+> checkpoint/已有预处理统计/训练产物。
+>
+> **未来 CNN1D 入口（未实现）**：共享编排未来从现 `scripts/train_mlp.py` 的
+> `run()` 抽到既有 `training.py`，保持命令/默认行为、显式 `output_dir`、构造
+> 模型前设定 seed、best/final 与数值失败语义不变；`train_mlp.py` /
+> `train_cnn1d.py` 为薄入口，各自在读数据、建目录**之前**校验 `model.kind`。
+> 细节大纲见 `tests/test_training.py` 的 `TODO(CNN1D-P4)` 注释。本文档描述的
 > prepare/train/evaluate 流程目前仍只覆盖 MLP。
 
 ## 1. 目标与非目标
@@ -347,8 +353,10 @@ ckpt，不要求提供当前训练 config 重建模型。
 - 配置/数据：`training_config.py`（严格 YAML 加载）、`training_data.py`
   （npz/协议快照/split/Dataset）、`configs/training/mlp.yaml`
 - 预处理/模型：`preprocessing.py`（train-only 拟合与变换）、
-  `models/mlp.py`（MLPRegressor）
-- 训练/评估：`training.py`（训练循环/early stopping/ckpt 读写）、
+  `models/mlp.py`（MLPRegressor）、`models/cnn1d.py`（CNN1DRegressor，P2）
+- 训练/评估：`training.py`（训练循环/early stopping/ckpt 读写；P3 另有独立
+  `CNNCheckpoint` 与 `build_cnn_model`/`save_cnn_checkpoint`/
+  `load_cnn_checkpoint`/`load_any_checkpoint`，CNN 训练循环未接）、
   `evaluation.py`（绑定校验/指标）；入口
   `scripts/prepare_training_samples.py`、`scripts/train_mlp.py`、
   `scripts/evaluate_model.py`；测试 `tests/test_training_config.py`、

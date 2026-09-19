@@ -94,15 +94,21 @@ run.log 仍由原机制写入。无 CLI 参数、无 plan/resume、无「目录�
   为唯一模拟执行入口，单份配置 CLI 已删除）；首版「样本准备 → 训练 →
   独立评估」工程已实现（见 `train.md`），**但未在正式研究数据上训练，
   不存在可靠科研结果或研究结论**。
-- **CNN1D 分支**：P1 配置层与 P2 模型已实现（`model.kind` 判别 + CNN 四字段
+- **CNN1D 分支**：P1 配置层、P2 模型与 P3 独立 checkpoint/工厂/评估已实现
+  （`model.kind` 判别 + CNN 四字段
   `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 严格校验，YAML 与
   mapping 同一 schema；`CNN1DRegressor` 已实现于
-  `src/micromagnetic_parameter_inversion/models/cnn1d.py`，并有 CPU 合成单元测试）。
-  但模型**尚未接入** `training.train_model`/模型工厂，独立 checkpoint 与 CNN
-  训练入口（`scripts/train_cnn1d.py`）也未实现，因此**不能经项目训练脚本训练
-  CNN**；`configs/training/cnn1d.yaml` 仍为全注释占位、不可加载。原 MLP 流程与
-  产物不变。CNN 与 MLP 的 checkpoint、训练产物与预处理统计**完全独立**，仅共用
-  同一 dataset 与冻结 split，并在自身训练组上拟合统计量。
+  `src/micromagnetic_parameter_inversion/models/cnn1d.py`；`training.py` 另有
+  `CNNCheckpoint`/`save_cnn_checkpoint`/`load_cnn_checkpoint`/`build_cnn_model`
+  与 `load_any_checkpoint` 显式类别路由，评估侧按 checkpoint 类别显式路由；
+  MLP 的 checkpoint 序列化布局与版本原样不变，MLP 与 CNN checkpoint
+  **互不接受**对方文件、未知/缺失 kind 或损坏文件一律报错、绝不回退）。
+  但 CNN 训练循环与共享 run、CNN 训练入口（`scripts/train_cnn1d.py`）**仍未
+  实现（P4）**，模型尚未接入 `training.train_model`，因此**不能经项目训练脚本
+  训练 CNN**；`configs/training/cnn1d.yaml` 仍为全注释占位、**无研究超参**、
+  不可加载。原 MLP 流程与产物不变。CNN 与 MLP 的 checkpoint、训练产物与预处理
+  统计**完全独立**，仅共用同一 dataset 与冻结 split，并在自身训练组上拟合
+  统计量。
 - 已完成的部分 QC：offline vertical slice 测试（31 passed）、2026-09-02
   test-only pilot 执行链冒烟、Pilot v1 哨兵轮轨迹层检查（历史协议）。
 - **未证明**：连续模型网格收敛、Relax 收敛鲁棒性、EdgeSmooth 选择的
@@ -372,7 +378,7 @@ runs/cache 不入库；`data/README.md` 可跟踪，`data/samples/` 在白名单
 src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
                                          # + mumax3 vertical slice（config / script / results / pipeline）
                                          # + 训练/评估（training_config / training_data / preprocessing /
-                                         #   models/mlp / training / evaluation）
+                                         #   models/mlp / models/cnn1d / training / evaluation）
 scripts/check_environment.py             # 环境诊断
 scripts/generate_dataset.py              # 唯一模拟执行入口：生成批量实验 YAML 并
                                          # 运行模拟（内置 Protocol B 固定配置与 Sobol

@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import math
 import sys
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,7 +30,9 @@ from micromagnetic_parameter_inversion import (
     training_data,
 )
 from micromagnetic_parameter_inversion.training_config import (
+    CNN1DModelConfig,
     ConfigError,
+    ExperimentConfig,
     ModelConfig,
     SplitConfig,
     SplitMinCounts,
@@ -37,19 +42,6 @@ from micromagnetic_parameter_inversion.training_config import (
 
 _SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_mlp.py"
 
-# TODO(CNN1D-P3)：checkpoint / build_model 实现后在此文件补充（本轮仅为注释，
-# 不改导入、不改 AST、不改任何可执行断言）：
-# - 模型描述：不做统一 checkpoint v2、也不做统一 loader 读 v1；统一的是与
-#   checkpoint 解耦的「模型描述」（模型类别 + 结构字段），供 build_model /
-#   evaluate 路由；
-# - 旧 MLP Checkpoint/save_checkpoint/load_checkpoint/格式原样不动（不加 kind、
-#   不改版本语义）；MLP 既有加载与预测回归不变；
-# - CNN 使用独立的 CNNCheckpoint / save_cnn_checkpoint / load_cnn_checkpoint
-#   （草案名，与核心实现统一）及明确的 cnn1d 格式与独立版本；
-# - CNN 完整架构与预处理统计往返：save→load→独立推理一致；weights_only 安全；
-# - 互不接受：CNN loader 拒绝 MLP 文件；MLP loader 拒绝 CNN 文件；损坏的 CNN
-#   文件必须报错，不得 fallback 到 MLP；
-# - 验证使用实际 split 成员与 SHA，且校验 t_s（不能只比 shape）。
 # TODO(CNN1D-P4)：入口/共享 run 实现后在此文件补充：
 # - 不新增共享 runner 模块；共享 run 未来从现 scripts/train_mlp.py 的 run()
 #   抽到既有 training.py，保持命令/默认行为、显式 output_dir、构造模型前设定
@@ -562,13 +554,22 @@ def test_weights_finite_update_from_same_seed_init(env: tuple[Path, Path]) -> No
 # 超参为**明确 unit-test-only 数值**，不代表研究配置。
 
 
-def _cnn_config_text(dataset: str, run_name: str) -> str:
-    """P1 合法 CNN 配置文本（结构字段齐全；unit-test-only 超参）。"""
+def _cnn_config_text(
+    dataset: str,
+    run_name: str,
+    *,
+    channels: tuple[int, ...] = (4, 8),
+    kernel_sizes: tuple[int, ...] = (3, 5),
+    pool_bins: int = 4,
+    head_hidden_dims: tuple[int, ...] = (8,),
+) -> str:
+    """P1/P3 合法 CNN 配置文本（结构字段可配；unit-test-only 超参）。"""
     return (
         f"dataset_name: {dataset}\n"
         f"run_name: {run_name}\n"
-        "model: {kind: cnn1d, channels: [4, 8], kernel_sizes: [3, 5],"
-        " pool_bins: 4, head_hidden_dims: [8]}\n"
+        f"model: {{kind: cnn1d, channels: {list(channels)}, "
+        f"kernel_sizes: {list(kernel_sizes)}, pool_bins: {pool_bins}, "
+        f"head_hidden_dims: {list(head_hidden_dims)}}}\n"
         "training: {\n"
         "  seed: 11, device: cpu, batch_size: 2, max_epochs: 2,\n"
         "  learning_rate: 0.01, weight_decay: 0.0,\n"
@@ -622,3 +623,671 @@ def test_train_model_rejects_cnn_config_before_side_effects(
     with pytest.raises(ConfigError, match="cnn1d"):
         training.train_model(config, sentinel, sentinel, sentinel, sentinel, "sha")
     assert calls == []
+
+
+# --- P3: 独立 CNN checkpoint / 模型工厂 / load_any 路由 --------------------
+# 数据由本文件既存 helper 合成；预处理统计仅在 split.train 上拟合，不读取也
+# 不转换任何 MLP checkpoint/统计。超参为 unit-test-only 数值，非研究配置。
+
+
+def _cnn_samples_config(
+    data_root: Path,
+    dataset: str,
+    *,
+    channels: tuple[int, ...] = (4, 8),
+    kernel_sizes: tuple[int, ...] = (3, 5),
+    pool_bins: int = 4,
+    head_hidden_dims: tuple[int, ...] = (8,),
+) -> tuple[Path, ExperimentConfig]:
+    """合成 npz/meta/split + 可被 load_config 加载的 CNN 配置。"""
+    samples_dir = _write_prepared_samples(data_root, dataset)
+    config_path = _write_config(
+        data_root,
+        _cnn_config_text(
+            dataset,
+            "r1",
+            channels=channels,
+            kernel_sizes=kernel_sizes,
+            pool_bins=pool_bins,
+            head_hidden_dims=head_hidden_dims,
+        ),
+        name=f"{dataset}.yaml",
+    )
+    return samples_dir, load_config(config_path)
+
+
+def _cnn_contract_state(
+    samples_dir: Path, config: ExperimentConfig
+) -> tuple[training_data.InputContract, preprocessing.PreprocessingState]:
+    """train-only：自真实 split.train 冻结契约并拟合预处理（不碰 MLP 产物）。"""
+    meta = training_data.load_dataset_meta(samples_dir)
+    split = training_data.load_split(samples_dir, meta)
+    train_set = training_data.TrajectoryDataset(samples_dir, meta, split.train)
+    first = train_set.samples[0]
+    contract = training_data.InputContract(
+        pulse_order=first.pulse_ids,
+        n_time_steps=int(first.x.shape[1]),
+        t_s=first.t_s,
+    )
+    train_set.validate_contract(contract)
+    state = preprocessing.fit(train_set, config.preprocessing, config.label)
+    return contract, state
+
+
+def _build_cnn_checkpoint(
+    data_root: Path,
+    dataset: str,
+    *,
+    channels: tuple[int, ...] = (4, 8),
+    kernel_sizes: tuple[int, ...] = (3, 5),
+    pool_bins: int = 4,
+    head_hidden_dims: tuple[int, ...] = (8,),
+    config_model: CNN1DModelConfig | None = None,
+) -> tuple[Path, training.CNNCheckpoint]:
+    """合成数据 train-only 拟合 + 工厂建网 → 自建 CNN checkpoint（非 MLP 转换）。"""
+    samples_dir, config = _cnn_samples_config(
+        data_root,
+        dataset,
+        channels=channels,
+        kernel_sizes=kernel_sizes,
+        pool_bins=pool_bins,
+        head_hidden_dims=head_hidden_dims,
+    )
+    if config_model is not None:
+        config = replace(config, model=config_model)
+    contract, state = _cnn_contract_state(samples_dir, config)
+    model = training.build_cnn_model(
+        contract,
+        channels=channels,
+        kernel_sizes=kernel_sizes,
+        pool_bins=pool_bins,
+        head_hidden_dims=head_hidden_dims,
+    )
+    ckpt = training.CNNCheckpoint(
+        ckpt_format_version=training.CNN_CKPT_FORMAT_VERSION,
+        model_state_dict={
+            name: value.detach().to("cpu").clone() for name, value in model.state_dict().items()
+        },
+        channels=tuple(channels),
+        kernel_sizes=tuple(kernel_sizes),
+        pool_bins=int(pool_bins),
+        head_hidden_dims=tuple(head_hidden_dims),
+        activation="relu",
+        contract=contract,
+        preprocessing=state,
+        seed=11,
+        config=config,
+        dataset_meta_relpath="dataset_meta.yaml",
+        dataset_meta_sha256=training_data.sha256_file(samples_dir / "dataset_meta.yaml"),
+        split_sha256=training_data.sha256_file(samples_dir / "split.yaml"),
+        best_val_loss=0.5,
+    )
+    path = data_root / f"{dataset}_cnn.pt"
+    training.save_cnn_checkpoint(path, ckpt)
+    return path, ckpt
+
+
+def _saved_damage(
+    tmp_path: Path,
+    payload: Any,
+    mutate: Callable[[Any], None],
+    *,
+    name: str = "damaged.pt",
+) -> Path:
+    """深拷贝 payload、应用 mutation 后落盘（不就地改共享对象）。"""
+    damaged = copy.deepcopy(payload)
+    mutate(damaged)
+    path = tmp_path / name
+    torch.save(damaged, path)
+    return path
+
+
+def _cnn_predict(ckpt: training.CNNCheckpoint) -> torch.Tensor:
+    """按显式结构字段重建 CNN 并对固定输入推理（CPU）。"""
+    model = training.build_cnn_model(
+        ckpt.contract,
+        channels=ckpt.channels,
+        kernel_sizes=ckpt.kernel_sizes,
+        pool_bins=ckpt.pool_bins,
+        head_hidden_dims=ckpt.head_hidden_dims,
+    )
+    model.load_state_dict(dict(ckpt.model_state_dict))
+    model.eval()
+    probe = torch.zeros(3, *ckpt.contract.input_shape)
+    with torch.no_grad():
+        return model(probe)
+
+
+def test_cnn_checkpoint_roundtrip_parity(env: tuple[Path, Path]) -> None:
+    """save→load：结构/权重/契约/预处理/元数据往返，CPU 推理逐位一致。"""
+    data_root, _ = env
+    path, _ = _build_cnn_checkpoint(data_root, "ds_cnn_rt")
+    ckpt = training.load_cnn_checkpoint(path)
+
+    assert isinstance(ckpt, training.CNNCheckpoint)
+    assert ckpt.ckpt_format_version == training.CNN_CKPT_FORMAT_VERSION == 1
+    assert (ckpt.channels, ckpt.kernel_sizes, ckpt.pool_bins, ckpt.head_hidden_dims) == (
+        (4, 8),
+        (3, 5),
+        4,
+        (8,),
+    )
+    assert ckpt.activation == "relu"
+    assert ckpt.contract.input_shape == (2, 8, 3)
+    assert ckpt.contract.pulse_order == ("p0", "p1")
+    assert ckpt.contract.component_order == ("mx", "my", "mz")
+    assert ckpt.preprocessing.x_stats.mean.shape == (2, 1, 3)
+    assert ckpt.preprocessing.y_stats.y_mean.shape == (2,)
+    assert ckpt.seed == 11
+    assert ckpt.best_val_loss == pytest.approx(0.5)
+    assert ckpt.dataset_meta_relpath == "dataset_meta.yaml"
+    assert ckpt.split_sha256
+    assert all(t.device.type == "cpu" for t in ckpt.model_state_dict.values())
+
+    # weights_only 安全读取；CNN 载荷有 model_kind、无 hidden_dims
+    payload = torch.load(path, weights_only=True, map_location="cpu")
+    assert payload["model_kind"] == "cnn1d"
+    assert "hidden_dims" not in payload
+    assert all(isinstance(t, torch.Tensor) for t in payload["model_state_dict"].values())
+
+    again = training.load_cnn_checkpoint(path)
+    assert torch.equal(_cnn_predict(ckpt), _cnn_predict(again))
+
+
+def test_cnn_checkpoint_empty_head_hidden_dims_legal(env: tuple[Path, Path]) -> None:
+    """head_hidden_dims 允许为空（= 直接线性输出），roundtrip 与推理均可用。"""
+    data_root, _ = env
+    path, _ = _build_cnn_checkpoint(data_root, "ds_cnn_empty", head_hidden_dims=())
+    ckpt = training.load_cnn_checkpoint(path)
+    assert ckpt.head_hidden_dims == ()
+    assert cast(CNN1DModelConfig, ckpt.config.model).head_hidden_dims == ()
+    model = training.build_cnn_model(
+        ckpt.contract,
+        channels=ckpt.channels,
+        kernel_sizes=ckpt.kernel_sizes,
+        pool_bins=ckpt.pool_bins,
+        head_hidden_dims=(),
+    )
+    model.load_state_dict(dict(ckpt.model_state_dict))
+    with torch.no_grad():
+        assert model(torch.zeros(1, 2, 8, 3)).shape == (1, 2)
+
+
+def test_build_cnn_model_structure_and_contract_rejection(env: tuple[Path, Path]) -> None:
+    """工厂：结构/形状正确；重复 pulse、分量序、t_s、pool>T 一律拒绝。"""
+    data_root, _ = env
+    samples_dir, config = _cnn_samples_config(data_root, "ds_cnn_factory")
+    contract, _ = _cnn_contract_state(samples_dir, config)
+    model = training.build_cnn_model(
+        contract,
+        channels=(4, 8),
+        kernel_sizes=(3, 5),
+        pool_bins=4,
+        head_hidden_dims=(8,),
+    )
+    assert model.input_shape == (2, 8, 3)
+    assert (model.channels, model.kernel_sizes, model.pool_bins, model.head_hidden_dims) == (
+        (4, 8),
+        (3, 5),
+        4,
+        (8,),
+    )
+    with torch.no_grad():
+        assert model(torch.zeros(2, 2, 8, 3)).shape == (2, 2)
+
+    bad_contracts = {
+        "duplicate_pulse": training_data.InputContract(
+            pulse_order=("p0", "p0"), n_time_steps=8, t_s=np.zeros(8)
+        ),
+        "component_order": training_data.InputContract(
+            pulse_order=("p0", "p1"),
+            n_time_steps=8,
+            t_s=np.zeros(8),
+            component_order=("mx", "mx", "mz"),
+        ),
+        "non_increasing_t_s": training_data.InputContract(
+            pulse_order=("p0", "p1"),
+            n_time_steps=8,
+            t_s=np.array([0.0, 2.0, 1.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+        ),
+        "non_finite_t_s": training_data.InputContract(
+            pulse_order=("p0", "p1"),
+            n_time_steps=8,
+            t_s=np.array([0.0, 1.0, np.nan, 3.0, 4.0, 5.0, 6.0, 7.0]),
+        ),
+        "timegrid_shape": training_data.InputContract(
+            pulse_order=("p0", "p1"), n_time_steps=8, t_s=np.zeros(7)
+        ),
+        "channel_shape": training_data.InputContract(
+            pulse_order=("p0", "p1"),
+            n_time_steps=8,
+            t_s=np.zeros(8),
+            n_channels=2,
+            component_order=("mx", "my"),
+        ),
+    }
+    for bad in bad_contracts.values():
+        with pytest.raises((training.TrainingError, ValueError)):
+            training.build_cnn_model(
+                bad,
+                channels=(4, 8),
+                kernel_sizes=(3, 5),
+                pool_bins=4,
+                head_hidden_dims=(8,),
+            )
+    with pytest.raises((training.TrainingError, ValueError)):
+        training.build_cnn_model(  # pool_bins > T=8
+            contract,
+            channels=(4, 8),
+            kernel_sizes=(3, 5),
+            pool_bins=9,
+            head_hidden_dims=(8,),
+        )
+
+
+def test_mlp_and_cnn_checkpoints_mutually_rejected(env: tuple[Path, Path]) -> None:
+    """MLP 旧格式无 kind 且拒绝 CNN 文件；CNN loader 拒绝 MLP 文件。"""
+    data_root, _ = env
+    _write_prepared_samples(data_root, "ds_cross_mlp")
+    run_dir = _load_script().run(_write_config(data_root, _config_text("ds_cross_mlp", "r1")))
+    cnn_path, _ = _build_cnn_checkpoint(data_root, "ds_cross_cnn")
+
+    with pytest.raises(training.TrainingError):
+        training.load_checkpoint(cnn_path)
+    with pytest.raises(training.TrainingError):
+        training.load_cnn_checkpoint(run_dir / "best.pt")
+
+    mlp_payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    assert "model_kind" not in mlp_payload
+    assert "channels" not in mlp_payload
+    assert "kind" not in mlp_payload["config"]["model"]
+    cnn_payload = torch.load(cnn_path, weights_only=True, map_location="cpu")
+    assert cnn_payload["model_kind"] == "cnn1d"
+    assert "hidden_dims" not in cnn_payload
+
+
+def test_load_any_checkpoint_routes_both_formats(env: tuple[Path, Path]) -> None:
+    """load_any：旧 MLP → Checkpoint；CNN → CNNCheckpoint（结构以显式字段为准）。"""
+    data_root, _ = env
+    assert training.ModelCheckpoint is not None
+    _write_prepared_samples(data_root, "ds_any_mlp")
+    run_dir = _load_script().run(_write_config(data_root, _config_text("ds_any_mlp", "r1")))
+    cnn_path, cnn_ckpt = _build_cnn_checkpoint(data_root, "ds_any_cnn")
+
+    mlp = training.load_any_checkpoint(run_dir / "best.pt")
+    assert isinstance(mlp, training.Checkpoint)
+    cnn = training.load_any_checkpoint(cnn_path)
+    assert isinstance(cnn, training.CNNCheckpoint)
+    assert cnn.channels == cnn_ckpt.channels
+    assert torch.equal(_cnn_predict(cnn), _cnn_predict(cnn_ckpt))
+
+
+def test_load_any_checkpoint_loads_each_file_once(
+    env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """load_any 每文件恰一次 torch.load，且 weights_only / CPU 映射。"""
+    data_root, _ = env
+    _write_prepared_samples(data_root, "ds_once_mlp")
+    run_dir = _load_script().run(_write_config(data_root, _config_text("ds_once_mlp", "r1")))
+    cnn_path, _ = _build_cnn_checkpoint(data_root, "ds_once_cnn")
+
+    real_load = torch.load
+    calls: list[dict[str, Any]] = []
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", _spy)
+    training.load_any_checkpoint(run_dir / "best.pt")
+    assert len(calls) == 1
+    training.load_any_checkpoint(cnn_path)
+    assert len(calls) == 2
+    for kwargs in calls:
+        assert kwargs.get("weights_only") is True
+        assert kwargs.get("map_location") == "cpu"
+
+
+@pytest.mark.parametrize("kind_value", ["mlp", None, "transformer"])
+def test_load_any_rejects_non_cnn_kind_on_mlp_payload(
+    env: tuple[Path, Path], tmp_path: Path, kind_value: str | None
+) -> None:
+    """MLP 载荷出现任何显式 kind（含 "mlp"）→ 拒绝，不回退旧 loader。"""
+    data_root, _ = env
+    _write_prepared_samples(data_root, "ds_kind_mlp")
+    run_dir = _load_script().run(_write_config(data_root, _config_text("ds_kind_mlp", "r1")))
+    payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    bad = _saved_damage(tmp_path, payload, lambda p: p.__setitem__("model_kind", kind_value))
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(bad)
+
+
+def test_load_any_rejects_layout_and_kind_mismatch(env: tuple[Path, Path], tmp_path: Path) -> None:
+    """未知/缺 kind 与布局不符一律报错：绝不 fallback 到 MLP。"""
+    data_root, _ = env
+    _write_prepared_samples(data_root, "ds_mismatch_mlp")
+    run_dir = _load_script().run(_write_config(data_root, _config_text("ds_mismatch_mlp", "r1")))
+    mlp_payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    mlp_as_cnn = _saved_damage(
+        tmp_path,
+        mlp_payload,
+        lambda p: p.__setitem__("model_kind", "cnn1d"),
+        name="mlp_as_cnn.pt",
+    )
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(mlp_as_cnn)
+
+    cnn_path, _ = _build_cnn_checkpoint(data_root, "ds_mismatch_cnn")
+    cnn_payload = torch.load(cnn_path, weights_only=True, map_location="cpu")
+    cnn_no_kind = _saved_damage(
+        tmp_path, cnn_payload, lambda p: p.pop("model_kind"), name="cnn_no_kind.pt"
+    )
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(cnn_no_kind)
+    for kind_value in ("mlp", None, "transformer"):
+        bad = _saved_damage(
+            tmp_path,
+            cnn_payload,
+            lambda p, v=kind_value: p.__setitem__("model_kind", v),
+            name=f"cnn_kind_{kind_value}.pt",
+        )
+        with pytest.raises(training.TrainingError):
+            training.load_any_checkpoint(bad)
+
+
+def test_cnn_explicit_structure_survives_nested_config(env: tuple[Path, Path]) -> None:
+    """CNN 显式结构字段为权威：嵌套 config.model 结构不同也不覆盖。"""
+    data_root, _ = env
+    nested = CNN1DModelConfig(
+        channels=(16, 16), kernel_sizes=(3, 3), pool_bins=2, head_hidden_dims=()
+    )
+    path, _ = _build_cnn_checkpoint(data_root, "ds_cnn_authoritative", config_model=nested)
+    ckpt = training.load_cnn_checkpoint(path)
+    assert (ckpt.channels, ckpt.kernel_sizes, ckpt.pool_bins, ckpt.head_hidden_dims) == (
+        (4, 8),
+        (3, 5),
+        4,
+        (8,),
+    )
+    nested_loaded = cast(CNN1DModelConfig, ckpt.config.model)
+    assert isinstance(nested_loaded, CNN1DModelConfig)
+    assert nested_loaded.channels == (16, 16)
+    model = training.build_cnn_model(
+        ckpt.contract,
+        channels=ckpt.channels,
+        kernel_sizes=ckpt.kernel_sizes,
+        pool_bins=ckpt.pool_bins,
+        head_hidden_dims=ckpt.head_hidden_dims,
+    )
+    assert model.channels == (4, 8)
+    model.load_state_dict(dict(ckpt.model_state_dict))
+
+
+def test_save_cnn_checkpoint_refuses_overwrite(env: tuple[Path, Path]) -> None:
+    data_root, _ = env
+    path, ckpt = _build_cnn_checkpoint(data_root, "ds_cnn_overwrite")
+    with pytest.raises(FileExistsError, match="拒绝覆盖"):
+        training.save_cnn_checkpoint(path, ckpt)
+
+
+def _mutate_state_non_tensor(payload: Any) -> None:
+    name = next(iter(payload["model_state_dict"]))
+    payload["model_state_dict"][name] = [1.0, 2.0]
+
+
+def _mutate_state_non_str_key(payload: Any) -> None:
+    payload["model_state_dict"][1] = torch.zeros(1)
+
+
+def _mutate_t_s_nan(payload: Any) -> None:
+    payload["contract"]["t_s"][0] = float("nan")
+
+
+def _mutate_preprocessing_p(payload: Any) -> None:
+    x_stats = payload["preprocessing"]["x_stats"]
+    x_stats["mean"] = [[[0.0, 0.0, 0.0]]]  # P=1，与契约 P=2 不符
+    x_stats["std"] = [[[1.0, 1.0, 1.0]]]
+
+
+_CNN_CORRUPTIONS: list[tuple[str, Callable[[Any], None]]] = [
+    ("version_bool", lambda p: p.__setitem__("ckpt_format_version", True)),
+    ("version_unknown", lambda p: p.__setitem__("ckpt_format_version", 999)),
+    ("missing_channels", lambda p: p.pop("channels")),
+    ("missing_kernel_sizes", lambda p: p.pop("kernel_sizes")),
+    ("missing_pool_bins", lambda p: p.pop("pool_bins")),
+    ("missing_head_hidden_dims", lambda p: p.pop("head_hidden_dims")),
+    ("kernel_even", lambda p: p.__setitem__("kernel_sizes", [2, 4])),
+    ("kernel_layer_mismatch", lambda p: p.__setitem__("kernel_sizes", [3])),
+    ("pool_bins_gt_T", lambda p: p.__setitem__("pool_bins", 9)),
+    ("unknown_activation", lambda p: p.__setitem__("activation", "gelu")),
+    ("state_dict_empty", lambda p: p.__setitem__("model_state_dict", {})),
+    ("state_dict_non_tensor", _mutate_state_non_tensor),
+    ("state_dict_non_str_key", _mutate_state_non_str_key),
+    ("contract_missing_key", lambda p: p["contract"].pop("n_time_steps")),
+    ("contract_wrong_T", lambda p: p["contract"].__setitem__("n_time_steps", 7)),
+    ("contract_t_s_nan", _mutate_t_s_nan),
+    (
+        "contract_t_s_not_increasing",
+        lambda p: p["contract"].__setitem__("t_s", list(reversed(p["contract"]["t_s"]))),
+    ),
+    (
+        "contract_component_order",
+        lambda p: p["contract"].__setitem__("component_order", ["mx", "mx", "mz"]),
+    ),
+    ("preprocessing_P_mismatch", _mutate_preprocessing_p),
+    ("config_model_wrong_kind", lambda p: p["config"].__setitem__("model", {"hidden_dims": [8]})),
+    ("seed_bool", lambda p: p.__setitem__("seed", True)),
+    ("seed_negative", lambda p: p.__setitem__("seed", -1)),
+    ("best_loss_bool", lambda p: p.__setitem__("best_val_loss", True)),
+    ("best_loss_nonfinite", lambda p: p.__setitem__("best_val_loss", float("nan"))),
+]
+
+
+@pytest.mark.parametrize("mutate", [pytest.param(fn, id=name) for name, fn in _CNN_CORRUPTIONS])
+def test_load_cnn_checkpoint_rejects_corrupt(
+    env: tuple[Path, Path], tmp_path: Path, mutate: Callable[[Any], None]
+) -> None:
+    """损坏 CNN payload 一律 TrainingError（不得 KeyError/TypeError，不回退 MLP）。"""
+    data_root, _ = env
+    path, _ = _build_cnn_checkpoint(data_root, "ds_cnn_corrupt")
+    payload = torch.load(path, weights_only=True, map_location="cpu")
+    broken = _saved_damage(tmp_path, payload, mutate)
+    with pytest.raises(training.TrainingError):
+        training.load_cnn_checkpoint(broken)
+
+
+def test_save_cnn_checkpoint_accepts_any_tensor_and_detaches(
+    env: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """save 不限定 CPU：接受 requires_grad 张量并 detach 落盘；load 仍要求 CPU。"""
+    data_root, _ = env
+    _, ckpt = _build_cnn_checkpoint(data_root, "ds_cnn_device")
+    probe = torch.zeros(2, requires_grad=True)
+    with_probe = replace(ckpt, model_state_dict={**ckpt.model_state_dict, "probe": probe})
+
+    saved = data_root / "device_probe.pt"
+    training.save_cnn_checkpoint(saved, with_probe)
+    payload = torch.load(saved, weights_only=True, map_location="cpu")
+    assert payload["model_state_dict"]["probe"].requires_grad is False
+    assert payload["model_state_dict"]["probe"].device.type == "cpu"
+
+    # save 走结构校验而非加载用 CPU 限定 helper：打桩后者也不影响保存。
+    def _forbidden(raw: Any, path: Path) -> Any:
+        raise AssertionError("save_cnn_checkpoint 不应调用 _cnn_state_dict_from_payload")
+
+    with monkeypatch.context() as patch_ctx:
+        patch_ctx.setattr(training, "_cnn_state_dict_from_payload", _forbidden)
+        saved2 = data_root / "device_probe2.pt"
+        training.save_cnn_checkpoint(saved2, with_probe)
+        assert saved2.is_file()
+
+    # load 边界 guard：真实非 CPU 张量（meta，CPU-only 可构造；CUDA 本身未验证）。
+    bad_payload = torch.load(saved, weights_only=True, map_location="cpu")
+    key = next(iter(bad_payload["model_state_dict"]))
+    bad_payload["model_state_dict"][key] = torch.empty(2, device="meta")
+    bad_path = tmp_path / "meta_state.pt"
+    torch.save(bad_payload, bad_path)
+    with pytest.raises(training.TrainingError):
+        training.load_cnn_checkpoint(bad_path)
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(bad_path)
+
+
+def _set_path(payload: Any, keys: tuple[Any, ...], value: Any) -> None:
+    target = payload
+    for key in keys[:-1]:
+        target = target[key]
+    target[keys[-1]] = value
+
+
+_CNN_PREP_CORRUPTIONS: list[tuple[str, Callable[[Any], None]]] = [
+    (
+        "x_mean_nan",
+        lambda p: _set_path(p, ("preprocessing", "x_stats", "mean", 0, 0, 0), float("nan")),
+    ),
+    (
+        "x_mean_inf",
+        lambda p: _set_path(p, ("preprocessing", "x_stats", "mean", 0, 0, 0), float("inf")),
+    ),
+    ("x_std_zero", lambda p: _set_path(p, ("preprocessing", "x_stats", "std", 0, 0, 0), 0.0)),
+    ("x_std_negative", lambda p: _set_path(p, ("preprocessing", "x_stats", "std", 0, 0, 0), -1.0)),
+    (
+        "x_std_inf",
+        lambda p: _set_path(p, ("preprocessing", "x_stats", "std", 0, 0, 0), float("inf")),
+    ),
+    (
+        "y_mean_nan",
+        lambda p: _set_path(p, ("preprocessing", "y_stats", "y_mean", 0), float("nan")),
+    ),
+    (
+        "y_mean_inf",
+        lambda p: _set_path(p, ("preprocessing", "y_stats", "y_mean", 0), float("inf")),
+    ),
+    ("y_std_zero", lambda p: _set_path(p, ("preprocessing", "y_stats", "y_std", 0), 0.0)),
+    ("y_std_negative", lambda p: _set_path(p, ("preprocessing", "y_stats", "y_std", 0), -1.0)),
+    ("y_std_inf", lambda p: _set_path(p, ("preprocessing", "y_stats", "y_std", 0), float("inf"))),
+]
+
+
+@pytest.mark.parametrize(
+    "mutate", [pytest.param(fn, id=name) for name, fn in _CNN_PREP_CORRUPTIONS]
+)
+def test_load_cnn_rejects_bad_preprocessing_numbers(
+    env: tuple[Path, Path], tmp_path: Path, mutate: Callable[[Any], None]
+) -> None:
+    """CNN 边界拒绝非有限 mean / 非正或非有限 effective scale。"""
+    data_root, _ = env
+    path, _ = _build_cnn_checkpoint(data_root, "ds_cnn_prep")
+    payload = torch.load(path, weights_only=True, map_location="cpu")
+    broken = _saved_damage(tmp_path, payload, mutate)
+    with pytest.raises(training.TrainingError):
+        training.load_cnn_checkpoint(broken)
+
+
+def test_save_cnn_rejects_bad_preprocessing_before_write(env: tuple[Path, Path]) -> None:
+    """save 侧同样先验证后 mkdir/写盘：坏 effective scale 不落盘。"""
+    data_root, _ = env
+    _, ckpt = _build_cnn_checkpoint(data_root, "ds_cnn_prep_save")
+    bad_state = replace(
+        ckpt.preprocessing,
+        x_stats=replace(
+            ckpt.preprocessing.x_stats, std=np.zeros_like(ckpt.preprocessing.x_stats.std)
+        ),
+    )
+    target = data_root / "bad_prep.pt"
+    with pytest.raises(training.TrainingError):
+        training.save_cnn_checkpoint(target, replace(ckpt, preprocessing=bad_state))
+    assert not target.exists()
+
+
+def test_cnn_preprocessing_effective_scale_one_accepted(env: tuple[Path, Path]) -> None:
+    """零方差位置 effective scale=1 合法（save→load 往返）。"""
+    data_root, _ = env
+    _, ckpt = _build_cnn_checkpoint(data_root, "ds_cnn_prep_one")
+    one_state = replace(
+        ckpt.preprocessing,
+        x_stats=replace(
+            ckpt.preprocessing.x_stats, std=np.ones_like(ckpt.preprocessing.x_stats.std)
+        ),
+        y_stats=replace(
+            ckpt.preprocessing.y_stats, y_std=np.ones_like(ckpt.preprocessing.y_stats.y_std)
+        ),
+    )
+    path = data_root / "prep_one.pt"
+    training.save_cnn_checkpoint(path, replace(ckpt, preprocessing=one_state))
+    loaded = training.load_cnn_checkpoint(path)
+    assert np.allclose(loaded.preprocessing.x_stats.std, 1.0)
+    assert np.allclose(loaded.preprocessing.y_stats.y_std, 1.0)
+
+
+def test_config_overflow_becomes_training_error(env: tuple[Path, Path], tmp_path: Path) -> None:
+    """batch_size=inf：load 边界 OverflowError → TrainingError；save 嵌套往返拒绝。"""
+    data_root, _ = env
+    _write_prepared_samples(data_root, "ds_overflow_mlp")
+    run_dir = _load_script().run(_write_config(data_root, _config_text("ds_overflow_mlp", "r1")))
+    mlp_payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    mlp_bad = _saved_damage(
+        tmp_path,
+        mlp_payload,
+        lambda p: p["config"]["training"].__setitem__("batch_size", float("inf")),
+        name="mlp_overflow.pt",
+    )
+    with pytest.raises(training.TrainingError):
+        training.load_checkpoint(mlp_bad)
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(mlp_bad)
+
+    cnn_path, cnn_ckpt = _build_cnn_checkpoint(data_root, "ds_overflow_cnn")
+    cnn_payload = torch.load(cnn_path, weights_only=True, map_location="cpu")
+    cnn_bad = _saved_damage(
+        tmp_path,
+        cnn_payload,
+        lambda p: p["config"]["training"].__setitem__("batch_size", float("inf")),
+        name="cnn_overflow.pt",
+    )
+    with pytest.raises(training.TrainingError):
+        training.load_cnn_checkpoint(cnn_bad)
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(cnn_bad)
+
+    # 嵌套 save 路径：同一非法 config 在 mkdir/写盘前被拒。
+    bad_config = replace(
+        cnn_ckpt.config, training=replace(cnn_ckpt.config.training, batch_size=float("inf"))
+    )
+    target = data_root / "overflow.pt"
+    with pytest.raises(training.TrainingError):
+        training.save_cnn_checkpoint(target, replace(cnn_ckpt, config=bad_config))
+    assert not target.exists()
+
+
+def test_cnn_contract_component_order_required_mlp_default_unchanged(
+    env: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """CNN 独立格式要求显式 component_order；旧 MLP 缺省仍可读。"""
+    data_root, _ = env
+    cnn_path, _ = _build_cnn_checkpoint(data_root, "ds_comp_cnn")
+    cnn_payload = torch.load(cnn_path, weights_only=True, map_location="cpu")
+    assert cnn_payload["contract"]["component_order"] == ["mx", "my", "mz"]
+    cnn_missing = _saved_damage(
+        tmp_path,
+        cnn_payload,
+        lambda p: p["contract"].pop("component_order"),
+        name="cnn_no_comp.pt",
+    )
+    with pytest.raises(training.TrainingError):
+        training.load_cnn_checkpoint(cnn_missing)
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(cnn_missing)
+
+    _write_prepared_samples(data_root, "ds_comp_mlp")
+    run_dir = _load_script().run(_write_config(data_root, _config_text("ds_comp_mlp", "r1")))
+    mlp_payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    mlp_missing = _saved_damage(
+        tmp_path,
+        mlp_payload,
+        lambda p: p["contract"].pop("component_order"),
+        name="mlp_no_comp.pt",
+    )
+    mlp_ckpt = training.load_checkpoint(mlp_missing)
+    assert mlp_ckpt.contract.component_order == ("mx", "my", "mz")
+    assert isinstance(training.load_any_checkpoint(mlp_missing), training.Checkpoint)
