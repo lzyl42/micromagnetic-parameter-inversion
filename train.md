@@ -8,8 +8,8 @@
 占位状态下不会成功。现有 `data/raw/` 各数据集（哨兵/QC 轮）仅验证过格式
 与执行链，不构成科研训练有效性依据。
 
-> **CNN1D 分支（P1 配置 + P2 模型 + P3 独立 checkpoint/工厂/评估已实现；
-> 训练链未接，不能训练）**：P1 配置层已支持 `model.kind` 判别（缺省 `mlp`）与
+> **CNN1D 分支（P1 配置 + P2 模型 + P3 独立 checkpoint/工厂/评估 + P4 训练链
+> 已接通）**：P1 配置层已支持 `model.kind` 判别（缺省 `mlp`）与
 > CNN 结构字段 `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 的严格
 > 校验（YAML 与 `config_from_mapping` 共用同一 schema）；P2 已实现
 > `src/micromagnetic_parameter_inversion/models/cnn1d.py` 的 `CNN1DRegressor`
@@ -23,20 +23,27 @@
 > 不变**；MLP 与 CNN checkpoint **互不接受**对方文件，未知/缺失/显式 `mlp`
 > kind 或残留 CNN 结构字段一律报错、绝不回退。
 >
-> **仍未实现（P4）**：CNN 训练循环与共享 run 编排、`scripts/train_cnn1d.py`
-> 入口均未实现，模型仍未接入 `training.train_model`（该函数顶部仍只接受 MLP
-> 配置并按 kind 早拒 CNN），因此**不能经项目训练脚本训练 CNN**；
-> `configs/training/cnn1d.yaml` 仍为全注释占位、**无研究超参**、不可加载。
-> CNN 与 MLP 的 checkpoint、训练产物与预处理统计**完全独立**：只共用同一
-> dataset 与冻结 split，统计量由 CNN 在自身训练组上拟合，不复用 MLP 权重/
-> checkpoint/已有预处理统计/训练产物。
+> **P4 训练链已接通**：共享编排 `training.run(config_path, *, expected_kind)`
+> 落地在既有 `training.py`（**不新增 runner 模块**，无 `cnn1d.md`）；
+> `scripts/train_mlp.py` / `scripts/train_cnn1d.py` 均为其**薄入口**，分别声明
+> `expected_kind`，对非法/错配 `model.kind` 在读数据、建目录**之前**早拒；
+> `--config` 必填，两个入口命令用法与默认输出目录保持
+> `output_root()/training/<kind>/<dataset_name>/<run_name>`（`output_dir` 显式
+> 覆盖时原样使用，目录已存在拒绝覆盖）。`training.train_model` 现支持两类模型，
+> `TrainingResult.best_checkpoint`/`final_checkpoint` 为联合类型，
+> `save_model_checkpoint` 按 checkpoint 类别 dispatch 到独立 save 函数。
 >
-> **未来 CNN1D 入口（未实现）**：共享编排未来从现 `scripts/train_mlp.py` 的
-> `run()` 抽到既有 `training.py`，保持命令/默认行为、显式 `output_dir`、构造
-> 模型前设定 seed、best/final 与数值失败语义不变；`train_mlp.py` /
-> `train_cnn1d.py` 为薄入口，各自在读数据、建目录**之前**校验 `model.kind`。
-> 细节大纲见 `tests/test_training.py` 的 `TODO(CNN1D-P4)` 注释。本文档描述的
-> prepare/train/evaluate 流程目前仍只覆盖 MLP。
+> **独立与共同点**：CNN 与 MLP 只共用**同一 dataset 与冻结 split**；
+> checkpoint、训练产物与预处理统计**完全独立**——每个 run 自行做
+> **train-only** `preprocessing.fit`，不复用对方权重/checkpoint/统计/产物。
+>
+> **验证范围**：P1–P4 均只经 CPU、tmp 合成数据、小 `max_epochs` 的离线测试
+> 验证（`tests/test_training.py`、`tests/test_evaluation.py`、
+> `tests/test_cnn1d.py`、`tests/test_training_config.py`）；**未在正式研究数据
+> 上训练，无超参搜索，不存在可靠科研结果**。`configs/training/cnn1d.yaml` 仍是
+> **全注释占位、无研究超参**：它**不能直接照抄运行**，须用户逐字段审定并显式
+> 填写 `model` 结构、替换 `dataset_name`/`run_name` 后才可加载执行；本文档不
+> 预填任何模型研究超参。
 
 ## 1. 目标与非目标
 
@@ -183,14 +190,19 @@ src/micromagnetic_parameter_inversion/
   training_data.py     # npz 读取/清单成员与形状校验/按 split.yaml 建 torch Dataset
   preprocessing.py     # [P,1,3] 广播标准化、标签变换与逆变换
   models/mlp.py        # MLP 定义（携带输入契约：P、T、C=3、pulse 顺序）
-  training.py          # 训练循环、early stopping、ckpt 读写
+  models/cnn1d.py      # CNN1DRegressor（卷积特征 + 池化 + 回归头）
+  training.py          # 训练循环、early stopping、ckpt 读写；共享 run 编排
+                       # （load_config 一次 → kind 早拒 → train-only fit →
+                       #  训练 → 产物）与 save_model_checkpoint 类别 dispatch
   evaluation.py        # val/test 评估、物理单位指标、test_predictions 导出
 scripts/
   prepare_training_samples.py  # raw → samples/<dataset>/ npz + dataset_meta + split
-  train_mlp.py                 # 配置 → 样本/划分 → 训练 → artifacts 产物
+  train_mlp.py                 # MLP 薄入口（training.run, expected_kind="mlp"）
+  train_cnn1d.py               # CNN 薄入口（training.run, expected_kind="cnn1d"）
   evaluate_model.py            # run/ckpt 定位 → run 内 split 副本的 test 指标
                                # 与 test_predictions.csv
-configs/training/mlp.yaml       # 训练配置（见第 7 节）
+configs/training/mlp.yaml       # MLP 训练配置（见第 7 节）
+configs/training/cnn1d.yaml     # CNN 配置：全注释占位，须审定填写后才可加载
 ```
 
 复用：`paths.data_root()/output_root()`（不硬编码机器路径）、
@@ -237,8 +249,18 @@ output_dir: null      # null = output_root()/training/mlp/<dataset_name>/<run_na
 uv run python scripts/prepare_training_samples.py \
   --config configs/training/mlp.yaml --parameter-set-ids all
 uv run python scripts/train_mlp.py --config configs/training/mlp.yaml
+uv run python scripts/train_cnn1d.py --config configs/training/cnn1d.yaml
 uv run python scripts/evaluate_model.py --run RUN_DIR
 ```
+
+训练入口只有 `--config` 一个开关，`--config` **必填**；MLP/CNN 两入口共用
+同一份 prepared dataset 与**冻结 split**，但各自写独立目录
+（`training/mlp/...` 与 `training/cnn1d/...`）并各自做 train-only 拟合。
+`configs/training/mlp.yaml` 的 `dataset_name`/`run_name` 仍为占位符，运行前
+必须替换；**`configs/training/cnn1d.yaml` 当前是全注释占位、无研究超参，不能
+直接执行**——须先由用户逐字段审定并显式填写 `model` 结构与
+`dataset_name`/`run_name`，否则 `load_config` 会拒绝。本文档不提供、也不预填
+任何 CNN 模型研究超参。
 
 evaluate 的 `--checkpoint CKPT` 为可选（默认 `<run>/best.pt`）；无论显式
 与否，ckpt 必须与 run 内 split 副本 SHA 绑定一致，结构/预处理全部取自
@@ -342,26 +364,38 @@ ckpt，不要求提供当前训练 config 重建模型。
 8. 常规 evaluate：run 内 split 副本与 ckpt.split SHA 不一致报错；npz 与
    ckpt 输入契约错配（T、pulse_ids 顺序、t_s 不一致）报错；空指标子集
    输出 null 而非 NaN/0；预测非有限报错。
-9. 预检：目标 npz/meta/split 已存在或部分残留时，拒绝且不写入新产物。
-10. 不做：物理 QC、协议逐字段重查、正向回代、科研有效性验证。
+9. CNN 训练链（P4，CPU 合成，小 max_epochs）：两入口 kind 错配在读数据/
+   建目录前早拒、`--config` 必填、显式 output_dir 与默认分目录、拒绝已存在
+   run 目录；`training.run` 只解析一次配置；CNN run 产物齐全（split 原字节
+   副本 / config_resolved / preprocessing / metrics / best / final）、
+   `load_cnn` 往返、MLP loader 拒 CNN、`evaluation.run_evaluation` 物理指标
+   有限且成员对齐；fit 只吃 train 成员（污染 val/test 不改变统计、不读取
+   其它 run 统计）；同 seed 权重一致（**仅 CPU 保证**，不扩大 GPU 确定性
+   承诺）；首 epoch 与后续 epoch 数值失败的 metrics/ckpt/退出码语义；非法
+   `pool_bins > T` 经 CLI 友好 exit 2、无成功产物。
+10. 预检：目标 npz/meta/split 已存在或部分残留时，拒绝且不写入新产物。
+11. 不做：物理 QC、协议逐字段重查、正向回代、科研有效性验证。
 
 ## 10. 已实现模块清单与待定研究项
 
 已实现模块清单（工程验证以 ruff/pyright 与聚焦离线 pytest 为准；非
 科研验证）：
 
-- 配置/数据：`training_config.py`（严格 YAML 加载）、`training_data.py`
-  （npz/协议快照/split/Dataset）、`configs/training/mlp.yaml`
+- 配置/数据：`training_config.py`（严格 YAML 加载，`model.kind` 判别）、
+  `training_data.py`（npz/协议快照/split/Dataset）、
+  `configs/training/mlp.yaml`、`configs/training/cnn1d.yaml`（全注释占位）
 - 预处理/模型：`preprocessing.py`（train-only 拟合与变换）、
   `models/mlp.py`（MLPRegressor）、`models/cnn1d.py`（CNN1DRegressor，P2）
-- 训练/评估：`training.py`（训练循环/early stopping/ckpt 读写；P3 另有独立
+- 训练/评估：`training.py`（训练循环/early stopping/ckpt 读写；P3 独立
   `CNNCheckpoint` 与 `build_cnn_model`/`save_cnn_checkpoint`/
-  `load_cnn_checkpoint`/`load_any_checkpoint`，CNN 训练循环未接）、
-  `evaluation.py`（绑定校验/指标）；入口
+  `load_cnn_checkpoint`/`load_any_checkpoint`；P4 共享 `run` 编排、
+  两模型 `train_model`、`save_model_checkpoint` 类别 dispatch）、
+  `evaluation.py`（绑定校验/指标，按 ckpt 类别显式路由）；入口
   `scripts/prepare_training_samples.py`、`scripts/train_mlp.py`、
-  `scripts/evaluate_model.py`；测试 `tests/test_training_config.py`、
-  `tests/test_training_data.py`、`tests/test_preprocessing.py`、
-  `tests/test_mlp.py`、`tests/test_training.py`、
+  `scripts/train_cnn1d.py`、`scripts/evaluate_model.py`；测试
+  `tests/test_training_config.py`、`tests/test_training_data.py`、
+  `tests/test_preprocessing.py`、`tests/test_mlp.py`、
+  `tests/test_cnn1d.py`、`tests/test_training.py`、
   `tests/test_evaluation.py`
 
 **以上为工程实现与离线验证：未在正式研究数据上训练，未做科研有效性

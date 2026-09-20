@@ -48,6 +48,9 @@ type LabelTransform = Literal["identity", "logalpha"]
 # 激活函数在 ckpt 中显式留档（模型结构显式字段）；首版固定 ReLU。
 type ActivationName = Literal["relu"]
 
+# 训练入口声明的模型类别（``training.run`` 的 expected_kind）。
+type ModelKind = Literal["mlp", "cnn1d"]
+
 _TOP_LEVEL_KEYS = frozenset(
     {
         "dataset_name",

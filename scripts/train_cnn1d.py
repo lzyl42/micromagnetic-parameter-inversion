@@ -1,52 +1,72 @@
 #!/usr/bin/env python3
-"""train_cnn1d.py —— CNN1D 训练入口（**架构审核骨架，未实现**）。
+"""train_cnn1d.py —— CNN1D 训练入口（已实现，薄封装 ``training.run``）。
 
-本脚本目前只占位未来的 CNN1D 训练入口；**直接执行不会创建目录、不会加载
-数据、不会调用任何训练逻辑**，仅打印未实现提示并以非 0 退出码结束
-（``--help`` 正常显示骨架用途）。
+用法：仅 ``--config <training YAML>``（无其它开关）。本入口声明
+``expected_kind="cnn1d"``，即要求 ``model.kind == "cnn1d"``；配置为 ``mlp``
+在加载数据、创建目录之前即抛 ``ConfigError``。
 
-未来实现步骤（评审通过后落地，暂不实现）：
+与 ``train_mlp.py`` 共用 ``training.run`` 编排，使用**相同的样本目录与冻结
+split**，但完全**不复用** MLP 的权重/checkpoint/预处理统计量/产物：每次
+run 自行做 train-only 拟合，产物写入独立目录
+``output_root()/training/cnn1d/<dataset_name>/<run_name>``（``output_dir``
+显式覆盖时原样使用），与 MLP 输出互不干扰。test 仍只在
+``evaluate_model.py`` 中评估，训练与选模只用 train/val。
 
-1. 解析训练 YAML 一次并校验 ``model.kind == "cnn1d"``；kind 不匹配时在加载
-   数据或创建目录**之前**早拒；
-2. 调用 ``training.run``（未来与 ``train_model`` 同模块的共享编排），使用与
-   MLP **相同的样本目录与冻结 split**，但不复用 MLP 权重/ckpt/预处理/产物；
-   CNN 自行做 train-only 拟合；
-3. 产物写入独立目录
-   ``output_root()/training/cnn1d/<dataset_name>/<run_name>``，与 MLP 输出
-   互不干扰；旧 ``train_mlp.py`` 命令与输出路径保持不变；
-4. 保留 ``output_dir`` 覆盖与失败/best-final 语义；
-5. test 仍只在独立 ``evaluate_model.py`` 中评估；训练与选模只用 train/val，
-   **test 不得用于调参**。
+错误处理：已知契约错误（ConfigError/DataError/PreprocessingError/
+FileExistsError/TrainingError）向 stderr 友好输出并返回退出码 2；其余
+异常直接上抛（bug）。
 """
 
 from __future__ import annotations
 
 import argparse
+import pathlib
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
-_NOT_IMPLEMENTED_MESSAGE = (
-    "train_cnn1d.py 仅为架构审核骨架，尚未实现，不可训练；待架构评审通过后再按批准阶段实现。"
-)
+from micromagnetic_parameter_inversion import preprocessing, training, training_data
+from micromagnetic_parameter_inversion.training_config import ConfigError
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    """构建骨架参数解析器：仅提供 ``--help`` 说明用途，暂不注册 ``--config``。"""
-    return argparse.ArgumentParser(
+    """构建命令行解析器：仅注册必填 --config。"""
+    parser = argparse.ArgumentParser(
         prog="train_cnn1d.py",
         description=(
-            "[骨架/未实现] 拟议的 CNN1D 反演训练入口，仅供架构审核；"
-            "本版本不可训练、不创建目录、不加载数据。"
+            "Train the CNN1D inverse-regression model from prepared samples "
+            "(CPU-friendly; test split is never touched)."
         ),
     )
+    parser.add_argument(
+        "--config",
+        required=True,
+        type=pathlib.Path,
+        help="Path to the training YAML config (e.g. configs/training/cnn1d.yaml).",
+    )
+    return parser
+
+
+def run(config_path: Path) -> Path:
+    """执行 CNN1D 训练（``training.run`` 的薄封装），返回 run 目录。"""
+    return training.run(config_path, expected_kind="cnn1d")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """解析参数并明确提示未实现；恒返回非 0（骨架不可训练）。"""
-    _build_arg_parser().parse_args(argv)
-    print(f"error: {_NOT_IMPLEMENTED_MESSAGE}", file=sys.stderr)
-    return 2
+    """解析参数并执行训练；已知契约错误友好输出并返回 2。"""
+    args = _build_arg_parser().parse_args(argv)
+    try:
+        run(args.config)
+    except (
+        ConfigError,
+        preprocessing.PreprocessingError,
+        training_data.DataError,
+        training.TrainingError,
+        FileExistsError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

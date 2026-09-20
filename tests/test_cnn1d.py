@@ -102,13 +102,18 @@ def test_first_convolution_receives_pulse_major_component_minor_encoding() -> No
     期望值用手工索引/stack 构造，避免在测试里完整复刻 permute+reshape。
     """
     n_pulse, n_time = _UNIT_SHAPE[0], _UNIT_SHAPE[1]
-    model = _make_model().eval()
+    model = _make_model()
+    model.eval()
     captured: dict[str, Tensor] = {}
 
     def _capture(_module: nn.Module, inputs: tuple[Tensor, ...]) -> None:
         captured["x"] = inputs[0].detach().clone()
 
-    handle = model.features[0].register_forward_pre_hook(_capture)
+    features = model.features
+    assert isinstance(features, nn.Sequential)
+    first_conv = features[0]
+    assert isinstance(first_conv, nn.Conv1d)
+    handle = first_conv.register_forward_pre_hook(_capture)
     try:
         # 每个 (p, t, c) 取唯一可辨识值。
         base = torch.arange(1, n_pulse * n_time * 3 + 1, dtype=torch.float32)
@@ -129,7 +134,8 @@ def test_first_convolution_receives_pulse_major_component_minor_encoding() -> No
 
 
 def test_features_preserve_time_length_and_pool_collapses_to_bins() -> None:
-    model = _make_model().eval()
+    model = _make_model()
+    model.eval()
     shapes: dict[str, tuple[int, ...]] = {}
 
     def _conv_out(_module: nn.Module, _inputs: tuple[Tensor, ...], output: Tensor) -> None:
@@ -138,8 +144,14 @@ def test_features_preserve_time_length_and_pool_collapses_to_bins() -> None:
     def _pool_out(_module: nn.Module, _inputs: tuple[Tensor, ...], output: Tensor) -> None:
         shapes["pool"] = tuple(output.shape)
 
-    conv_handle = model.features[0].register_forward_hook(_conv_out)
-    pool_handle = model.pool.register_forward_hook(_pool_out)
+    features = model.features
+    assert isinstance(features, nn.Sequential)
+    first_conv = features[0]
+    assert isinstance(first_conv, nn.Conv1d)
+    conv_handle = first_conv.register_forward_hook(_conv_out)
+    pool = model.pool
+    assert isinstance(pool, nn.AdaptiveAvgPool1d)
+    pool_handle = pool.register_forward_hook(_pool_out)
     try:
         with torch.no_grad():
             model(torch.randn(2, *_UNIT_SHAPE))
@@ -153,7 +165,8 @@ def test_features_preserve_time_length_and_pool_collapses_to_bins() -> None:
 
 
 def test_noncontiguous_input_matches_contiguous() -> None:
-    model = _make_model().eval()
+    model = _make_model()
+    model.eval()
     big = torch.randn(2, *_UNIT_SHAPE[:2], 6)  # (N, P, T, 6)
     x = big[..., :3]  # 末维切片得到形状一致的 (N, P, T, 3) 非连续张量
     assert x.shape == (2, *_UNIT_SHAPE)
@@ -236,7 +249,8 @@ def test_constructor_rejects_invalid_arguments(case: str, overrides: dict[str, o
 
 
 def test_forward_rejects_wrong_ndim_or_shape() -> None:
-    model = _make_model().eval()
+    model = _make_model()
+    model.eval()
     n_pulse, n_time = _UNIT_SHAPE[0], _UNIT_SHAPE[1]
     bad_shapes = [
         (2, n_time, 3),  # ndim=3
@@ -252,7 +266,8 @@ def test_forward_rejects_wrong_ndim_or_shape() -> None:
 
 
 def test_forward_output_and_gradients_are_finite() -> None:
-    model = _make_model().train()
+    model = _make_model()
+    model.train()
     out = model(torch.randn(3, *_UNIT_SHAPE))
     assert torch.isfinite(out).all()
     (out**2).sum().backward()
@@ -264,14 +279,16 @@ def test_forward_output_and_gradients_are_finite() -> None:
 
 
 def test_state_dict_roundtrip_via_torch_load(tmp_path: Path) -> None:
-    model = _make_model().eval()
+    model = _make_model()
+    model.eval()
     probe = torch.randn(3, *_UNIT_SHAPE)
     with torch.no_grad():
         expected = model(probe)
 
     path = tmp_path / "cnn1d_state.pt"
     torch.save(model.state_dict(), path)
-    reloaded = _make_model().eval()
+    reloaded = _make_model()
+    reloaded.eval()
     reloaded.load_state_dict(torch.load(path, weights_only=True))
     with torch.no_grad():
         got = reloaded(probe)
@@ -298,9 +315,13 @@ def test_module_export() -> None:
 
 
 def test_output_head_is_linear_without_final_activation() -> None:
-    model = _make_model(head_hidden_dims=()).eval()
-    last = model.head[-1]
+    model = _make_model(head_hidden_dims=())
+    model.eval()
+    head = model.head
+    assert isinstance(head, nn.Sequential)
+    last = head[-1]
     assert isinstance(last, nn.Linear)
+    assert last.bias is not None
     with torch.no_grad():
         last.weight.zero_()
         last.bias.fill_(-3.0)

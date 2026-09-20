@@ -23,10 +23,11 @@ import yaml
 from torch import nn
 
 from micromagnetic_parameter_inversion import (
+    evaluation,
     paths,
     preprocessing,
-    runtime,
     training,
+    training_config,
     training_data,
 )
 from micromagnetic_parameter_inversion.training_config import (
@@ -41,24 +42,25 @@ from micromagnetic_parameter_inversion.training_config import (
 )
 
 _SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_mlp.py"
+_CNN_SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_cnn1d.py"
 
-# TODO(CNN1D-P4)：入口/共享 run 实现后在此文件补充：
-# - 不新增共享 runner 模块；共享 run 未来从现 scripts/train_mlp.py 的 run()
-#   抽到既有 training.py，保持命令/默认行为、显式 output_dir、构造模型前设定
-#   seed、best/final 与数值失败语义不变；
-# - train_mlp.py / train_cnn1d.py 为薄入口，各自在读数据、建目录前校验
-#   model.kind（不匹配即拒绝），不通过 runner；旧 train_mlp 输出路径/产物不变，
-#   CNN 输出 output_root()/training/cnn1d/<dataset_name>/<run_name>。
+# 共享 run（training.run，expected_kind 早拒）与两个薄入口；CNN 只复用本文件
+# 合成数据 helper，不读取也不复用 MLP 的权重/统计/产物。
 
 
-def _load_script() -> Any:
-    """按路径加载 train_mlp 脚本模块（scripts/ 非包；自带、不跨测试导入）。"""
-    spec = importlib.util.spec_from_file_location("train_mlp_script", _SCRIPT_PATH)
+def _load_script(path: Path = _SCRIPT_PATH, name: str = "train_mlp_script") -> Any:
+    """按路径加载 scripts/ 模块（scripts/ 非包；自带、不跨测试导入）。"""
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_cnn_script() -> Any:
+    """加载 train_cnn1d 脚本模块（薄入口；默认非 MLP）。"""
+    return _load_script(_CNN_SCRIPT_PATH, "train_cnn1d_script")
 
 
 @pytest.fixture()
@@ -130,7 +132,9 @@ def _config_text(
     patience: int = 50,
     min_delta: float = 0.0,
     seed: int = 11,
+    output_dir: str | None = None,
 ) -> str:
+    output = "null" if output_dir is None else output_dir
     return (
         f"dataset_name: {dataset}\n"
         f"run_name: {run_name}\n"
@@ -142,7 +146,7 @@ def _config_text(
         "}\n"
         "split: {seed: 5, ratios: {train: 0.5, val: 0.25, test: 0.25},"
         " min_per_split: {train: 1, val: 1, test: 1}}\n"
-        "output_dir: null\n"
+        f"output_dir: {output}\n"
     )
 
 
@@ -206,6 +210,7 @@ def test_ckpt_roundtrip_reload_parity(env: tuple[Path, Path]) -> None:
     run_dir = _load_script().run(config_path)
 
     ckpt = training.load_checkpoint(run_dir / "best.pt")
+    assert isinstance(ckpt, training.Checkpoint)  # load_any 联合类型下的必要收窄
     assert ckpt.contract.input_shape == (2, 8, 3)
     assert ckpt.contract.pulse_order == ("p0", "p1")
     assert ckpt.hidden_dims == (8, 4)
@@ -562,8 +567,11 @@ def _cnn_config_text(
     kernel_sizes: tuple[int, ...] = (3, 5),
     pool_bins: int = 4,
     head_hidden_dims: tuple[int, ...] = (8,),
+    max_epochs: int = 2,
+    output_dir: str | None = None,
 ) -> str:
-    """P1/P3 合法 CNN 配置文本（结构字段可配；unit-test-only 超参）。"""
+    """合法 CNN 配置文本（结构/停止/输出目录可配；unit-test-only 超参）。"""
+    output = "null" if output_dir is None else output_dir
     return (
         f"dataset_name: {dataset}\n"
         f"run_name: {run_name}\n"
@@ -571,58 +579,144 @@ def _cnn_config_text(
         f"kernel_sizes: {list(kernel_sizes)}, pool_bins: {pool_bins}, "
         f"head_hidden_dims: {list(head_hidden_dims)}}}\n"
         "training: {\n"
-        "  seed: 11, device: cpu, batch_size: 2, max_epochs: 2,\n"
+        f"  seed: 11, device: cpu, batch_size: 2, max_epochs: {max_epochs},\n"
         "  learning_rate: 0.01, weight_decay: 0.0,\n"
         "  early_stopping: {patience: 50, min_delta: 0.0},\n"
         "}\n"
         "split: {seed: 5, ratios: {train: 0.5, val: 0.25, test: 0.25},"
         " min_per_split: {train: 1, val: 1, test: 1}}\n"
-        "output_dir: null\n"
+        f"output_dir: {output}\n"
     )
 
 
-def test_run_rejects_cnn_config_before_touching_data(
+def _run_cnn(
+    data_root: Path,
+    dataset: str,
+    run_name: str,
+    *,
+    max_epochs: int = 2,
+    output_dir: str | None = None,
+    channels: tuple[int, ...] = (4, 8),
+    kernel_sizes: tuple[int, ...] = (3, 5),
+    pool_bins: int = 4,
+    head_hidden_dims: tuple[int, ...] = (8,),
+) -> Path:
+    """写 CNN 配置 + 合成样本，经 train_cnn1d 薄入口训练，返回 run 目录。"""
+    config_path = _write_config(
+        data_root,
+        _cnn_config_text(
+            dataset,
+            run_name,
+            max_epochs=max_epochs,
+            output_dir=output_dir,
+            channels=channels,
+            kernel_sizes=kernel_sizes,
+            pool_bins=pool_bins,
+            head_hidden_dims=head_hidden_dims,
+        ),
+        name=f"{dataset}_{run_name}.yaml",
+    )
+    return _load_cnn_script().run(config_path)
+
+
+def _cnn_run_dir(env: tuple[Path, Path], dataset: str, run_name: str) -> Path:
+    """测试内小 helper：CNN 默认输出目录布局。"""
+    _, out_root = env
+    return out_root / "training" / "cnn1d" / dataset / run_name
+
+
+@pytest.mark.parametrize(
+    ("entry", "config_text", "match"),
+    [
+        ("mlp", _cnn_config_text("ds_guard_cnn", "r1"), "cnn1d"),
+        ("cnn1d", _config_text("ds_guard_mlp", "r1"), "mlp"),
+    ],
+    ids=["mlp_entry_rejects_cnn", "cnn_entry_rejects_mlp"],
+)
+def test_entry_kind_mismatch_early_reject_before_data_root(
+    entry: str,
+    config_text: str,
+    match: str,
     env: tuple[Path, Path],
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CNN 配置：load_config 后、读 data_root/建目录前按 kind 早拒（ConfigError）。"""
+    """两入口错配：load_config 一次后、读 data_root/建目录前按 kind 早拒（ConfigError）。
+
+    kind guard 现在位于共享 ``training.run`` 入口（脚本为薄包装），因此
+    monkeypatch 目标是 ``training.paths``；CLI 同样 exit 2 且无输出目录。
+    """
     _, out_root = env
-    config_path = _write_config(tmp_path, _cnn_config_text("ds_cnn", "r1"), name="cnn.yaml")
+    config_path = _write_config(tmp_path, config_text, name=f"guard_{entry}.yaml")
     calls = {"data_root": 0}
 
     def _forbidden_data_root() -> Path:
         calls["data_root"] += 1
-        raise AssertionError("paths.data_root() 不应在 kind 早拒前被调用")
+        raise AssertionError("data_root() 不应在 kind 早拒前被调用")
 
-    monkeypatch.setattr(paths, "data_root", _forbidden_data_root)
-    script = _load_script()
-    with pytest.raises(ConfigError, match="cnn1d"):
+    monkeypatch.setattr(training.paths, "data_root", _forbidden_data_root)
+    script = _load_script() if entry == "mlp" else _load_cnn_script()
+    with pytest.raises(ConfigError, match=match):
         script.run(config_path)
     assert calls["data_root"] == 0
     assert not (out_root / "training").exists()
 
-    # CLI 同样友好失败：exit 2、错误信息点明 cnn1d、无输出目录
+    # CLI 同样友好失败：exit 2、错误信息点明期望/实际 kind、无输出目录
     assert script.main(["--config", str(config_path)]) == 2
-    assert "cnn1d" in capsys.readouterr().err
+    assert match in capsys.readouterr().err
     assert calls["data_root"] == 0
     assert not (out_root / "training").exists()
 
 
-def test_train_model_rejects_cnn_config_before_side_effects(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_run_invalid_expected_kind_rejected_before_data_root(
+    env: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CNN 配置直接进 training.train_model：顶部早拒，不触 seed/device/构模。"""
-    config = load_config(_write_config(tmp_path, _cnn_config_text("ds_cnn", "r1"), name="cnn.yaml"))
-    calls: list[str] = []
-    monkeypatch.setattr(training, "set_seed", lambda seed: calls.append("set_seed"))
-    monkeypatch.setattr(training, "build_model", lambda *a, **k: calls.append("build_model"))
-    monkeypatch.setattr(runtime, "select_device", lambda *a, **k: calls.append("select_device"))
-    sentinel = cast(Any, object())
-    with pytest.raises(ConfigError, match="cnn1d"):
-        training.train_model(config, sentinel, sentinel, sentinel, sentinel, "sha")
-    assert calls == []
+    """非法 expected_kind（非 mlp/cnn1d）在 data_root/读数据/建目录前即拒绝。"""
+    _, out_root = env
+    config_path = _write_config(tmp_path, _config_text("ds_bad_kind", "r1"), name="bad.yaml")
+    calls = {"data_root": 0}
+
+    def _forbidden_data_root() -> Path:
+        calls["data_root"] += 1
+        raise AssertionError("data_root() 不应在 expected_kind 校验前被调用")
+
+    monkeypatch.setattr(training.paths, "data_root", _forbidden_data_root)
+    with pytest.raises((ConfigError, ValueError)):
+        training.run(config_path, expected_kind=cast(Any, "transformer"))
+    assert calls["data_root"] == 0
+    assert not (out_root / "training").exists()
+
+
+def test_train_model_supports_cnn_config(env: tuple[Path, Path]) -> None:
+    """P4：train_model 真实支持 CNN（不再在顶部按 kind 拒）；返回 CNNCheckpoint。"""
+    data_root, _ = env
+    samples_dir, config = _cnn_samples_config(data_root, "ds_train_cnn")
+    contract, state = _cnn_contract_state(samples_dir, config)
+    meta = training_data.load_dataset_meta(samples_dir)
+    split = training_data.load_split(samples_dir, meta)
+    train_set = training_data.TrajectoryDataset(samples_dir, meta, split.train, contract=contract)
+    val_set = training_data.TrajectoryDataset(samples_dir, meta, split.val, contract=contract)
+    assert isinstance(
+        training.build_cnn_model(
+            contract, channels=(4, 8), kernel_sizes=(3, 5), pool_bins=4, head_hidden_dims=(8,)
+        ),
+        nn.Module,
+    )
+
+    result = training.train_model(
+        config,
+        train_set,
+        val_set,
+        state,
+        contract,
+        training_data.sha256_file(samples_dir / "split.yaml"),
+    )
+    assert result.history  # 至少完成 1 个完整 epoch
+    assert isinstance(result.best_checkpoint, training.CNNCheckpoint)
+    assert isinstance(result.final_checkpoint, training.CNNCheckpoint)
+    assert result.best_checkpoint.best_val_loss is not None
+    assert result.final_checkpoint.best_val_loss is None
 
 
 # --- P3: 独立 CNN checkpoint / 模型工厂 / load_any 路由 --------------------
@@ -1291,3 +1385,362 @@ def test_cnn_contract_component_order_required_mlp_default_unchanged(
     mlp_ckpt = training.load_checkpoint(mlp_missing)
     assert mlp_ckpt.contract.component_order == ("mx", "my", "mz")
     assert isinstance(training.load_any_checkpoint(mlp_missing), training.Checkpoint)
+
+
+# --- P4: 共享 training.run / CNN 训练入口 / 独立产物与拟合 -------------------
+# 超参均为**明确 unit-test-only 数值**（max_epochs 1-2、CPU、tiny fixture），
+# 不代表研究配置；复用本文件既存合成数据 helper，不读取真实数据/GPU。
+
+
+def _run_kind(kind: str, data_root: Path, dataset: str, run_name: str) -> Path:
+    """按模型类别经各自薄入口训练（复用同一合成数据），返回 run 目录。"""
+    if kind == "mlp":
+        return _load_script().run(
+            _write_config(
+                data_root, _config_text(dataset, run_name), name=f"{dataset}_{run_name}.yaml"
+            )
+        )
+    return _run_cnn(data_root, dataset, run_name)
+
+
+def test_cnn_run_trains_and_writes_artifacts(env: tuple[Path, Path]) -> None:
+    """CNN 薄入口 run：产物齐全、split raw 字节/config_resolved/preproc/metrics
+    正确；load_cnn + 恢复可推理；MLP loader 拒 CNN；evaluate 物理指标有限且成员对齐。"""
+    data_root, out_root = env
+    dataset = "ds_cnn_e2e"
+    samples_dir = _write_prepared_samples(data_root, dataset)
+    run_dir = _run_cnn(data_root, dataset, "r1")
+
+    assert run_dir == out_root / "training" / "cnn1d" / dataset / "r1"
+    for name in (
+        "best.pt",
+        "final.pt",
+        "split.yaml",
+        "config_resolved.yaml",
+        "preprocessing.yaml",
+        "metrics.json",
+    ):
+        assert (run_dir / name).is_file(), name
+
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert len(metrics["history"]) == 2
+    assert metrics["stop_reason"] == "max_epochs"
+    assert metrics["stop_epoch"] == 2
+    assert metrics["detail"] is None
+    for entry in metrics["history"]:
+        assert math.isfinite(entry["train_loss"]) and math.isfinite(entry["val_loss"])
+    assert metrics["best_val_loss"] == min(e["val_loss"] for e in metrics["history"])
+
+    resolved = load_config(run_dir / "config_resolved.yaml")
+    assert isinstance(resolved.model, CNN1DModelConfig)
+    assert resolved.model.channels == (4, 8)
+    assert resolved.model.pool_bins == 4
+    assert (run_dir / "split.yaml").read_bytes() == (samples_dir / "split.yaml").read_bytes()
+    prep = yaml.safe_load((run_dir / "preprocessing.yaml").read_text(encoding="utf-8"))
+    assert len(prep["x_stats"]["mean"]) == 2  # [P=2, 1, 3]
+    assert len(prep["x_stats"]["mean"][0][0]) == 3
+    assert prep["y_stats"]["transform"] == "identity"
+
+    ckpt = training.load_cnn_checkpoint(run_dir / "best.pt")
+    with pytest.raises(training.TrainingError):
+        training.load_checkpoint(run_dir / "best.pt")  # MLP loader 拒 CNN
+    assert ckpt.contract.input_shape == (2, 8, 3)
+
+    def _predict(checkpoint: training.CNNCheckpoint) -> torch.Tensor:
+        model = training.build_cnn_model(
+            checkpoint.contract,
+            channels=checkpoint.channels,
+            kernel_sizes=checkpoint.kernel_sizes,
+            pool_bins=checkpoint.pool_bins,
+            head_hidden_dims=checkpoint.head_hidden_dims,
+        )
+        model.load_state_dict(dict(checkpoint.model_state_dict))
+        model.eval()
+        with torch.no_grad():
+            return model(torch.zeros(1, *checkpoint.contract.input_shape))
+
+    again = training.load_cnn_checkpoint(run_dir / "best.pt")
+    assert torch.equal(_predict(ckpt), _predict(again))
+
+    report, rows = evaluation.run_evaluation(run_dir)
+    test_members = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))["test"]
+    assert [row.parameter_set_id for row in rows] == test_members
+    assert all(row.split == "test" for row in rows)
+    assert report.main.n + report.control.n == len(test_members)
+    for subset in (report.main, report.control):
+        for key in ("mae_alpha", "rmse_alpha", "mae_ku", "rmse_ku"):
+            value = getattr(subset, key)
+            assert value is None or math.isfinite(value)
+    assert report.provenance.checkpoint_path == str(run_dir / "best.pt")
+
+
+@pytest.mark.parametrize("kind", ["mlp", "cnn1d"])
+def test_explicit_output_dir_override(kind: str, env: tuple[Path, Path]) -> None:
+    """显式 output_dir 覆盖默认分目录；默认目录（training/<kind>/...）不产生。"""
+    data_root, out_root = env
+    dataset = f"ds_out_{kind}"
+    _write_prepared_samples(data_root, dataset)
+    target = out_root / "custom" / f"{kind}_run"
+    if kind == "mlp":
+        config_path = _write_config(
+            data_root, _config_text(dataset, "r1", output_dir=str(target)), name="out_mlp.yaml"
+        )
+        run_dir = _load_script().run(config_path)
+    else:
+        run_dir = _run_cnn(data_root, dataset, "r1", output_dir=str(target))
+    assert run_dir == target
+    assert (target / "best.pt").is_file()
+    assert not (out_root / "training").exists()
+
+
+def test_shared_run_parses_config_once(
+    env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """共享 run 只解析一次配置（薄入口不重复 load_config）。"""
+    data_root, _ = env
+    dataset = "ds_parse_once"
+    _write_prepared_samples(data_root, dataset)
+    config_path = _write_config(data_root, _config_text(dataset, "r1"))
+    real_load = training_config.load_config
+    calls = {"n": 0}
+
+    def spy(path: Path) -> ExperimentConfig:
+        calls["n"] += 1
+        return real_load(path)
+
+    # 无论 training.run 用模块限定调用还是预先导入符号，均恰好解析一次。
+    monkeypatch.setattr(training_config, "load_config", spy)
+    if hasattr(training, "load_config"):
+        monkeypatch.setattr(training, "load_config", spy)
+    run_dir = _load_script().run(config_path)
+    assert calls["n"] == 1
+    assert (run_dir / "best.pt").is_file()
+
+
+def test_run_rejects_existing_cnn_run_dir(
+    env: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    data_root, _ = env
+    dataset = "ds_cnn_exists"
+    _write_prepared_samples(data_root, dataset)
+    config_path = _write_config(data_root, _cnn_config_text(dataset, "r1"), name="cnn_exists.yaml")
+    script = _load_cnn_script()
+    assert script.run(config_path).is_dir()
+    assert script.main(["--config", str(config_path)]) == 2
+    assert "已存在" in capsys.readouterr().err
+
+
+def test_cnn_first_epoch_numerical_failure_no_checkpoints(
+    env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CNN 首 epoch 数值失败：TrainingError(epoch=1)；失败 metrics、无伪 ckpt、CLI exit 2。"""
+    data_root, _ = env
+    dataset = "ds_cnn_first_fail"
+    _write_prepared_samples(data_root, dataset)
+    config_path = _write_config(
+        data_root, _cnn_config_text(dataset, "r1", max_epochs=3), name="cnn_ff.yaml"
+    )
+
+    def failing_validation(model: Any, loader: Any, state: Any, device: str) -> float:
+        raise training.TrainingError("验证预测含非有限值 (NaN/Inf)")
+
+    monkeypatch.setattr(training, "run_validation", failing_validation)
+    script = _load_cnn_script()
+    with pytest.raises(training.TrainingError) as exc_info:
+        script.run(config_path)
+    assert exc_info.value.epoch == 1
+    assert exc_info.value.detail is not None and "非有限" in exc_info.value.detail
+
+    run_dir = _cnn_run_dir(env, dataset, "r1")
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["stop_reason"] == "numerical_failure"
+    assert metrics["stop_epoch"] == 1
+    assert metrics["history"] == []
+    assert metrics["best_val_loss"] is None
+    assert not (run_dir / "best.pt").exists()
+    assert not (run_dir / "final.pt").exists()
+
+    config_rerun = _write_config(
+        data_root, _cnn_config_text(dataset, "r2", max_epochs=3), name="cnn_ff2.yaml"
+    )
+    assert script.main(["--config", str(config_rerun)]) == 2
+    rerun = json.loads(
+        (_cnn_run_dir(env, dataset, "r2") / "metrics.json").read_text(encoding="utf-8")
+    )
+    assert rerun["stop_reason"] == "numerical_failure"
+    assert rerun["stop_epoch"] == 1
+
+
+def test_cnn_later_numerical_failure_preserves_previous_epoch(
+    env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CNN 后续 epoch 数值失败：保留最后完整有限 epoch 的 best/final，CLI exit 2。"""
+    data_root, _ = env
+    dataset = "ds_cnn_late_fail"
+    _write_prepared_samples(data_root, dataset)
+    config_path = _write_config(
+        data_root, _cnn_config_text(dataset, "r1", max_epochs=3), name="cnn_lf.yaml"
+    )
+    calls = {"n": 0}
+
+    def fake_validation(model: Any, loader: Any, state: Any, device: str) -> float:
+        calls["n"] += 1
+        return 1.0 if calls["n"] == 1 else math.inf
+
+    monkeypatch.setattr(training, "run_validation", fake_validation)
+    script = _load_cnn_script()
+    with pytest.raises(training.TrainingError) as exc_info:
+        script.run(config_path)
+    assert exc_info.value.epoch == 2
+
+    run_dir = _cnn_run_dir(env, dataset, "r1")
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["stop_reason"] == "numerical_failure"
+    assert metrics["stop_epoch"] == 2
+    assert len(metrics["history"]) == 1
+    assert metrics["best_val_loss"] == 1.0
+    best = training.load_cnn_checkpoint(run_dir / "best.pt")
+    final = training.load_cnn_checkpoint(run_dir / "final.pt")
+    assert best.best_val_loss == 1.0 and final.best_val_loss is None
+    for name, tensor in best.model_state_dict.items():
+        assert torch.equal(tensor, final.model_state_dict[name])  # 均第 1 完整 epoch 权重
+
+    config_rerun = _write_config(
+        data_root, _cnn_config_text(dataset, "r2", max_epochs=3), name="cnn_lf2.yaml"
+    )
+    calls["n"] = 0
+    assert script.main(["--config", str(config_rerun)]) == 2
+
+
+def test_cnn_seed_determinism_across_runs(env: tuple[Path, Path]) -> None:
+    """同 seed 同数据 → CNN history 与 best 权重逐位一致（CPU；不推广到 GPU）。"""
+    data_root, _ = env
+    dataset = "ds_cnn_seed"
+    _write_prepared_samples(data_root, dataset)
+    run_a = _run_cnn(data_root, dataset, "r_a")
+    run_b = _run_cnn(data_root, dataset, "r_b")
+    metrics_a = json.loads((run_a / "metrics.json").read_text(encoding="utf-8"))
+    metrics_b = json.loads((run_b / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics_a["history"] == metrics_b["history"]
+    best_a = training.load_cnn_checkpoint(run_a / "best.pt")
+    best_b = training.load_cnn_checkpoint(run_b / "best.pt")
+    for name, tensor in best_a.model_state_dict.items():
+        assert torch.equal(tensor, best_b.model_state_dict[name]), name
+
+
+def test_save_model_checkpoint_routes_by_type(env: tuple[Path, Path], tmp_path: Path) -> None:
+    """save_model_checkpoint：MLP→旧布局（无 model_kind），CNN→独立布局；拒覆盖/未知类型。"""
+    data_root, _ = env
+    _write_prepared_samples(data_root, "ds_route_mlp")
+    mlp_run = _load_script().run(_write_config(data_root, _config_text("ds_route_mlp", "r1")))
+    mlp_ckpt = training.load_checkpoint(mlp_run / "best.pt")
+    mlp_target = tmp_path / "routed_mlp.pt"
+    training.save_model_checkpoint(mlp_target, mlp_ckpt)
+    mlp_payload = torch.load(mlp_target, weights_only=True, map_location="cpu")
+    assert "model_kind" not in mlp_payload and "channels" not in mlp_payload
+    assert mlp_payload["hidden_dims"] == [8, 4]  # 旧 MLP payload 布局不变
+    assert isinstance(training.load_any_checkpoint(mlp_target), training.Checkpoint)
+    with pytest.raises(FileExistsError, match="拒绝覆盖"):
+        training.save_model_checkpoint(mlp_target, mlp_ckpt)
+
+    _write_prepared_samples(data_root, "ds_route_cnn")
+    cnn_run = _run_cnn(data_root, "ds_route_cnn", "r1")
+    cnn_ckpt = training.load_cnn_checkpoint(cnn_run / "best.pt")
+    cnn_target = tmp_path / "routed_cnn.pt"
+    training.save_model_checkpoint(cnn_target, cnn_ckpt)
+    cnn_payload = torch.load(cnn_target, weights_only=True, map_location="cpu")
+    assert cnn_payload["model_kind"] == "cnn1d" and "hidden_dims" not in cnn_payload
+    routed_cnn = training.load_any_checkpoint(cnn_target)
+    assert isinstance(routed_cnn, training.CNNCheckpoint)
+    assert routed_cnn.channels == cnn_ckpt.channels
+
+    unsupported = tmp_path / "routed_bad.pt"
+    with pytest.raises((training.TrainingError, TypeError)):
+        training.save_model_checkpoint(unsupported, cast(Any, object()))
+    assert not unsupported.exists()
+
+
+@pytest.mark.parametrize("kind", ["mlp", "cnn1d"])
+def test_preprocessing_fit_train_only_ignores_val_test(
+    kind: str, env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fit 只吃 split.train 成员；污染 val/test 数据不改变本 run 统计。
+
+    不要求 MLP/CNN 统计互不相同（同数据下允许相同），也不读取其它 run 统计。
+    """
+    data_root, _ = env
+    dataset = f"ds_fit_{kind}"
+    samples_dir = _write_prepared_samples(data_root, dataset)
+    meta = training_data.load_dataset_meta(samples_dir)
+    split = training_data.load_split(samples_dir, meta)
+    seen: list[tuple[str, ...]] = []
+    real_fit = preprocessing.fit
+
+    def spy_fit(dataset_obj: Any, *args: Any, **kwargs: Any) -> Any:
+        seen.append(tuple(sorted(sample.parameter_set_id for sample in dataset_obj.samples)))
+        return real_fit(dataset_obj, *args, **kwargs)
+
+    monkeypatch.setattr(preprocessing, "fit", spy_fit)
+    run_a = _run_kind(kind, data_root, dataset, "clean")
+    assert seen == [tuple(sorted(split.train))]
+    stats_a = yaml.safe_load((run_a / "preprocessing.yaml").read_text(encoding="utf-8"))
+
+    for psid in (*split.val, *split.test):  # 污染 val/test：不参与拟合
+        npz = samples_dir / f"{psid}.npz"
+        with np.load(npz, allow_pickle=False) as archive:
+            arrays = {key: archive[key] for key in archive.files}
+        arrays["x"] = arrays["x"] + 1000.0
+        arrays["y"] = arrays["y"] + 500.0
+        np.savez_compressed(npz, **arrays)
+
+    seen.clear()
+    run_b = _run_kind(kind, data_root, dataset, "poisoned")
+    assert seen == [tuple(sorted(split.train))]
+    stats_b = yaml.safe_load((run_b / "preprocessing.yaml").read_text(encoding="utf-8"))
+    assert stats_a == stats_b
+    # split 冻结：两次 run 的 run 内副本 raw 字节一致
+    assert (run_a / "split.yaml").read_bytes() == (run_b / "split.yaml").read_bytes()
+
+
+def test_cnn_pool_bins_gt_T_cli_friendly_no_output(
+    env: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """非法 pool_bins > T：配置层合法但模型层拒绝 → CLI 友好 exit 2、无成功产物。"""
+    data_root, out_root = env
+    dataset = "ds_cnn_pool_bad"
+    _write_prepared_samples(data_root, dataset)  # T=8
+    config_path = _write_config(
+        data_root, _cnn_config_text(dataset, "r1", pool_bins=9), name="pool_bad.yaml"
+    )
+    assert _load_cnn_script().main(["--config", str(config_path)]) == 2
+    err = capsys.readouterr().err
+    assert "error:" in err and "pool_bins" in err
+    run_dir = out_root / "training" / "cnn1d" / dataset / "r1"
+    assert not (run_dir / "best.pt").exists()
+    assert not (run_dir / "metrics.json").exists()
+
+
+@pytest.mark.parametrize("loader", [_load_script, _load_cnn_script], ids=["mlp_entry", "cnn_entry"])
+def test_main_requires_config_argument(loader: Callable[[], Any]) -> None:
+    """两入口 --config 均为必填：缺失即 argparse exit 2。"""
+    with pytest.raises(SystemExit) as exc_info:
+        loader().main([])
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("kind", ["mlp", "cnn1d"])
+def test_main_same_error_for_missing_samples(
+    kind: str, env: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """两入口对同一 DataError（样本目录缺失）均友好 exit 2、不建 run 目录。"""
+    _, out_root = env
+    dataset = "ds_missing_samples"
+    if kind == "mlp":
+        config_path = _write_config(tmp_path, _config_text(dataset, "r1"), name="miss_mlp.yaml")
+        script = _load_script()
+    else:
+        config_path = _write_config(tmp_path, _cnn_config_text(dataset, "r1"), name="miss_cnn.yaml")
+        script = _load_cnn_script()
+    assert script.main(["--config", str(config_path)]) == 2
+    assert "样本目录不存在" in capsys.readouterr().err
+    assert not (out_root / "training").exists()

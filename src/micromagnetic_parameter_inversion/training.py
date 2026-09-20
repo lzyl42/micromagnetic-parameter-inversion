@@ -21,8 +21,11 @@
   dataclass/numpy 对象），同名文件拒绝覆盖；读取以
   ``torch.load(weights_only=True, map_location="cpu")`` 显式安全模式。
 - 数据流：``train_model`` 返回 ``TrainingResult``（best/final checkpoint +
-  逐 epoch history）；best.pt/final.pt/metrics.json 的磁盘写出由
-  ``train_mlp.py`` 编排，checkpoint 读写仅在本模块。
+  逐 epoch history）；``run(config_path, expected_kind=...)`` 为
+  ``train_mlp.py``/``train_cnn1d.py`` 共用的编排，负责 load_config（一次）、
+  kind 早拒（读数据/建目录前）、train-only 拟合与 best.pt/final.pt/
+  metrics.json 等磁盘写出；checkpoint 读写仅在本模块。按类别落盘经
+  ``save_model_checkpoint`` dispatch（CNN 独立 schema，不写进 MLP）。
 
 依赖方向：training_config / training_data / preprocessing / runtime →
 （本模块）→ evaluation；本模块禁止导入 evaluation（评估侧反向调用
@@ -31,19 +34,27 @@
 
 from __future__ import annotations
 
+import json
 import math
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
-from torch import Tensor
+import yaml
+from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from micromagnetic_parameter_inversion import preprocessing, runtime, training_config
+from micromagnetic_parameter_inversion import (
+    paths,
+    preprocessing,
+    runtime,
+    training_config,
+    training_data,
+)
 from micromagnetic_parameter_inversion.models.cnn1d import CNN1DRegressor
 from micromagnetic_parameter_inversion.models.mlp import MLPRegressor
 from micromagnetic_parameter_inversion.preprocessing import (
@@ -58,8 +69,9 @@ from micromagnetic_parameter_inversion.training_config import (
     CNN1DModelConfig,
     ConfigError,
     ExperimentConfig,
-    ModelConfig,
+    ModelKind,
     _require_positive_int,
+    load_config,
 )
 from micromagnetic_parameter_inversion.training_data import (
     InputContract,
@@ -187,9 +199,11 @@ type ModelCheckpoint = Checkpoint | CNNCheckpoint
 class TrainingResult:
     """``train_model`` 的返回值：入口脚本据此编排产物写出。
 
-    ``best_checkpoint`` → best.pt（best_val_loss 必填，绝对最优权重）；
-    ``final_checkpoint`` → final.pt（实际最后完成 epoch 的权重，
-    best_val_loss 为 None）；``history`` → metrics.json 的逐 epoch MSE。
+    ``best_checkpoint``/``final_checkpoint`` 为 ``ModelCheckpoint``
+    （MLP ``Checkpoint`` 或 CNN ``CNNCheckpoint``，由 ``config.model`` 类别
+    决定，schema 不同）：``best_checkpoint`` → best.pt（best_val_loss 必填，
+    绝对最优权重）；``final_checkpoint`` → final.pt（实际最后完成 epoch 的
+    权重，best_val_loss 为 None）；``history`` → metrics.json 的逐 epoch MSE。
     ``stop_reason``/``stop_epoch``/``detail`` 记录停止状态（ckpt 格式版本
     不变，停止元数据仅存于 TrainingResult 与 metrics.json）：
 
@@ -200,8 +214,8 @@ class TrainingResult:
       CLI 须以非零退出并写失败状态 metrics（不打印训练完成）。
     """
 
-    best_checkpoint: Checkpoint
-    final_checkpoint: Checkpoint
+    best_checkpoint: ModelCheckpoint
+    final_checkpoint: ModelCheckpoint
     history: tuple[EpochMetrics, ...]
     stop_reason: StopReason
     stop_epoch: int  # 触发停止的 epoch（1-based）
@@ -272,7 +286,7 @@ def _batch_to_device(
 
 
 def run_validation(
-    model: MLPRegressor,
+    model: nn.Module,
     loader: DataLoader[SampleItem],
     state: PreprocessingState,
     device: str,
@@ -313,7 +327,7 @@ def run_validation(
 
 
 def _train_one_epoch(
-    model: MLPRegressor,
+    model: nn.Module,
     loader: DataLoader[SampleItem],
     optimizer: torch.optim.Optimizer,
     state: PreprocessingState,
@@ -355,7 +369,7 @@ def _train_one_epoch(
     return aggregate if math.isfinite(aggregate) else None
 
 
-def _clone_state_dict(model: MLPRegressor) -> dict[str, Tensor]:
+def _clone_state_dict(model: nn.Module) -> dict[str, Tensor]:
     """state_dict 的 CPU 深拷贝（后续训练不再影响已保存权重）。"""
     return {name: value.detach().to("cpu").clone() for name, value in model.state_dict().items()}
 
@@ -387,10 +401,8 @@ def _git_info() -> tuple[str | None, bool | None]:
     return sha, bool(status.strip())
 
 
-# TODO(CNN1D-P4): 未来共享编排 run(config_path) 放在本模块（与 train_model
-# 同模块、互不 import）：解析配置一次 → 按入口要求早拒 kind 不匹配（在加载
-# 数据/建目录前）→ 加载同一冻结 split/Dataset → 各自 train-only 拟合 →
-# train_model → 写各自产物；保持 output_dir 覆盖与失败/best-final 语义。
+# 共享训练编排见下方 ``run``（与 train_model 同模块、互不 import）；入口
+# 脚本仅负责声明 expected_kind 并转发。
 def train_model(
     config: ExperimentConfig,
     train_set: TrajectoryDataset,
@@ -414,26 +426,37 @@ def train_model(
             meta 路径（默认 "dataset_meta.yaml"）。
         dataset_meta_sha256: dataset_meta 实际文件指纹；None → 记 ""。
 
-    编排：``set_seed``（先于模型构造）→ ``build_model`` →
-    ``runtime.select_device`` → DataLoader（train shuffle=True +
-    seeded generator；num_workers=0）→ Adam → 逐 epoch
+    编排：``set_seed``（先于模型构造）→ 按 ``config.model`` 类别
+    （``ModelConfig`` → ``build_model``；``CNN1DModelConfig`` →
+    ``build_cnn_model``）构造模型 → ``runtime.select_device`` → DataLoader
+    （train shuffle=True + seeded generator；num_workers=0）→ Adam → 逐 epoch
     ``_train_one_epoch`` + ``run_validation`` → best（绝对最低，严格小于
     才更新，CPU clone）与 early stopping（独立 reference，仅改善 >
     min_delta 才更新）分开推进 → 非有限 loss/grad/pred/聚合立即停止且不
     保存坏权重（原因记入 ``stop_reason``/``stop_epoch``/``detail``，不吞
-    掉）→ 返回 ``TrainingResult``（磁盘写出由 ``train_mlp.py`` 编排）。
+    掉）→ 返回 ``TrainingResult``（磁盘写出由 ``run`` 编排）。
 
     Raises:
         TrainingError: 首个 epoch 即因数值失败停止（无可保存权重）；
-            异常携带 ``epoch``/``detail``。
+            异常携带 ``epoch``/``detail``；或模型结构非法（ValueError 领域
+            转换为 TrainingError）。
     """
-    model_config = config.model  # P1：CNN 配置尚未支持训练，先收窄并守卫
-    if not isinstance(model_config, ModelConfig):
-        raise ConfigError(
-            f"train_model 只支持 MLP 模型；检测到 kind={model_config.kind!r}（cnn1d 训练尚未实现）"
-        )
+    model_config = config.model
     set_seed(config.training.seed)  # 先于模型构造：权重初始化可复现
-    model = build_model(contract, model_config.hidden_dims)
+    model: nn.Module
+    try:
+        if isinstance(model_config, CNN1DModelConfig):
+            model = build_cnn_model(
+                contract,
+                channels=tuple(model_config.channels),
+                kernel_sizes=tuple(model_config.kernel_sizes),
+                pool_bins=int(model_config.pool_bins),
+                head_hidden_dims=tuple(model_config.head_hidden_dims),
+            )
+        else:
+            model = build_model(contract, model_config.hidden_dims)
+    except ValueError as exc:  # 模型层结构校验失败（如 pool_bins > T）→ 领域错误
+        raise TrainingError(f"模型结构非法: {exc}") from exc
     device = runtime.select_device(config.training.device)
     model.to(device)
     train_loader: DataLoader[SampleItem] = DataLoader(
@@ -507,9 +530,7 @@ def train_model(
         )
 
     git_sha, git_dirty = _git_info()
-    common: dict[str, Any] = dict(
-        ckpt_format_version=CKPT_FORMAT_VERSION,
-        hidden_dims=tuple(model_config.hidden_dims),
+    common_meta: dict[str, Any] = dict(
         activation="relu",
         contract=contract,
         preprocessing=state,
@@ -523,7 +544,26 @@ def train_model(
         torch_version=torch.__version__,
         numpy_version=np.__version__,
     )
-    best_checkpoint = Checkpoint(model_state_dict=best_state, best_val_loss=best_val, **common)
+    best_checkpoint: ModelCheckpoint
+    if isinstance(model_config, CNN1DModelConfig):
+        best_checkpoint = CNNCheckpoint(
+            ckpt_format_version=CNN_CKPT_FORMAT_VERSION,
+            model_state_dict=best_state,
+            channels=tuple(model_config.channels),
+            kernel_sizes=tuple(model_config.kernel_sizes),
+            pool_bins=int(model_config.pool_bins),
+            head_hidden_dims=tuple(model_config.head_hidden_dims),
+            best_val_loss=best_val,
+            **common_meta,
+        )
+    else:
+        best_checkpoint = Checkpoint(
+            ckpt_format_version=CKPT_FORMAT_VERSION,
+            model_state_dict=best_state,
+            hidden_dims=tuple(model_config.hidden_dims),
+            best_val_loss=best_val,
+            **common_meta,
+        )
     final_checkpoint = replace(best_checkpoint, model_state_dict=final_state, best_val_loss=None)
     return TrainingResult(
         best_checkpoint=best_checkpoint,
@@ -535,17 +575,235 @@ def train_model(
     )
 
 
+# --- 共享训练编排：train_mlp.py / train_cnn1d.py 的唯一实现 ------------------
+
+_EXPECTED_KINDS: frozenset[str] = frozenset({"mlp", "cnn1d"})
+
+
+def _resolve_expected_kind(expected_kind: object) -> ModelKind:
+    """入口声明的模型类别：仅接受 ``"mlp"``/``"cnn1d"``，否则 ConfigError。"""
+    if not isinstance(expected_kind, str) or expected_kind not in _EXPECTED_KINDS:
+        raise ConfigError(f"expected_kind 非法: {expected_kind!r}（须为 'mlp' 或 'cnn1d'）")
+    return cast(ModelKind, expected_kind)
+
+
+def _freeze_contract(train_set: TrajectoryDataset) -> InputContract:
+    """自首个**缓存**样本冻结输入契约（不回磁盘）；train 其余成员在缓存内校验。"""
+    first = train_set.samples[0]
+    contract = InputContract(
+        pulse_order=first.pulse_ids,
+        n_time_steps=int(first.x.shape[1]),
+        t_s=first.t_s,
+    )
+    train_set.validate_contract(contract)
+    return contract
+
+
+def _metrics_payload(
+    history: Sequence[EpochMetrics],
+    best_val_loss: float | None,
+    stop_reason: str,
+    stop_epoch: int,
+    detail: str | None,
+) -> dict[str, Any]:
+    """metrics.json 文档：history + best val + 停止状态（无 test 评估；有限值）。"""
+    return {
+        "history": [
+            {"epoch": m.epoch, "train_loss": m.train_loss, "val_loss": m.val_loss} for m in history
+        ],
+        "best_val_loss": best_val_loss,
+        "best_epoch": max(history, key=lambda m: -m.val_loss).epoch if history else None,
+        "stop_reason": stop_reason,
+        "stop_epoch": stop_epoch,
+        "detail": detail,
+    }
+
+
+def _write_metrics(path: Path, result: TrainingResult) -> None:
+    """metrics.json：逐 epoch history + best val + 停止状态（JSON 有限值）。"""
+    payload = _metrics_payload(
+        result.history,
+        result.best_checkpoint.best_val_loss,
+        result.stop_reason,
+        result.stop_epoch,
+        result.detail,
+    )
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
+    )
+
+
+def _write_failure_metrics(path: Path, error: TrainingError) -> None:
+    """首 epoch 数值失败的失败状态 metrics（无 checkpoint 可保留）。"""
+    payload = _metrics_payload(
+        [],
+        None,
+        "numerical_failure",
+        error.epoch if error.epoch is not None else 0,
+        error.detail if error.detail is not None else str(error),
+    )
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
+    )
+
+
+def run(config_path: Path, *, expected_kind: ModelKind) -> Path:
+    """共享训练编排：配置 → 样本/划分 → train_model → 产物，返回 run 目录。
+
+    与入口无关的同一实现，``expected_kind`` 声明本次入口要求的模型类别：
+
+    1. ``load_config(config_path)`` **仅一次**；随后立即校验
+       ``expected_kind`` 合法且 ``config.model.kind`` 匹配——**在**调用
+       ``paths.data_root()``、读取样本或创建输出目录之前，不匹配抛
+       ``ConfigError``；
+    2. 输出目录：``config.output_dir`` 非 null 时原样 ``Path(...)``（相对路径
+       按当前工作目录解析）；否则 ``output_root()/training/<kind>/<dataset>/
+       <run_name>``；已存在则 ``FileExistsError``（先于训练）；
+    3. 同一冻结 split + dataset_meta 定位（``data_root()/samples/<dataset>/``）；
+       仅构造 train/val（test 不加载、不参与选模）；
+    4. ``_freeze_contract`` + ``preprocessing.fit``（**仅 train 组**；本 run
+       自行拟合，不读取任何既有 ckpt/预处理统计量）；
+    5. split 副本 raw 字节 + SHA、dataset_meta SHA 后调用 ``train_model``；
+    6. run 目录在训练返回后创建，按序写出 split 副本（raw 字节）、
+       ``config_resolved.yaml``、``preprocessing.yaml``、``metrics.json``、
+       ``best.pt``/``final.pt``（经 ``save_model_checkpoint`` 按类别 dispatch）。
+
+    失败语义（保持原 MLP 约定）：首 epoch 数值失败（``TrainingError`` 带
+    ``epoch``）→ 创建 run 目录并只写失败状态 ``metrics.json`` 后上抛；其余
+    领域错误（kind/结构/数据）在创建目录前上抛，不留产物。训练返回后再因
+    ``numerical_failure`` 停止（已有有效 best/final 快照）→ 已写产物后抛
+    ``TrainingError``（调用方非零退出、不打印完成）。
+
+    Raises:
+        ConfigError: 配置非法、``expected_kind`` 非法或与配置类别不匹配。
+        training_data.DataError / PreprocessingError: 样本/split/契约问题。
+        FileExistsError: run 目录已存在。
+        TrainingError: 模型结构非法或训练数值失败。
+    """
+    config = load_config(config_path)
+    kind = _resolve_expected_kind(expected_kind)
+    if config.model.kind != kind:
+        raise ConfigError(
+            f"训练入口要求 model.kind={kind!r}，但配置为 {config.model.kind!r}（{config_path}）"
+        )
+
+    samples_dir = paths.data_root() / "samples" / config.dataset_name
+    if not samples_dir.is_dir():
+        raise training_data.DataError(f"样本目录不存在: {samples_dir}")
+    meta = training_data.load_dataset_meta(samples_dir)
+    split = training_data.load_split(samples_dir, meta)
+    # 训练契约要求 train/val 非空（test 允许为空：不参与训练也不评估）。
+    if not split.train:
+        raise training_data.DataError(
+            f"split.train 为空：训练至少需要 1 个 train 成员 "
+            f"(split 副本位于 {samples_dir / 'split.yaml'})"
+        )
+    if not split.val:
+        raise training_data.DataError(
+            f"split.val 为空：early stopping 与 best 选择需要 val 成员 "
+            f"(split 副本位于 {samples_dir / 'split.yaml'})"
+        )
+
+    output_dir = (
+        Path(config.output_dir)
+        if config.output_dir is not None
+        else paths.output_root() / "training" / kind / config.dataset_name / config.run_name
+    )
+    if output_dir.exists():
+        raise FileExistsError(f"run 目录已存在，拒绝覆盖: {output_dir}")
+
+    # 仅构造 train/val；test 不参与任何调参与模型选择，也不加载。
+    # 每 npz 恰好读盘一次：train 先无契约加载并缓存，契约自首个缓存样本
+    # 冻结后在缓存内校验；val 一次读盘即按契约验证。
+    train_set = TrajectoryDataset(samples_dir, meta, split.train)
+    contract = _freeze_contract(train_set)
+    val_set = TrajectoryDataset(samples_dir, meta, split.val, contract=contract)
+    state = preprocessing.fit(train_set, config.preprocessing, config.label)
+
+    split_source = samples_dir / "split.yaml"
+    split_bytes = split_source.read_bytes()
+    split_sha256 = training_data.sha256_file(split_source)
+    meta_source = samples_dir / "dataset_meta.yaml"
+    meta_sha256 = training_data.sha256_file(meta_source)
+
+    try:
+        result = train_model(
+            config,
+            train_set,
+            val_set,
+            state,
+            contract,
+            split_sha256,
+            dataset_meta_relpath=meta_source.name,
+            dataset_meta_sha256=meta_sha256,
+        )
+    except TrainingError as exc:
+        # 仅首 epoch 数值失败（带 epoch）无权重可保留 → 写失败状态 metrics；
+        # 结构/契约类错误（epoch 为 None）在创建目录前上抛，不留产物。
+        if exc.epoch is not None:
+            output_dir.mkdir(parents=True)
+            _write_failure_metrics(output_dir / "metrics.json", exc)
+        raise
+
+    # run 目录在训练返回后创建；此后失败可留部分产物（不事务）。
+    output_dir.mkdir(parents=True)
+    (output_dir / "split.yaml").write_bytes(split_bytes)
+    (output_dir / "config_resolved.yaml").write_text(
+        yaml.safe_dump(
+            training_config.config_to_mapping(config), sort_keys=False, allow_unicode=True
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "preprocessing.yaml").write_text(
+        yaml.safe_dump(preprocessing.state_to_mapping(state), sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    _write_metrics(output_dir / "metrics.json", result)
+    save_model_checkpoint(output_dir / "best.pt", result.best_checkpoint)
+    save_model_checkpoint(output_dir / "final.pt", result.final_checkpoint)
+
+    if result.stop_reason == "numerical_failure":
+        # 有效快照（上一完整 epoch）已保存，但本次训练视为失败：非零退出、
+        # 不打印训练完成。
+        raise TrainingError(
+            f"训练因数值失败停止于 epoch {result.stop_epoch}: {result.detail}",
+            epoch=result.stop_epoch,
+            detail=result.detail,
+        )
+
+    print(f"训练完成: {output_dir}")
+    print(f"  epochs={len(result.history)}; best_val_loss={result.best_checkpoint.best_val_loss!r}")
+    print(f"  stop: {result.stop_reason} @ epoch {result.stop_epoch}")
+    return output_dir
+
+
 def save_checkpoint(path: Path, ckpt: Checkpoint) -> None:
     """``torch.save`` 序列化 Checkpoint；同名文件已存在 → FileExistsError。
 
     磁盘字典仅含 Python primitives/list/dict + CPU Tensor（dataclass 与
     numpy 对象一律展开/转换，见 ``_checkpoint_to_dict``）；权重张量落盘前
-    detach + CPU + clone。
+    detach + CPU + clone。运行时类别守卫：非 ``Checkpoint`` 在 mkdir/写盘
+    前拒绝（``TrainingError``），不误写 MLP schema。
     """
+    if not isinstance(ckpt, Checkpoint):
+        raise TrainingError(f"save_checkpoint 需要 MLP Checkpoint (got {type(ckpt)!r}) ({path})")
     if path.exists():
         raise FileExistsError(f"checkpoint 已存在，拒绝覆盖: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(_checkpoint_to_dict(ckpt), path)
+
+
+def save_model_checkpoint(path: Path, ckpt: ModelCheckpoint) -> None:
+    """按 checkpoint 显式类别 dispatch 到独立 save 函数（不把 CNN 写进 MLP）。
+
+    ``CNNCheckpoint`` → ``save_cnn_checkpoint``（``model_kind="cnn1d"`` 独立
+    schema）；其余 → ``save_checkpoint``（其自带运行时类型守卫，错误类别在
+    mkdir 前拒绝）。
+    """
+    if isinstance(ckpt, CNNCheckpoint):
+        save_cnn_checkpoint(path, ckpt)
+        return
+    save_checkpoint(path, ckpt)
 
 
 def _validate_cnn_checkpoint_for_save(ckpt: CNNCheckpoint, path: Path) -> None:
