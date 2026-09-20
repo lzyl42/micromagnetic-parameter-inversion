@@ -30,8 +30,10 @@
 test_metrics.json / test_predictions.csv 的写出由 ``evaluate_model.py``
 编排（经 ``export_test_predictions``，拒绝覆盖、LF 行尾、每 psid 一行）。
 
-依赖方向：经 ``training.load_checkpoint``/``build_model`` 读 ckpt 与重建
-模型（training 禁止反向导入本模块）；split 副本经
+依赖方向：经 ``training.load_any_checkpoint`` 一次安全读取 ckpt（显式
+``model_kind`` 路由，无 fallback），并按 checkpoint 类别用
+``training.build_model`` / ``training.build_cnn_model`` 重建模型（CNN 用 ckpt
+顶层结构字段，不看嵌套 config；training 禁止反向导入本模块）；split 副本经
 ``training_data.load_split(…, split_path=…)``、dataset_meta 经
 ``training_data.load_dataset_meta(…, meta_path=…)`` 走同一加载边界（本
 模块只做 SHA/逃逸/dataset_name 核对）；metrics 计算在本模块。
@@ -168,8 +170,9 @@ def run_evaluation(
 
     编排：
 
-    1. ``ckpt = training.load_checkpoint(...)``；结构/预处理/label 全部
-       来自 ckpt（不经当前 YAML）；
+    1. ``ckpt = training.load_any_checkpoint(...)``；按显式 ``model_kind``
+       路由（MLP/CNN，无 fallback），结构/预处理/label 全部来自 ckpt（不经
+       当前 YAML）；
     2. run 内 split 副本 sha256 与 ``ckpt.split_sha256`` 核对；随后生成
        ``EvaluationProvenance``（实际 ckpt 路径、文件字节 sha256 一次
        读取、来自该 ckpt 的 split_sha256）；
@@ -185,13 +188,14 @@ def run_evaluation(
     7. 组装 ``PredictionRow`` 序列（写盘由 ``evaluate_model.py`` 编排）。
 
     Raises:
-        EvaluationError: split/meta 绑定不一致、路径逃逸、指标输入非法。
+        EvaluationError: split/meta 绑定不一致、路径逃逸、指标输入非法、
+            checkpoint 权重与所恢复模型结构不匹配（keys/尺寸）。
         DataError/PreprocessingError/TrainingError: npz 契约、逆变换非有限、
             ckpt 加载失败（原样上抛，调用方统一呈现）。
     """
     run_dir = Path(run_dir)
     ckpt_path = resolve_checkpoint_path(run_dir, checkpoint_path)
-    ckpt = training.load_checkpoint(ckpt_path)
+    ckpt = training.load_any_checkpoint(ckpt_path)
 
     samples_dir = paths.data_root() / "samples" / ckpt.config.dataset_name
     split_copy = run_dir / "split.yaml"
@@ -221,7 +225,7 @@ def run_evaluation(
     return report, tuple(rows)
 
 
-def _resolve_meta_path(ckpt: training.Checkpoint) -> Path:
+def _resolve_meta_path(ckpt: training.ModelCheckpoint) -> Path:
     """dataset_meta 锚点定位：resolve 后强制留在锚点内（防逃逸）+ SHA 核对。
 
     锚点由 ``data_root()/samples/<ckpt.config.dataset_name>/`` 推导（与
@@ -243,14 +247,33 @@ def _resolve_meta_path(ckpt: training.Checkpoint) -> Path:
 
 
 def _evaluate_test_rows(
-    ckpt: training.Checkpoint,
+    ckpt: training.ModelCheckpoint,
     samples_dir: Path,
     meta: training_data.DatasetMeta,
     split: training_data.SplitDefinition,
 ) -> list[PredictionRow]:
-    """test 成员分批推理（CPU/eval/no_grad）→ 物理单位 PredictionRow 列表。"""
-    model = training.build_model(ckpt.contract, ckpt.hidden_dims)
-    model.load_state_dict(dict(ckpt.model_state_dict))
+    """test 成员分批推理（CPU/eval/no_grad）→ 物理单位 PredictionRow 列表。
+
+    模型结构按 checkpoint 类别恢复：CNN 用 ``ckpt`` 顶层显式结构字段（不看
+    嵌套 config），MLP 沿用既有 ``hidden_dims``；``load_state_dict(strict=True)``
+    键/尺寸不匹配统一收敛为 ``EvaluationError``（不回退、不产出半成品报告）。
+    """
+    if isinstance(ckpt, training.CNNCheckpoint):
+        model = training.build_cnn_model(
+            ckpt.contract,
+            channels=ckpt.channels,
+            kernel_sizes=ckpt.kernel_sizes,
+            pool_bins=ckpt.pool_bins,
+            head_hidden_dims=ckpt.head_hidden_dims,
+        )
+    else:
+        model = training.build_model(ckpt.contract, ckpt.hidden_dims)
+    try:
+        model.load_state_dict(dict(ckpt.model_state_dict), strict=True)
+    except RuntimeError as exc:
+        raise EvaluationError(
+            f"checkpoint 权重与恢复的模型结构不匹配（keys/尺寸），拒绝评估: {exc}"
+        ) from exc
     model.to("cpu")
     model.eval()
     batch_size = int(ckpt.config.training.batch_size)

@@ -10,14 +10,22 @@
   非有限 loss/grad/pred 立即停止且不保存坏权重（best/final 只含完成
   epoch 的权重）；early stopping 使用独立 reference（仅当改善 >
   ``min_delta`` 才更新），与绝对 best（严格更低即更新）分开。
-- checkpoint：``save_checkpoint`` 落盘字典仅含 Python primitives/list/dict
-  + CPU Tensor（无 dataclass/numpy 对象），同名文件拒绝覆盖；
-  ``load_checkpoint`` 以 ``torch.load(weights_only=True, map_location="cpu")``
-  显式安全读取，校验格式版本与关键字段/契约形状后重建 dataclass（config
-  嵌套重建不经临时文件）。
+- checkpoint：``save_checkpoint``/``load_checkpoint`` 为 **MLP 专用**，
+  ``CKPT_FORMAT_VERSION`` 与既有 payload/schema 不变。CNN 使用独立的
+  ``CNNCheckpoint``/``save_cnn_checkpoint``/``load_cnn_checkpoint``
+  （``CNN_CKPT_FORMAT_VERSION`` + ``model_kind="cnn1d"``）；
+  ``load_any_checkpoint`` 单次安全读取后按显式 ``model_kind`` 路由，缺 kind
+  仅接受合法旧 MLP 形态，未知/损坏一律 ``TrainingError``、不回退。CNN save 侧
+  接受任意正常 Tensor 设备（不限定 CPU），落盘前统一 ``detach().to("cpu")``；
+  load 侧要求 CPU。落盘字典仅含 primitives/list/dict + CPU Tensor（无
+  dataclass/numpy 对象），同名文件拒绝覆盖；读取以
+  ``torch.load(weights_only=True, map_location="cpu")`` 显式安全模式。
 - 数据流：``train_model`` 返回 ``TrainingResult``（best/final checkpoint +
-  逐 epoch history）；best.pt/final.pt/metrics.json 的磁盘写出由
-  ``train_mlp.py`` 编排，checkpoint 读写仅在本模块。
+  逐 epoch history）；``run(config_path, expected_kind=...)`` 为
+  ``train_mlp.py``/``train_cnn1d.py`` 共用的编排，负责 load_config（一次）、
+  kind 早拒（读数据/建目录前）、train-only 拟合与 best.pt/final.pt/
+  metrics.json 等磁盘写出；checkpoint 读写仅在本模块。按类别落盘经
+  ``save_model_checkpoint`` dispatch（CNN 独立 schema，不写进 MLP）。
 
 依赖方向：training_config / training_data / preprocessing / runtime →
 （本模块）→ evaluation；本模块禁止导入 evaluation（评估侧反向调用
@@ -26,19 +34,28 @@
 
 from __future__ import annotations
 
+import json
 import math
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
-from torch import Tensor
+import yaml
+from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from micromagnetic_parameter_inversion import preprocessing, runtime, training_config
+from micromagnetic_parameter_inversion import (
+    paths,
+    preprocessing,
+    runtime,
+    training_config,
+    training_data,
+)
+from micromagnetic_parameter_inversion.models.cnn1d import CNN1DRegressor
 from micromagnetic_parameter_inversion.models.mlp import MLPRegressor
 from micromagnetic_parameter_inversion.preprocessing import (
     PreprocessingError,
@@ -49,8 +66,12 @@ from micromagnetic_parameter_inversion.preprocessing import (
 from micromagnetic_parameter_inversion.training_config import (
     CKPT_FORMAT_VERSION,
     ActivationName,
+    CNN1DModelConfig,
     ConfigError,
     ExperimentConfig,
+    ModelKind,
+    _require_positive_int,
+    load_config,
 )
 from micromagnetic_parameter_inversion.training_data import (
     InputContract,
@@ -67,6 +88,13 @@ type StopReason = Literal["max_epochs", "early_stopping", "numerical_failure"]
 
 _ACTIVATIONS = ("relu",)  # 首版固定 ReLU（Checkpoint.activation 显式留档）
 _N_OUTPUTS = 2  # 标准化标签列数 (alpha, ku_j_per_m3)
+_N_CHANNELS = 3  # 磁化分量数 (mx, my, mz)
+
+# CNN 独立 checkpoint 格式版本（与 MLP 的 CKPT_FORMAT_VERSION 互不相关）。
+CNN_CKPT_FORMAT_VERSION = 1
+# CNN 顶层显式结构字段（恢复权威；嵌套 config 的 model 结构仅记录）。
+_CNN_STRUCTURE_FIELDS = ("channels", "kernel_sizes", "pool_bins", "head_hidden_dims")
+_MODEL_COMPONENT_ORDER = ("mx", "my", "mz")
 
 
 class TrainingError(RuntimeError):
@@ -98,6 +126,7 @@ class EpochMetrics:
     val_loss: float  # val 集加权平均标准化 MSE（best 与 early stopping 判据）
 
 
+# MLP 专用 checkpoint；CNN 见下方 CNNCheckpoint（schema 完全独立，无迁移）。
 @dataclass(frozen=True, eq=False)
 class Checkpoint:
     """best.pt / final.pt 的 schema（仅凭 ckpt + npz 即可独立推理）。
@@ -131,13 +160,50 @@ class Checkpoint:
     numpy_version: str = ""
 
 
+@dataclass(frozen=True, eq=False)
+class CNNCheckpoint:
+    """CNN 独立 checkpoint schema（与 ``Checkpoint`` 字段同名同义，仅结构字段不同）。
+
+    与 ``Checkpoint`` 完全独立：以**顶层显式结构字段**为恢复权威，嵌套
+    ``config`` 仅记录（不得覆盖结构）；``model_kind="cnn1d"`` 只在 payload 中
+    体现，dataclass 不额外接收该参数。评估侧 ``load_state_dict(strict=True)``
+    负责键/形状匹配，本模块不预构模型（避免 RNG 副作用）。
+    """
+
+    ckpt_format_version: int  # 写出时的 CNN schema 版本（CNN_CKPT_FORMAT_VERSION）
+    model_state_dict: StateDict  # 模型权重（磁盘形态为 CPU Tensor 字典）
+    channels: tuple[int, ...]  # 显式结构：各 Conv1d 层输出通道数
+    kernel_sizes: tuple[int, ...]  # 显式结构：各层卷积核长度（奇数）
+    pool_bins: int  # 显式结构：AdaptiveAvgPool1d 输出 bin 数
+    head_hidden_dims: tuple[int, ...]  # 显式结构：回归头隐层宽度（可空）
+    activation: ActivationName  # 激活函数显式留档（固定 "relu"）
+    contract: InputContract  # 输入契约：pulse 顺序、T、分量序、t_s
+    preprocessing: PreprocessingState  # 预处理状态（train-only 拟合）
+    seed: int  # training.seed
+    config: ExperimentConfig  # 生效配置副本（仅记录；model 须为 CNN1DModelConfig）
+    dataset_meta_relpath: str  # 相对锚点 data_root()/samples/<dataset>/ 的路径
+    dataset_meta_sha256: str  # dataset_meta 内容指纹（轻量溯源）
+    split_sha256: str  # run 内 split 副本 sha256（split 绑定）
+    best_val_loss: float | None  # best.pt 必有；final.pt 可为 None
+    git_sha: str | None = None  # 可得时记录；与 dirty 标记相互独立
+    git_dirty: bool | None = None  # 工作区是否有未提交变更（可得时记录）
+    torch_version: str = ""
+    numpy_version: str = ""
+
+
+# 显式模型类别路由结果（load_any_checkpoint 返回类型）。
+type ModelCheckpoint = Checkpoint | CNNCheckpoint
+
+
 @dataclass(frozen=True)
 class TrainingResult:
     """``train_model`` 的返回值：入口脚本据此编排产物写出。
 
-    ``best_checkpoint`` → best.pt（best_val_loss 必填，绝对最优权重）；
-    ``final_checkpoint`` → final.pt（实际最后完成 epoch 的权重，
-    best_val_loss 为 None）；``history`` → metrics.json 的逐 epoch MSE。
+    ``best_checkpoint``/``final_checkpoint`` 为 ``ModelCheckpoint``
+    （MLP ``Checkpoint`` 或 CNN ``CNNCheckpoint``，由 ``config.model`` 类别
+    决定，schema 不同）：``best_checkpoint`` → best.pt（best_val_loss 必填，
+    绝对最优权重）；``final_checkpoint`` → final.pt（实际最后完成 epoch 的
+    权重，best_val_loss 为 None）；``history`` → metrics.json 的逐 epoch MSE。
     ``stop_reason``/``stop_epoch``/``detail`` 记录停止状态（ckpt 格式版本
     不变，停止元数据仅存于 TrainingResult 与 metrics.json）：
 
@@ -148,8 +214,8 @@ class TrainingResult:
       CLI 须以非零退出并写失败状态 metrics（不打印训练完成）。
     """
 
-    best_checkpoint: Checkpoint
-    final_checkpoint: Checkpoint
+    best_checkpoint: ModelCheckpoint
+    final_checkpoint: ModelCheckpoint
     history: tuple[EpochMetrics, ...]
     stop_reason: StopReason
     stop_epoch: int  # 触发停止的 epoch（1-based）
@@ -172,6 +238,7 @@ def make_data_generator(seed: int) -> torch.Generator:
     return torch.Generator().manual_seed(seed)
 
 
+# MLP 工厂（签名/行为不变）；CNN 用下方 build_cnn_model。
 def build_model(contract: InputContract, hidden_dims: tuple[int, ...]) -> MLPRegressor:
     """按输入契约与隐层宽度构建 MLP（激活固定 ReLU，见 MLPRegressor）。
 
@@ -180,6 +247,32 @@ def build_model(contract: InputContract, hidden_dims: tuple[int, ...]) -> MLPReg
     ``build_model(ckpt.contract, ckpt.hidden_dims)`` 恢复结构。
     """
     return MLPRegressor(input_shape=contract.input_shape, hidden_dims=tuple(hidden_dims))
+
+
+def build_cnn_model(
+    contract: InputContract,
+    *,
+    channels: tuple[int, ...],
+    kernel_sizes: tuple[int, ...],
+    pool_bins: int,
+    head_hidden_dims: tuple[int, ...],
+) -> CNN1DRegressor:
+    """按输入契约与显式结构构建 CNN1DRegressor（无默认超参）。
+
+    先严格校验契约语义（分量序、pulse 顺序、T/C/t_s 一致且 t_s 递增），再交
+    模型构造器做结构校验（结构非法由 ``CNN1DRegressor`` 抛 ``ValueError``）。
+
+    Raises:
+        TrainingError: 契约非法。
+    """
+    _validate_cnn_contract(contract, "build_cnn_model")
+    return CNN1DRegressor(
+        input_shape=contract.input_shape,
+        channels=tuple(channels),
+        kernel_sizes=tuple(kernel_sizes),
+        pool_bins=pool_bins,
+        head_hidden_dims=tuple(head_hidden_dims),
+    )
 
 
 def _batch_to_device(
@@ -193,7 +286,7 @@ def _batch_to_device(
 
 
 def run_validation(
-    model: MLPRegressor,
+    model: nn.Module,
     loader: DataLoader[SampleItem],
     state: PreprocessingState,
     device: str,
@@ -234,7 +327,7 @@ def run_validation(
 
 
 def _train_one_epoch(
-    model: MLPRegressor,
+    model: nn.Module,
     loader: DataLoader[SampleItem],
     optimizer: torch.optim.Optimizer,
     state: PreprocessingState,
@@ -276,7 +369,7 @@ def _train_one_epoch(
     return aggregate if math.isfinite(aggregate) else None
 
 
-def _clone_state_dict(model: MLPRegressor) -> dict[str, Tensor]:
+def _clone_state_dict(model: nn.Module) -> dict[str, Tensor]:
     """state_dict 的 CPU 深拷贝（后续训练不再影响已保存权重）。"""
     return {name: value.detach().to("cpu").clone() for name, value in model.state_dict().items()}
 
@@ -308,6 +401,8 @@ def _git_info() -> tuple[str | None, bool | None]:
     return sha, bool(status.strip())
 
 
+# 共享训练编排见下方 ``run``（与 train_model 同模块、互不 import）；入口
+# 脚本仅负责声明 expected_kind 并转发。
 def train_model(
     config: ExperimentConfig,
     train_set: TrajectoryDataset,
@@ -331,21 +426,37 @@ def train_model(
             meta 路径（默认 "dataset_meta.yaml"）。
         dataset_meta_sha256: dataset_meta 实际文件指纹；None → 记 ""。
 
-    编排：``set_seed``（先于模型构造）→ ``build_model`` →
-    ``runtime.select_device`` → DataLoader（train shuffle=True +
-    seeded generator；num_workers=0）→ Adam → 逐 epoch
+    编排：``set_seed``（先于模型构造）→ 按 ``config.model`` 类别
+    （``ModelConfig`` → ``build_model``；``CNN1DModelConfig`` →
+    ``build_cnn_model``）构造模型 → ``runtime.select_device`` → DataLoader
+    （train shuffle=True + seeded generator；num_workers=0）→ Adam → 逐 epoch
     ``_train_one_epoch`` + ``run_validation`` → best（绝对最低，严格小于
     才更新，CPU clone）与 early stopping（独立 reference，仅改善 >
     min_delta 才更新）分开推进 → 非有限 loss/grad/pred/聚合立即停止且不
     保存坏权重（原因记入 ``stop_reason``/``stop_epoch``/``detail``，不吞
-    掉）→ 返回 ``TrainingResult``（磁盘写出由 ``train_mlp.py`` 编排）。
+    掉）→ 返回 ``TrainingResult``（磁盘写出由 ``run`` 编排）。
 
     Raises:
         TrainingError: 首个 epoch 即因数值失败停止（无可保存权重）；
-            异常携带 ``epoch``/``detail``。
+            异常携带 ``epoch``/``detail``；或模型结构非法（ValueError 领域
+            转换为 TrainingError）。
     """
+    model_config = config.model
     set_seed(config.training.seed)  # 先于模型构造：权重初始化可复现
-    model = build_model(contract, config.model.hidden_dims)
+    model: nn.Module
+    try:
+        if isinstance(model_config, CNN1DModelConfig):
+            model = build_cnn_model(
+                contract,
+                channels=tuple(model_config.channels),
+                kernel_sizes=tuple(model_config.kernel_sizes),
+                pool_bins=int(model_config.pool_bins),
+                head_hidden_dims=tuple(model_config.head_hidden_dims),
+            )
+        else:
+            model = build_model(contract, model_config.hidden_dims)
+    except ValueError as exc:  # 模型层结构校验失败（如 pool_bins > T）→ 领域错误
+        raise TrainingError(f"模型结构非法: {exc}") from exc
     device = runtime.select_device(config.training.device)
     model.to(device)
     train_loader: DataLoader[SampleItem] = DataLoader(
@@ -419,9 +530,7 @@ def train_model(
         )
 
     git_sha, git_dirty = _git_info()
-    common: dict[str, Any] = dict(
-        ckpt_format_version=CKPT_FORMAT_VERSION,
-        hidden_dims=tuple(config.model.hidden_dims),
+    common_meta: dict[str, Any] = dict(
         activation="relu",
         contract=contract,
         preprocessing=state,
@@ -435,7 +544,26 @@ def train_model(
         torch_version=torch.__version__,
         numpy_version=np.__version__,
     )
-    best_checkpoint = Checkpoint(model_state_dict=best_state, best_val_loss=best_val, **common)
+    best_checkpoint: ModelCheckpoint
+    if isinstance(model_config, CNN1DModelConfig):
+        best_checkpoint = CNNCheckpoint(
+            ckpt_format_version=CNN_CKPT_FORMAT_VERSION,
+            model_state_dict=best_state,
+            channels=tuple(model_config.channels),
+            kernel_sizes=tuple(model_config.kernel_sizes),
+            pool_bins=int(model_config.pool_bins),
+            head_hidden_dims=tuple(model_config.head_hidden_dims),
+            best_val_loss=best_val,
+            **common_meta,
+        )
+    else:
+        best_checkpoint = Checkpoint(
+            ckpt_format_version=CKPT_FORMAT_VERSION,
+            model_state_dict=best_state,
+            hidden_dims=tuple(model_config.hidden_dims),
+            best_val_loss=best_val,
+            **common_meta,
+        )
     final_checkpoint = replace(best_checkpoint, model_state_dict=final_state, best_val_loss=None)
     return TrainingResult(
         best_checkpoint=best_checkpoint,
@@ -447,30 +575,292 @@ def train_model(
     )
 
 
+# --- 共享训练编排：train_mlp.py / train_cnn1d.py 的唯一实现 ------------------
+
+_EXPECTED_KINDS: frozenset[str] = frozenset({"mlp", "cnn1d"})
+
+
+def _resolve_expected_kind(expected_kind: object) -> ModelKind:
+    """入口声明的模型类别：仅接受 ``"mlp"``/``"cnn1d"``，否则 ConfigError。"""
+    if not isinstance(expected_kind, str) or expected_kind not in _EXPECTED_KINDS:
+        raise ConfigError(f"expected_kind 非法: {expected_kind!r}（须为 'mlp' 或 'cnn1d'）")
+    return cast(ModelKind, expected_kind)
+
+
+def _freeze_contract(train_set: TrajectoryDataset) -> InputContract:
+    """自首个**缓存**样本冻结输入契约（不回磁盘）；train 其余成员在缓存内校验。"""
+    first = train_set.samples[0]
+    contract = InputContract(
+        pulse_order=first.pulse_ids,
+        n_time_steps=int(first.x.shape[1]),
+        t_s=first.t_s,
+    )
+    train_set.validate_contract(contract)
+    return contract
+
+
+def _metrics_payload(
+    history: Sequence[EpochMetrics],
+    best_val_loss: float | None,
+    stop_reason: str,
+    stop_epoch: int,
+    detail: str | None,
+) -> dict[str, Any]:
+    """metrics.json 文档：history + best val + 停止状态（无 test 评估；有限值）。"""
+    return {
+        "history": [
+            {"epoch": m.epoch, "train_loss": m.train_loss, "val_loss": m.val_loss} for m in history
+        ],
+        "best_val_loss": best_val_loss,
+        "best_epoch": max(history, key=lambda m: -m.val_loss).epoch if history else None,
+        "stop_reason": stop_reason,
+        "stop_epoch": stop_epoch,
+        "detail": detail,
+    }
+
+
+def _write_metrics(path: Path, result: TrainingResult) -> None:
+    """metrics.json：逐 epoch history + best val + 停止状态（JSON 有限值）。"""
+    payload = _metrics_payload(
+        result.history,
+        result.best_checkpoint.best_val_loss,
+        result.stop_reason,
+        result.stop_epoch,
+        result.detail,
+    )
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
+    )
+
+
+def _write_failure_metrics(path: Path, error: TrainingError) -> None:
+    """首 epoch 数值失败的失败状态 metrics（无 checkpoint 可保留）。"""
+    payload = _metrics_payload(
+        [],
+        None,
+        "numerical_failure",
+        error.epoch if error.epoch is not None else 0,
+        error.detail if error.detail is not None else str(error),
+    )
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
+    )
+
+
+def run(config_path: Path, *, expected_kind: ModelKind) -> Path:
+    """共享训练编排：配置 → 样本/划分 → train_model → 产物，返回 run 目录。
+
+    与入口无关的同一实现，``expected_kind`` 声明本次入口要求的模型类别：
+
+    1. ``load_config(config_path)`` **仅一次**；随后立即校验
+       ``expected_kind`` 合法且 ``config.model.kind`` 匹配——**在**调用
+       ``paths.data_root()``、读取样本或创建输出目录之前，不匹配抛
+       ``ConfigError``；
+    2. 输出目录：``config.output_dir`` 非 null 时原样 ``Path(...)``（相对路径
+       按当前工作目录解析）；否则 ``output_root()/training/<kind>/<dataset>/
+       <run_name>``；已存在则 ``FileExistsError``（先于训练）；
+    3. 同一冻结 split + dataset_meta 定位（``data_root()/samples/<dataset>/``）；
+       仅构造 train/val（test 不加载、不参与选模）；
+    4. ``_freeze_contract`` + ``preprocessing.fit``（**仅 train 组**；本 run
+       自行拟合，不读取任何既有 ckpt/预处理统计量）；
+    5. split 副本 raw 字节 + SHA、dataset_meta SHA 后调用 ``train_model``；
+    6. run 目录在训练返回后创建，按序写出 split 副本（raw 字节）、
+       ``config_resolved.yaml``、``preprocessing.yaml``、``metrics.json``、
+       ``best.pt``/``final.pt``（经 ``save_model_checkpoint`` 按类别 dispatch）。
+
+    失败语义（保持原 MLP 约定）：首 epoch 数值失败（``TrainingError`` 带
+    ``epoch``）→ 创建 run 目录并只写失败状态 ``metrics.json`` 后上抛；其余
+    领域错误（kind/结构/数据）在创建目录前上抛，不留产物。训练返回后再因
+    ``numerical_failure`` 停止（已有有效 best/final 快照）→ 已写产物后抛
+    ``TrainingError``（调用方非零退出、不打印完成）。
+
+    Raises:
+        ConfigError: 配置非法、``expected_kind`` 非法或与配置类别不匹配。
+        training_data.DataError / PreprocessingError: 样本/split/契约问题。
+        FileExistsError: run 目录已存在。
+        TrainingError: 模型结构非法或训练数值失败。
+    """
+    config = load_config(config_path)
+    kind = _resolve_expected_kind(expected_kind)
+    if config.model.kind != kind:
+        raise ConfigError(
+            f"训练入口要求 model.kind={kind!r}，但配置为 {config.model.kind!r}（{config_path}）"
+        )
+
+    samples_dir = paths.data_root() / "samples" / config.dataset_name
+    if not samples_dir.is_dir():
+        raise training_data.DataError(f"样本目录不存在: {samples_dir}")
+    meta = training_data.load_dataset_meta(samples_dir)
+    split = training_data.load_split(samples_dir, meta)
+    # 训练契约要求 train/val 非空（test 允许为空：不参与训练也不评估）。
+    if not split.train:
+        raise training_data.DataError(
+            f"split.train 为空：训练至少需要 1 个 train 成员 "
+            f"(split 副本位于 {samples_dir / 'split.yaml'})"
+        )
+    if not split.val:
+        raise training_data.DataError(
+            f"split.val 为空：early stopping 与 best 选择需要 val 成员 "
+            f"(split 副本位于 {samples_dir / 'split.yaml'})"
+        )
+
+    output_dir = (
+        Path(config.output_dir)
+        if config.output_dir is not None
+        else paths.output_root() / "training" / kind / config.dataset_name / config.run_name
+    )
+    if output_dir.exists():
+        raise FileExistsError(f"run 目录已存在，拒绝覆盖: {output_dir}")
+
+    # 仅构造 train/val；test 不参与任何调参与模型选择，也不加载。
+    # 每 npz 恰好读盘一次：train 先无契约加载并缓存，契约自首个缓存样本
+    # 冻结后在缓存内校验；val 一次读盘即按契约验证。
+    train_set = TrajectoryDataset(samples_dir, meta, split.train)
+    contract = _freeze_contract(train_set)
+    val_set = TrajectoryDataset(samples_dir, meta, split.val, contract=contract)
+    state = preprocessing.fit(train_set, config.preprocessing, config.label)
+
+    split_source = samples_dir / "split.yaml"
+    split_bytes = split_source.read_bytes()
+    split_sha256 = training_data.sha256_file(split_source)
+    meta_source = samples_dir / "dataset_meta.yaml"
+    meta_sha256 = training_data.sha256_file(meta_source)
+
+    try:
+        result = train_model(
+            config,
+            train_set,
+            val_set,
+            state,
+            contract,
+            split_sha256,
+            dataset_meta_relpath=meta_source.name,
+            dataset_meta_sha256=meta_sha256,
+        )
+    except TrainingError as exc:
+        # 仅首 epoch 数值失败（带 epoch）无权重可保留 → 写失败状态 metrics；
+        # 结构/契约类错误（epoch 为 None）在创建目录前上抛，不留产物。
+        if exc.epoch is not None:
+            output_dir.mkdir(parents=True)
+            _write_failure_metrics(output_dir / "metrics.json", exc)
+        raise
+
+    # run 目录在训练返回后创建；此后失败可留部分产物（不事务）。
+    output_dir.mkdir(parents=True)
+    (output_dir / "split.yaml").write_bytes(split_bytes)
+    (output_dir / "config_resolved.yaml").write_text(
+        yaml.safe_dump(
+            training_config.config_to_mapping(config), sort_keys=False, allow_unicode=True
+        ),
+        encoding="utf-8",
+    )
+    (output_dir / "preprocessing.yaml").write_text(
+        yaml.safe_dump(preprocessing.state_to_mapping(state), sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    _write_metrics(output_dir / "metrics.json", result)
+    save_model_checkpoint(output_dir / "best.pt", result.best_checkpoint)
+    save_model_checkpoint(output_dir / "final.pt", result.final_checkpoint)
+
+    if result.stop_reason == "numerical_failure":
+        # 有效快照（上一完整 epoch）已保存，但本次训练视为失败：非零退出、
+        # 不打印训练完成。
+        raise TrainingError(
+            f"训练因数值失败停止于 epoch {result.stop_epoch}: {result.detail}",
+            epoch=result.stop_epoch,
+            detail=result.detail,
+        )
+
+    print(f"训练完成: {output_dir}")
+    print(f"  epochs={len(result.history)}; best_val_loss={result.best_checkpoint.best_val_loss!r}")
+    print(f"  stop: {result.stop_reason} @ epoch {result.stop_epoch}")
+    return output_dir
+
+
 def save_checkpoint(path: Path, ckpt: Checkpoint) -> None:
     """``torch.save`` 序列化 Checkpoint；同名文件已存在 → FileExistsError。
 
     磁盘字典仅含 Python primitives/list/dict + CPU Tensor（dataclass 与
     numpy 对象一律展开/转换，见 ``_checkpoint_to_dict``）；权重张量落盘前
-    detach + CPU + clone。
+    detach + CPU + clone。运行时类别守卫：非 ``Checkpoint`` 在 mkdir/写盘
+    前拒绝（``TrainingError``），不误写 MLP schema。
     """
+    if not isinstance(ckpt, Checkpoint):
+        raise TrainingError(f"save_checkpoint 需要 MLP Checkpoint (got {type(ckpt)!r}) ({path})")
     if path.exists():
         raise FileExistsError(f"checkpoint 已存在，拒绝覆盖: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(_checkpoint_to_dict(ckpt), path)
 
 
-def load_checkpoint(path: Path) -> Checkpoint:
-    """安全读取 Checkpoint（evaluation 侧恢复契约的唯一入口）。
+def save_model_checkpoint(path: Path, ckpt: ModelCheckpoint) -> None:
+    """按 checkpoint 显式类别 dispatch 到独立 save 函数（不把 CNN 写进 MLP）。
 
-    ``torch.load(weights_only=True, map_location="cpu")`` 显式安全模式；
-    校验格式版本、必需键与关键字段/契约形状（t_s 长度、[P,1,3]/[2] 统计
-    量形状、state_dict 为 CPU 张量字典）后重建嵌套 dataclass。
-
-    Raises:
-        FileNotFoundError: 文件不存在。
-        TrainingError: 格式版本不符、键缺失或形状/类型损坏。
+    ``CNNCheckpoint`` → ``save_cnn_checkpoint``（``model_kind="cnn1d"`` 独立
+    schema）；其余 → ``save_checkpoint``（其自带运行时类型守卫，错误类别在
+    mkdir 前拒绝）。
     """
+    if isinstance(ckpt, CNNCheckpoint):
+        save_cnn_checkpoint(path, ckpt)
+        return
+    save_checkpoint(path, ckpt)
+
+
+def _validate_cnn_checkpoint_for_save(ckpt: CNNCheckpoint, path: Path) -> None:
+    """save 前校验：明显错误（kind/version/结构/config 类型）在 mkdir/write 前拒绝。"""
+    if not isinstance(ckpt, CNNCheckpoint):
+        raise TrainingError(f"save_cnn_checkpoint 需要 CNNCheckpoint (got {type(ckpt)!r}) ({path})")
+    _require_ckpt_version(ckpt.ckpt_format_version, CNN_CKPT_FORMAT_VERSION, path)
+    if ckpt.activation not in _ACTIVATIONS:
+        raise TrainingError(f"未知激活函数 {ckpt.activation!r} ({path})")
+    _validate_cnn_contract(ckpt.contract, path)
+    _cnn_structure_from_values(
+        ckpt.channels,
+        ckpt.kernel_sizes,
+        ckpt.pool_bins,
+        ckpt.head_hidden_dims,
+        ckpt.contract.n_time_steps,
+        path,
+    )
+    if not isinstance(ckpt.config.model, CNN1DModelConfig):
+        raise TrainingError(f"CNN checkpoint 的 config.model 须为 CNN1DModelConfig ({path})")
+    # 嵌套 config 往返：inf/nan 等非法数值（如 batch_size=inf 经 int 抛
+    # OverflowError）在 mkdir/写盘前转为 TrainingError，不写坏数据。
+    try:
+        training_config.config_from_mapping(training_config.config_to_mapping(ckpt.config))
+    except (ConfigError, OverflowError, TypeError, ValueError) as exc:
+        raise TrainingError(f"CNN checkpoint 的 config 无法往返 ({path}): {exc}") from exc
+    # save 侧只做结构校验（允许任意正常 Tensor 设备/requires_grad）；落盘统一转
+    # CPU 并 detach，见 _cnn_checkpoint_to_dict。
+    _cnn_state_dict_structure(ckpt.model_state_dict, path)
+    _validate_cnn_preprocessing(ckpt.preprocessing, path)
+    seed = ckpt.seed
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise TrainingError(f"seed 须为非负整数 (got {seed!r}) ({path})")
+    best_val_loss = ckpt.best_val_loss
+    if best_val_loss is not None and (
+        isinstance(best_val_loss, bool)
+        or not isinstance(best_val_loss, (int, float))
+        or not math.isfinite(float(best_val_loss))
+    ):
+        raise TrainingError(f"best_val_loss 须为 null 或有限数值 (got {best_val_loss!r}) ({path})")
+
+
+def save_cnn_checkpoint(path: Path, ckpt: CNNCheckpoint) -> None:
+    """``torch.save`` 序列化 CNNCheckpoint；同名文件已存在 → FileExistsError。
+
+    先在 mkdir/写盘前拒绝明显错误（版本/结构/config/state_dict）；落盘字典仅含
+    primitives/list/dict + CPU Tensor（权重 detach + CPU + clone）。
+    """
+    if path.exists():
+        raise FileExistsError(f"checkpoint 已存在，拒绝覆盖: {path}")
+    _validate_cnn_checkpoint_for_save(ckpt, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(_cnn_checkpoint_to_dict(ckpt), path)
+
+
+def _read_checkpoint_payload(path: Path) -> dict[str, Any]:
+    """单次安全读取 checkpoint payload（weights_only、CPU、须为 dict）。"""
     if not path.is_file():
         raise FileNotFoundError(f"checkpoint 不存在: {path}")
     try:
@@ -479,7 +869,18 @@ def load_checkpoint(path: Path) -> Checkpoint:
         raise TrainingError(f"checkpoint 加载失败 ({path}): {exc}") from exc
     if not isinstance(payload, dict):
         raise TrainingError(f"checkpoint 内容须为映射 (got {type(payload)!r}) ({path})")
-    required = {
+    return payload
+
+
+def _require_ckpt_version(value: object, expected: int, context: object) -> int:
+    """格式版本：非 bool 正整数且须等于 expected，否则 TrainingError。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        raise TrainingError(f"ckpt_format_version 不兼容: {value!r} != {expected} ({context})")
+    return value
+
+
+_MLP_CKPT_REQUIRED_KEYS = frozenset(
+    {
         "ckpt_format_version",
         "model_state_dict",
         "hidden_dims",
@@ -493,7 +894,20 @@ def load_checkpoint(path: Path) -> Checkpoint:
         "split_sha256",
         "best_val_loss",
     }
-    missing = sorted(required.difference(payload))
+)
+
+
+def _mlp_checkpoint_from_payload(payload: dict[str, Any], path: Path) -> Checkpoint:
+    """MLP payload → Checkpoint（原解析主体；仅搬家 + 类别格式守卫）。
+
+    拒绝任何 ``model_kind`` 字段与 CNN 结构字段：MLP ckpt 不使用类别键，出现
+    即视为类别错配。
+    """
+    if "model_kind" in payload:
+        raise TrainingError(f"MLP checkpoint 不接受 model_kind 字段 ({path})")
+    if any(field in payload for field in _CNN_STRUCTURE_FIELDS):
+        raise TrainingError(f"MLP checkpoint 不接受 CNN 结构字段 ({path})")
+    missing = sorted(_MLP_CKPT_REQUIRED_KEYS.difference(payload))
     if missing:
         raise TrainingError(f"checkpoint 缺失键 {missing} ({path})")
     if payload["ckpt_format_version"] != CKPT_FORMAT_VERSION:
@@ -543,6 +957,43 @@ def load_checkpoint(path: Path) -> Checkpoint:
     )
 
 
+def load_checkpoint(path: Path) -> Checkpoint:
+    """安全读取 **MLP** Checkpoint（evaluation 侧 MLP 恢复入口）。
+
+    拒绝携带 ``model_kind`` 或 CNN 结构字段的文件（类别错配）；CNN 请用
+    ``load_cnn_checkpoint``，需要自动路由用 ``load_any_checkpoint``。
+
+    Raises:
+        FileNotFoundError: 文件不存在。
+        TrainingError: 格式版本不符、键缺失或形状/类型损坏。
+    """
+    return _mlp_checkpoint_from_payload(_read_checkpoint_payload(path), path)
+
+
+def load_cnn_checkpoint(path: Path) -> CNNCheckpoint:
+    """安全读取 **CNN** checkpoint（要求显式 ``model_kind="cnn1d"``）。
+
+    不接受 MLP ckpt、未知 kind 或缺失 kind；损坏一律 ``TrainingError``，无 fallback。
+    """
+    return _cnn_checkpoint_from_payload(_read_checkpoint_payload(path), path)
+
+
+def load_any_checkpoint(path: Path) -> ModelCheckpoint:
+    """单次安全读取后按显式 ``model_kind`` 路由：``cnn1d``→CNN；缺 kind→仅合法旧 MLP。
+
+    其它显式 kind（含 ``"mlp"``）、未知/null/坏值均 ``TrainingError``；缺 kind
+    但残留任意 CNN 结构字段同样拒绝，不猜测、不回退。
+    """
+    payload = _read_checkpoint_payload(path)
+    if "model_kind" in payload:
+        if payload["model_kind"] == "cnn1d":
+            return _cnn_checkpoint_from_payload(payload, path)
+        raise TrainingError(f"不支持的 model_kind: {payload['model_kind']!r} ({path})")
+    if any(field in payload for field in _CNN_STRUCTURE_FIELDS):
+        raise TrainingError(f"缺 model_kind 却残留 CNN 结构字段，拒绝按 MLP 读取 ({path})")
+    return _mlp_checkpoint_from_payload(payload, path)
+
+
 def _contract_from_dict(raw: Any, path: Path) -> InputContract:
     """契约重建 + 形状校验（t_s 长度 == T、通道恒 3、P 与 pulse 顺序一致）。"""
     if not isinstance(raw, Mapping):
@@ -581,6 +1032,26 @@ def _preprocessing_from_dict(raw: Any, n_pulse: int, path: Path) -> Preprocessin
     return state
 
 
+def _validate_cnn_preprocessing(state: PreprocessingState, path: Path) -> None:
+    """CNN 预处理数值边界（仅 CNN 边界，旧 MLP schema/loader 不变）。
+
+    mean（x/y）须有限；effective scale（x/y std）须有限且严格 > 0。零方差位置
+    由拟合侧写成 1.0，故 1.0 合法；0/负数/inf/NaN 一律拒（不写坏数据）。
+    """
+    x_mean = np.asarray(state.x_stats.mean, dtype=np.float64)
+    x_std = np.asarray(state.x_stats.std, dtype=np.float64)
+    y_mean = np.asarray(state.y_stats.y_mean, dtype=np.float64)
+    y_std = np.asarray(state.y_stats.y_std, dtype=np.float64)
+    if not bool(np.isfinite(x_mean).all()):
+        raise TrainingError(f"preprocessing x mean 含非有限值 ({path})")
+    if not bool(np.isfinite(x_std).all()) or bool((x_std <= 0.0).any()):
+        raise TrainingError(f"preprocessing x effective scale 须为有限正值 ({path})")
+    if not bool(np.isfinite(y_mean).all()):
+        raise TrainingError(f"preprocessing y mean 含非有限值 ({path})")
+    if not bool(np.isfinite(y_std).all()) or bool((y_std <= 0.0).any()):
+        raise TrainingError(f"preprocessing y effective scale 须为有限正值 ({path})")
+
+
 def _config_from_dict(raw: Any, path: Path) -> ExperimentConfig:
     """ckpt 配置副本重建：委托 training_config.config_from_mapping（属主）；
     ConfigError 在 ckpt 边界包裹为 TrainingError（不反向依赖 evaluation，
@@ -588,8 +1059,271 @@ def _config_from_dict(raw: Any, path: Path) -> ExperimentConfig:
     """
     try:
         return training_config.config_from_mapping(raw)
-    except ConfigError as exc:
+    except (ConfigError, OverflowError) as exc:
         raise TrainingError(f"config 副本损坏 ({path}): {exc}") from exc
+
+
+def _cnn_state_dict_structure(raw: Any, path: Path) -> dict[str, Tensor]:
+    """CNN state_dict 结构校验（非空映射、str 键、Tensor 值）；不限定设备。
+
+    save 侧使用：允许任意正常 Tensor 设备（如 CUDA/requires_grad），落盘前由
+    ``_cnn_checkpoint_to_dict`` 统一 ``detach().to("cpu").clone()``。
+    """
+    if not isinstance(raw, Mapping) or not raw:
+        raise TrainingError(f"model_state_dict 须为非空映射 ({path})")
+    state_dict: dict[str, Tensor] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str):
+            raise TrainingError(f"model_state_dict 键须为字符串 (got {type(name)!r}) ({path})")
+        if not isinstance(value, Tensor):
+            raise TrainingError(f"model_state_dict 含非张量项 ({path})")
+        state_dict[name] = value
+    return state_dict
+
+
+def _cnn_state_dict_from_payload(raw: Any, path: Path) -> dict[str, Tensor]:
+    """CNN 加载边界：结构校验 + 必须为 CPU 张量（损坏统一 TrainingError）。"""
+    state_dict = _cnn_state_dict_structure(raw, path)
+    for value in state_dict.values():
+        if value.device.type != "cpu":
+            raise TrainingError(f"model_state_dict 含非 CPU 张量 ({path})")
+    return state_dict
+
+
+def _cnn_positive_int(value: object, field: str) -> int:
+    """正整数（拒 bool/float/string）；ConfigError 统一包为 TrainingError。"""
+    try:
+        return _require_positive_int(value, field)
+    except ConfigError as exc:
+        raise TrainingError(str(exc)) from exc
+
+
+def _cnn_int_sequence(value: object, field: str, *, allow_empty: bool) -> tuple[int, ...]:
+    """CNN 结构整数序列：接受 tuple/list，拒 bool/float/string 与非正元素。"""
+    if isinstance(value, (str, bytes)) or not isinstance(value, (tuple, list)):
+        raise TrainingError(f"{field}: 必须为整数序列 (got {value!r})")
+    sequence = tuple(value)
+    if not sequence and not allow_empty:
+        raise TrainingError(f"{field}: 必须为非空整数序列 (got {value!r})")
+    for index, item in enumerate(sequence):
+        _cnn_positive_int(item, f"{field}[{index}]")
+    return sequence
+
+
+def _cnn_structure_from_values(
+    channels: object,
+    kernel_sizes: object,
+    pool_bins: object,
+    head_hidden_dims: object,
+    n_time_steps: int,
+    context: object,
+) -> tuple[tuple[int, ...], tuple[int, ...], int, tuple[int, ...]]:
+    """CNN 结构严格校验（等价于配置层规范：拒 bool/float/string 蒙混）。"""
+    normalized_channels = _cnn_int_sequence(channels, f"{context}: channels", allow_empty=False)
+    normalized_kernels = _cnn_int_sequence(
+        kernel_sizes, f"{context}: kernel_sizes", allow_empty=False
+    )
+    normalized_pool_bins = _cnn_positive_int(pool_bins, f"{context}: pool_bins")
+    normalized_head = _cnn_int_sequence(
+        head_hidden_dims, f"{context}: head_hidden_dims", allow_empty=True
+    )
+    if len(normalized_kernels) != len(normalized_channels):
+        raise TrainingError(
+            f"kernel_sizes 层数须与 channels 相同 "
+            f"(got {len(normalized_kernels)} vs {len(normalized_channels)}) ({context})"
+        )
+    if any(kernel % 2 == 0 for kernel in normalized_kernels):
+        raise TrainingError(
+            f"kernel_sizes 须全为奇数 (got {list(normalized_kernels)!r}) ({context})"
+        )
+    if normalized_pool_bins > n_time_steps:
+        raise TrainingError(
+            f"pool_bins 须 <= T={n_time_steps} (got {normalized_pool_bins}) ({context})"
+        )
+    return normalized_channels, normalized_kernels, normalized_pool_bins, normalized_head
+
+
+def _validate_cnn_contract(contract: InputContract, context: object) -> None:
+    """CNN 契约语义校验：分量序、pulse 顺序、T/C/t_s 一致且 t_s 严格递增。"""
+    if not isinstance(contract, InputContract):
+        raise TrainingError(f"contract 须为 InputContract (got {type(contract)!r}) ({context})")
+    if tuple(contract.component_order) != _MODEL_COMPONENT_ORDER:
+        raise TrainingError(
+            f"contract 分量序须为 {_MODEL_COMPONENT_ORDER} "
+            f"(got {contract.component_order!r}) ({context})"
+        )
+    pulse_order = tuple(contract.pulse_order)
+    if (
+        not pulse_order
+        or any(not isinstance(p, str) or not p for p in pulse_order)
+        or len(set(pulse_order)) != len(pulse_order)
+    ):
+        raise TrainingError(f"contract pulse_order 须为非空唯一非空字符串序列 ({context})")
+    n_time = contract.n_time_steps
+    if isinstance(n_time, bool) or not isinstance(n_time, int) or n_time <= 0:
+        raise TrainingError(f"contract n_time_steps 须为正整数 (got {n_time!r}) ({context})")
+    if contract.n_channels != _N_CHANNELS:
+        raise TrainingError(
+            f"contract 通道数须为 {_N_CHANNELS} (got {contract.n_channels}) ({context})"
+        )
+    t_s = np.asarray(contract.t_s, dtype=np.float64)
+    if t_s.shape != (n_time,):
+        raise TrainingError(f"contract t_s 形状 {t_s.shape} 与 T={n_time} 不符 ({context})")
+    if not bool(np.isfinite(t_s).all()):
+        raise TrainingError(f"contract t_s 含非有限值 ({context})")
+    if n_time > 1 and not bool(np.all(np.diff(t_s) > 0)):
+        raise TrainingError(f"contract t_s 须严格递增 ({context})")
+
+
+def _cnn_contract_from_dict(raw: Any, path: Path) -> InputContract:
+    """CNN 契约严格重建（bool/float 冒充 T/C 拒；t_s 长度一致、有限、严格递增）。"""
+    if not isinstance(raw, Mapping):
+        raise TrainingError(f"contract 须为映射 ({path})")
+    missing = sorted(
+        {"pulse_order", "n_time_steps", "n_channels", "t_s", "component_order"}.difference(raw)
+    )
+    if missing:
+        raise TrainingError(f"contract 缺失键 {missing} ({path})")
+    pulse_raw = raw["pulse_order"]
+    if isinstance(pulse_raw, (str, bytes)) or not isinstance(pulse_raw, (list, tuple)):
+        raise TrainingError(f"contract pulse_order 须为序列 ({path})")
+    pulse_order = tuple(pulse_raw)
+    if (
+        not pulse_order
+        or any(not isinstance(p, str) or not p for p in pulse_order)
+        or len(set(pulse_order)) != len(pulse_order)
+    ):
+        raise TrainingError(f"contract pulse_order 须为非空唯一非空字符串序列 ({path})")
+    try:
+        n_time_steps = _require_positive_int(raw["n_time_steps"], f"contract.n_time_steps ({path})")
+        n_channels = _require_positive_int(raw["n_channels"], f"contract.n_channels ({path})")
+    except ConfigError as exc:
+        raise TrainingError(str(exc)) from exc
+    if n_channels != _N_CHANNELS:
+        raise TrainingError(f"contract 通道数须为 {_N_CHANNELS} (got {n_channels}) ({path})")
+    component_raw = raw["component_order"]
+    if isinstance(component_raw, (str, bytes)) or not isinstance(component_raw, (list, tuple)):
+        raise TrainingError(f"contract component_order 须为序列 ({path})")
+    component_order = tuple(component_raw)
+    if component_order != _MODEL_COMPONENT_ORDER:
+        raise TrainingError(
+            f"contract 分量序须为 {_MODEL_COMPONENT_ORDER} (got {component_order!r}) ({path})"
+        )
+    t_raw = raw["t_s"]
+    if isinstance(t_raw, (str, bytes)) or not isinstance(t_raw, (list, tuple, np.ndarray)):
+        raise TrainingError(f"contract t_s 须为序列 ({path})")
+    try:
+        t_s = np.asarray(t_raw, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise TrainingError(f"contract t_s 无法解析为 float64 ({path}): {exc}") from exc
+    if t_s.ndim != 1 or t_s.shape != (n_time_steps,):
+        raise TrainingError(f"contract t_s 形状 {t_s.shape} 与 T={n_time_steps} 不符 ({path})")
+    if not bool(np.isfinite(t_s).all()):
+        raise TrainingError(f"contract t_s 含非有限值 ({path})")
+    if n_time_steps > 1 and not bool(np.all(np.diff(t_s) > 0)):
+        raise TrainingError(f"contract t_s 须严格递增 ({path})")
+    return InputContract(
+        pulse_order=pulse_order,
+        n_time_steps=n_time_steps,
+        t_s=t_s,
+        n_channels=n_channels,
+        component_order=component_order,
+    )
+
+
+_CNN_CKPT_REQUIRED_KEYS = frozenset(
+    {
+        "ckpt_format_version",
+        "model_kind",
+        "model_state_dict",
+        "channels",
+        "kernel_sizes",
+        "pool_bins",
+        "head_hidden_dims",
+        "activation",
+        "contract",
+        "preprocessing",
+        "seed",
+        "config",
+        "dataset_meta_relpath",
+        "dataset_meta_sha256",
+        "split_sha256",
+        "best_val_loss",
+    }
+)
+
+
+def _cnn_checkpoint_from_payload(payload: dict[str, Any], path: Path) -> CNNCheckpoint:
+    """CNN payload → CNNCheckpoint（严格类别/版本/结构/契约；config.model 须 CNN）。"""
+    missing = sorted(_CNN_CKPT_REQUIRED_KEYS.difference(payload))
+    if missing:
+        raise TrainingError(f"CNN checkpoint 缺失键 {missing} ({path})")
+    if payload["model_kind"] != "cnn1d":
+        raise TrainingError(f"model_kind 须为 'cnn1d' (got {payload['model_kind']!r}) ({path})")
+    if "hidden_dims" in payload:
+        raise TrainingError(f"CNN checkpoint 不接受 hidden_dims 字段 ({path})")
+    _require_ckpt_version(payload["ckpt_format_version"], CNN_CKPT_FORMAT_VERSION, path)
+    if payload["activation"] not in _ACTIVATIONS:
+        raise TrainingError(f"未知激活函数 {payload['activation']!r} ({path})")
+    state_dict = _cnn_state_dict_from_payload(payload["model_state_dict"], path)
+    contract = _cnn_contract_from_dict(payload["contract"], path)
+    channels, kernel_sizes, pool_bins, head_hidden_dims = _cnn_structure_from_values(
+        payload["channels"],
+        payload["kernel_sizes"],
+        payload["pool_bins"],
+        payload["head_hidden_dims"],
+        contract.n_time_steps,
+        path,
+    )
+    preprocessing = _preprocessing_from_dict(
+        payload["preprocessing"], len(contract.pulse_order), path
+    )
+    _validate_cnn_preprocessing(preprocessing, path)
+    config = _config_from_dict(payload["config"], path)
+    if not isinstance(config.model, CNN1DModelConfig):
+        raise TrainingError(f"CNN checkpoint 的 config.model 须为 CNN1DModelConfig ({path})")
+    seed = payload["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise TrainingError(f"seed 须为非负整数 (got {seed!r}) ({path})")
+    best_val_loss = payload["best_val_loss"]
+    if best_val_loss is not None and (
+        isinstance(best_val_loss, bool)
+        or not isinstance(best_val_loss, (int, float))
+        or not math.isfinite(float(best_val_loss))
+    ):
+        raise TrainingError(f"best_val_loss 须为 null 或有限数值 (got {best_val_loss!r}) ({path})")
+    return CNNCheckpoint(
+        ckpt_format_version=CNN_CKPT_FORMAT_VERSION,
+        model_state_dict=state_dict,
+        channels=channels,
+        kernel_sizes=kernel_sizes,
+        pool_bins=pool_bins,
+        head_hidden_dims=head_hidden_dims,
+        activation=payload["activation"],
+        contract=contract,
+        preprocessing=preprocessing,
+        seed=seed,
+        config=config,
+        dataset_meta_relpath=str(payload["dataset_meta_relpath"]),
+        dataset_meta_sha256=str(payload["dataset_meta_sha256"]),
+        split_sha256=str(payload["split_sha256"]),
+        best_val_loss=float(best_val_loss) if best_val_loss is not None else None,
+        git_sha=payload.get("git_sha"),
+        git_dirty=payload.get("git_dirty"),
+        torch_version=str(payload.get("torch_version", "")),
+        numpy_version=str(payload.get("numpy_version", "")),
+    )
+
+
+def _contract_to_dict(contract: InputContract) -> dict[str, Any]:
+    """InputContract → 纯字典（MLP/CNN 落盘共用；schema 不变）。"""
+    return {
+        "pulse_order": [str(p) for p in contract.pulse_order],
+        "n_time_steps": int(contract.n_time_steps),
+        "t_s": np.asarray(contract.t_s, dtype=np.float64).tolist(),
+        "n_channels": int(contract.n_channels),
+        "component_order": [str(c) for c in contract.component_order],
+    }
 
 
 def _checkpoint_to_dict(ckpt: Checkpoint) -> dict[str, Any]:
@@ -601,13 +1335,35 @@ def _checkpoint_to_dict(ckpt: Checkpoint) -> dict[str, Any]:
         },
         "hidden_dims": [int(dim) for dim in ckpt.hidden_dims],
         "activation": str(ckpt.activation),
-        "contract": {
-            "pulse_order": [str(p) for p in ckpt.contract.pulse_order],
-            "n_time_steps": int(ckpt.contract.n_time_steps),
-            "t_s": np.asarray(ckpt.contract.t_s, dtype=np.float64).tolist(),
-            "n_channels": int(ckpt.contract.n_channels),
-            "component_order": [str(c) for c in ckpt.contract.component_order],
+        "contract": _contract_to_dict(ckpt.contract),
+        "preprocessing": preprocessing.state_to_mapping(ckpt.preprocessing),
+        "seed": int(ckpt.seed),
+        "config": training_config.config_to_mapping(ckpt.config),
+        "dataset_meta_relpath": str(ckpt.dataset_meta_relpath),
+        "dataset_meta_sha256": str(ckpt.dataset_meta_sha256),
+        "split_sha256": str(ckpt.split_sha256),
+        "best_val_loss": (float(ckpt.best_val_loss) if ckpt.best_val_loss is not None else None),
+        "git_sha": ckpt.git_sha,
+        "git_dirty": ckpt.git_dirty,
+        "torch_version": str(ckpt.torch_version),
+        "numpy_version": str(ckpt.numpy_version),
+    }
+
+
+def _cnn_checkpoint_to_dict(ckpt: CNNCheckpoint) -> dict[str, Any]:
+    """CNNCheckpoint → torch.save 落盘字典（primitives/list/dict + CPU Tensor）。"""
+    return {
+        "ckpt_format_version": int(ckpt.ckpt_format_version),
+        "model_kind": "cnn1d",
+        "model_state_dict": {
+            name: value.detach().to("cpu").clone() for name, value in ckpt.model_state_dict.items()
         },
+        "channels": [int(c) for c in ckpt.channels],
+        "kernel_sizes": [int(k) for k in ckpt.kernel_sizes],
+        "pool_bins": int(ckpt.pool_bins),
+        "head_hidden_dims": [int(h) for h in ckpt.head_hidden_dims],
+        "activation": str(ckpt.activation),
+        "contract": _contract_to_dict(ckpt.contract),
         "preprocessing": preprocessing.state_to_mapping(ckpt.preprocessing),
         "seed": int(ckpt.seed),
         "config": training_config.config_to_mapping(ckpt.config),

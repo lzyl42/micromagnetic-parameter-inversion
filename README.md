@@ -94,11 +94,50 @@ run.log 仍由原机制写入。无 CLI 参数、无 plan/resume、无「目录�
   为唯一模拟执行入口，单份配置 CLI 已删除）；首版「样本准备 → 训练 →
   独立评估」工程已实现（见 `train.md`），**但未在正式研究数据上训练，
   不存在可靠科研结果或研究结论**。
+- **CNN1D 分支（P1–P4 训练链已接通）**：P1 配置层、P2 模型与 P3 独立
+  checkpoint/工厂/评估已实现（`model.kind` 判别 + CNN 四字段
+  `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 严格校验，YAML 与
+  mapping 同一 schema；`CNN1DRegressor` 已实现于
+  `src/micromagnetic_parameter_inversion/models/cnn1d.py`；`training.py` 另有
+  `CNNCheckpoint`/`save_cnn_checkpoint`/`load_cnn_checkpoint`/`build_cnn_model`
+  与 `load_any_checkpoint` 显式类别路由，评估侧按 checkpoint 类别显式路由；
+  MLP 的 checkpoint 序列化布局与版本原样不变，MLP 与 CNN checkpoint
+  **互不接受**对方文件、未知/缺失 kind 或损坏文件一律报错、绝不回退）。
+  P4 已把共享编排 `training.run(config_path, *, expected_kind)` 落在既有
+  `training.py`（**不新增 runner 模块**），`scripts/train_mlp.py` /
+  `scripts/train_cnn1d.py` 为薄入口（`--config` 必填，kind 错配在读数据/建目录
+  前早拒），`training.train_model` 支持两类模型，`save_model_checkpoint` 按
+  checkpoint 类别 dispatch；CNN 产物写入
+  `output_root()/training/cnn1d/<dataset_name>/<run_name>`（`output_dir` 可
+  显式覆盖）。CNN 与 MLP 只共用同一 dataset 与冻结 split，checkpoint/产物/
+  预处理统计**完全独立**，每个 run 自行做 train-only 拟合。
+  **验证范围仅为 CPU + tmp 合成数据 + 小 `max_epochs` 的离线测试；未在正式
+  研究数据上训练，无超参搜索，不存在可靠科研结果。**
+  `configs/training/cnn1d.yaml` 仍是**全注释占位、无研究超参**，**不能直接
+  执行**——须用户逐字段审定并显式填写 `model` 结构与
+  `dataset_name`/`run_name` 后才可加载。
 - 已完成的部分 QC：offline vertical slice 测试（31 passed）、2026-09-02
   test-only pilot 执行链冒烟、Pilot v1 哨兵轮轨迹层检查（历史协议）。
 - **未证明**：连续模型网格收敛、Relax 收敛鲁棒性、EdgeSmooth 选择的
   系统论证、批量可复现性、OVF/物理级 QC、真实器件有效性、正向回代验证、
   训练侧科研有效性（未在正式研究数据上训练）。
+
+### 训练入口（首版工程，仅 CPU 合成验证）
+
+两模型共用同一份 prepared dataset 与冻结 split，各写独立目录
+（`training/mlp/...` 与 `training/cnn1d/...`），各自做 train-only 拟合：
+
+```bash
+uv run python scripts/train_mlp.py   --config configs/training/mlp.yaml
+uv run python scripts/train_cnn1d.py --config configs/training/cnn1d.yaml
+uv run python scripts/evaluate_model.py --run RUN_DIR
+```
+
+`--config` 为必填；kind 与入口不匹配会在读数据、建目录前报错退出。两份配置
+当前都**不能直接照抄运行**：`mlp.yaml` 的 `dataset_name`/`run_name` 为占位符；
+`cnn1d.yaml` 是**全注释占位、无模型研究超参**，须用户逐字段审定并显式填写
+`model` 结构与 `dataset_name`/`run_name` 后才可加载。详细流程与产物见
+`train.md`。
 
 ## 物理模型概述
 
@@ -363,20 +402,22 @@ runs/cache 不入库；`data/README.md` 可跟踪，`data/samples/` 在白名单
 src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
                                          # + mumax3 vertical slice（config / script / results / pipeline）
                                          # + 训练/评估（training_config / training_data / preprocessing /
-                                         #   models/mlp / training / evaluation）
+                                         #   models/mlp / models/cnn1d / training / evaluation）
 scripts/check_environment.py             # 环境诊断
 scripts/generate_dataset.py              # 唯一模拟执行入口：生成批量实验 YAML 并
                                          # 运行模拟（内置 Protocol B 固定配置与 Sobol
                                          # 1024 点；MAX_WORKERS=2 并发，1=串行；
                                          # 直接运行会启动模拟，执行前须获批准）
 scripts/prepare_training_samples.py      # raw → data/samples npz/meta/split（train.md §2）
-scripts/train_mlp.py                     # MLP 训练入口（train.md）
+scripts/train_mlp.py                     # MLP 训练入口（training.run 薄封装）
+scripts/train_cnn1d.py                   # CNN1D 训练入口（training.run 薄封装）
 scripts/evaluate_model.py                # 独立 test 评估入口（train.md）
 configs/base.yaml                        # 通用设置（seed、device=auto）
 configs/experiments/mumax3_simulation.yaml
                                          # 实验配置模板（Protocol B 固定值；
                                          # 仅 dataset_name/alpha/Ku 三处待填）
-configs/training/mlp.yaml                # 训练配置（dataset/run_name 占位待填）
+configs/training/mlp.yaml                # MLP 训练配置（dataset/run_name 占位待填）
+configs/training/cnn1d.yaml              # CNN 配置：全注释占位，须审定填写
 train.md                                 # 首版训练/评估实现说明
 simulations/mumax3/                      # MuMax3 脚本模板（.mx3.in）与说明
 tests/                                   # pytest（无需 GPU/MuMax3）
