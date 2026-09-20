@@ -1,15 +1,16 @@
 """Training/evaluation experiment config: frozen dataclasses + strict YAML loading/validation.
 
-Fields correspond one-to-one with ``configs/training/mlp.yaml``; the ``split``
-block is used only by the prepare script. ``load_config`` is the single
-validation boundary: every level uses a strict schema (unknown/missing fields
-rejected), dataset_name/run_name are required, must be safe single path
-segments, and must not keep placeholders; zero values (weight_decay=0,
-min_delta=0) are valid, and after validation passes the pipeline assumes the
-config is valid.
+Fields correspond one-to-one with ``configs/training/mlp.yaml`` (plus the CNN
+model schema); the ``split`` block is used only by the prepare script.
+``load_config`` is the single validation boundary: every level uses a strict
+schema (unknown/missing fields rejected), dataset_name/run_name are required,
+must be safe single path segments, and must not keep placeholders; zero values
+(weight_decay=0, min_delta=0) are valid, and after validation passes the
+pipeline assumes the config is valid and does not re-defend.
 
-Validation helpers are reused from ``mumax3_config``; schema violations raise
-ConfigError uniformly.
+The validation helpers (``_fail``/``_require_*``/``_UniqueKeyLoader``) are
+reused from ``mumax3_config``, keeping the same strict style and error type
+(ConfigError); schema violations uniformly raise ConfigError.
 
 Dependency direction: this module is a leaf (stdlib + yaml + mumax3_config
 validators); it is referenced one-way by training_data / preprocessing /
@@ -19,7 +20,7 @@ training / evaluation.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -49,8 +50,11 @@ CKPT_FORMAT_VERSION = 1
 type LabelTransform = Literal["identity", "logalpha"]
 
 # The activation function is recorded explicitly in the ckpt (explicit model
-# structure field); fixed ReLU.
+# structure field); fixed ReLU for the first version.
 type ActivationName = Literal["relu"]
+
+# Model kind declared by the training entry (``training.run`` expected_kind).
+type ModelKind = Literal["mlp", "cnn1d"]
 
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -66,7 +70,12 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 _DATA_KEYS = frozenset({"pulse_order"})
-_MODEL_KEYS = frozenset({"hidden_dims"})
+# model block: kind values and per-kind mutually exclusive field sets
+# (unknown/cross-kind fields are always rejected).
+_MODEL_KINDS = frozenset({"mlp", "cnn1d"})
+_MODEL_KEYS_MLP = frozenset({"kind", "hidden_dims"})
+_MODEL_KEYS_CNN1D = frozenset({"kind", "channels", "kernel_sizes", "pool_bins", "head_hidden_dims"})
+_CNN1D_REQUIRED = frozenset({"channels", "kernel_sizes", "pool_bins", "head_hidden_dims"})
 _LABEL_KEYS = frozenset({"transform"})
 _PREPROCESSING_KEYS = frozenset({"std_eps"})
 _TRAINING_KEYS = frozenset(
@@ -103,11 +112,30 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """``model`` block: network architecture (with [64,32,32] the parameter count is
+    """``model`` block: MLP network architecture (with [64,32,32] the parameter count is
     ``64·D + 3266``).
     """
 
     hidden_dims: tuple[int, ...] = (64, 32, 32)
+    # Fixed kind marker; init=False keeps the old positional construction
+    # (ModelConfig()) and field order unchanged.
+    kind: Literal["mlp"] = field(default="mlp", init=False)
+
+
+@dataclass(frozen=True)
+class CNN1DModelConfig:
+    """``model`` block: 1D CNN network architecture.
+
+    All four fields are required (``head_hidden_dims`` may be an empty tuple);
+    ``kind`` is fixed to ``"cnn1d"``. ``pool_bins <= T`` is validated by the
+    model layer; the config layer does not read data.
+    """
+
+    channels: tuple[int, ...]
+    kernel_sizes: tuple[int, ...]
+    pool_bins: int
+    head_hidden_dims: tuple[int, ...]
+    kind: Literal["cnn1d"] = field(default="cnn1d", init=False)
 
 
 @dataclass(frozen=True)
@@ -192,7 +220,7 @@ class ExperimentConfig:
     dataset_name: str
     run_name: str
     data: DataConfig = DataConfig()
-    model: ModelConfig = ModelConfig()
+    model: ModelConfig | CNN1DModelConfig = ModelConfig()
     label: LabelConfig = LabelConfig()
     preprocessing: PreprocessingConfig = PreprocessingConfig()
     training: TrainingParams = TrainingParams()
@@ -245,6 +273,61 @@ def _parse_hidden_dims(value: object, field: str) -> tuple[int, ...]:
     return tuple(_require_positive_int(item, f"{field}[{i}]") for i, item in enumerate(value))
 
 
+def _parse_int_sequence(value: object, field: str, *, allow_empty: bool) -> tuple[int, ...]:
+    """Integer sequence: elements are positive integers (rejects bool/float/string);
+    the empty sequence is allowed on demand.
+    """
+    if not isinstance(value, list):
+        _fail(field, f"must be an integer list (got {value!r})")
+    if not value and not allow_empty:
+        _fail(field, f"must be a non-empty integer list (got {value!r})")
+    return tuple(_require_positive_int(item, f"{field}[{i}]") for i, item in enumerate(value))
+
+
+def _parse_model_value(value: object, field: str) -> ModelConfig | CNN1DModelConfig:
+    """Strict ``model`` block parsing (shared by YAML and config_from_mapping).
+
+    - ``kind`` absent is equivalent to ``"mlp"`` (only the old MLP field
+      ``hidden_dims`` is valid);
+    - ``kind="cnn1d"`` requires all four fields: ``channels``/``kernel_sizes``
+      are non-empty positive integers with matching layer counts and all-odd
+      kernels, ``pool_bins`` is a positive integer, and ``head_hidden_dims`` is
+      provided explicitly (may be empty) with each element a positive integer;
+    - kind fields are strictly mutually exclusive, unknown fields are rejected;
+      ``kind`` and sequence elements both reject bool.
+    """
+    raw = _require_mapping(value, field)  # null/non-mapping → error (no relaxation)
+    kind = raw.get("kind", "mlp")
+    if isinstance(kind, bool) or not isinstance(kind, str) or kind not in _MODEL_KINDS:
+        _fail(f"{field}.kind", f"must be one of {sorted(_MODEL_KINDS)} (got {kind!r})")
+    if kind == "cnn1d":
+        _check_keys(raw, field, _MODEL_KEYS_CNN1D, _CNN1D_REQUIRED)
+        channels = _parse_int_sequence(raw["channels"], f"{field}.channels", allow_empty=False)
+        kernel_sizes = _parse_int_sequence(
+            raw["kernel_sizes"], f"{field}.kernel_sizes", allow_empty=False
+        )
+        if len(kernel_sizes) != len(channels):
+            _fail(
+                f"{field}.kernel_sizes",
+                f"layer count must match channels (got {len(kernel_sizes)} vs {len(channels)})",
+            )
+        if any(kernel % 2 == 0 for kernel in kernel_sizes):
+            _fail(f"{field}.kernel_sizes", f"kernels must be odd (got {list(kernel_sizes)!r})")
+        return CNN1DModelConfig(
+            channels=channels,
+            kernel_sizes=kernel_sizes,
+            pool_bins=_require_positive_int(raw["pool_bins"], f"{field}.pool_bins"),
+            head_hidden_dims=_parse_int_sequence(
+                raw["head_hidden_dims"], f"{field}.head_hidden_dims", allow_empty=True
+            ),
+        )
+    _check_keys(raw, field, _MODEL_KEYS_MLP, frozenset())
+    kwargs: dict[str, Any] = {}
+    if "hidden_dims" in raw:
+        kwargs["hidden_dims"] = _parse_hidden_dims(raw["hidden_dims"], f"{field}.hidden_dims")
+    return ModelConfig(**kwargs)
+
+
 def _parse_ratios(value: object, field: str) -> SplitRatios:
     """ratios: non-negative finite numbers summing to 1 (within tolerance)."""
     raw = _require_mapping(value, field)
@@ -282,14 +365,11 @@ def _parse_data(root: dict[Any, Any]) -> DataConfig:
     return DataConfig(**kwargs)
 
 
-def _parse_model(root: dict[Any, Any]) -> ModelConfig:
-    raw = _optional_section(root, "model", _MODEL_KEYS)
-    if raw is None:
+def _parse_model(root: dict[Any, Any]) -> ModelConfig | CNN1DModelConfig:
+    """``model`` section: absent → MLP default; present → shared strict parser (null rejected)."""
+    if "model" not in root:
         return ModelConfig()
-    kwargs: dict[str, Any] = {}
-    if "hidden_dims" in raw:
-        kwargs["hidden_dims"] = _parse_hidden_dims(raw["hidden_dims"], "model.hidden_dims")
-    return ModelConfig(**kwargs)
+    return _parse_model_value(root["model"], "model")
 
 
 def _parse_label(root: dict[Any, Any]) -> LabelConfig:
@@ -385,10 +465,17 @@ def load_config(path: Path) -> ExperimentConfig:
     Validation boundary (the pipeline assumes a valid config afterwards): every
     level uses a strict schema (unknown fields and duplicate YAML keys rejected);
     dataset_name/run_name are required, safe single path segments, and must not
-    keep placeholders; device ∈ {auto,cpu,cuda} (same semantics as
-    runtime.select_device); ratios are non-negative, finite, and sum to 1
-    (tolerance 1e-9); weight_decay/min_delta/min_per_split allow 0; absent
-    optional sections use dataclass defaults.
+    keep placeholders; data.pulse_order is null or a duplicate-free pulse_id
+    list; model.kind ∈ {mlp,cnn1d} and is validated strictly per kind (MLP
+    hidden_dims non-empty positive integers; CNN channels/kernel_sizes non-empty
+    positive integers with matching layer counts and odd kernels, pool_bins a
+    positive integer, head_hidden_dims explicitly present and possibly empty);
+    label.transform takes a legal value; std_eps/learning_rate/batch_size/
+    max_epochs/patience are positive, weight_decay/min_delta non-negative (0 is
+    valid); device ∈ {auto,cpu,cuda} (same semantics as runtime.select_device);
+    ratios are non-negative, finite, and sum to 1 (tolerance 1e-9);
+    min_per_split are non-negative integers; output_dir is null or a non-empty
+    string. Absent optional sections use dataclass defaults.
 
     Raises:
         ConfigError: messages include the field path (e.g. training.batch_size).
@@ -423,6 +510,22 @@ def load_config(path: Path) -> ExperimentConfig:
     )
 
 
+def _model_to_mapping(model: ModelConfig | CNN1DModelConfig) -> dict[str, Any]:
+    """model → plain dict: MLP keeps the old layout (no kind, for old ckpt nested
+    config compatibility); CNN emits kind + the four fields (reloadable by
+    ``config_from_mapping``).
+    """
+    if isinstance(model, CNN1DModelConfig):
+        return {
+            "kind": model.kind,
+            "channels": list(model.channels),
+            "kernel_sizes": list(model.kernel_sizes),
+            "pool_bins": model.pool_bins,
+            "head_hidden_dims": list(model.head_hidden_dims),
+        }
+    return {"hidden_dims": list(model.hidden_dims)}
+
+
 def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
     """ExperimentConfig → nested plain dict (mapping schema maintained by this module).
 
@@ -439,7 +542,7 @@ def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
                 list(config.data.pulse_order) if config.data.pulse_order is not None else None
             )
         },
-        "model": {"hidden_dims": list(config.model.hidden_dims)},
+        "model": _model_to_mapping(config.model),
         "label": {"transform": config.label.transform},
         "preprocessing": {"std_eps": config.preprocessing.std_eps},
         "training": {
@@ -472,8 +575,8 @@ def config_to_mapping(config: ExperimentConfig) -> dict[str, Any]:
 
 
 def _mapping_section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
-    """Optional config section: absent → empty mapping (caller falls back to dataclass
-    defaults); a non-mapping raises."""
+    """Optional config section: absent → empty mapping (caller falls back to
+    dataclass defaults); a non-mapping raises."""
     value = mapping.get(key)
     if value is None:
         return {}
@@ -501,7 +604,6 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
         if key not in mapping:
             _fail("config", f"missing required key {key!r}")
     data_raw = _mapping_section(mapping, "data")
-    model_raw = _mapping_section(mapping, "model")
     label_raw = _mapping_section(mapping, "label")
     prep_raw = _mapping_section(mapping, "preprocessing")
     training_raw = _mapping_section(mapping, "training")
@@ -519,10 +621,10 @@ def config_from_mapping(mapping: Mapping[str, Any]) -> ExperimentConfig:
             data=DataConfig(
                 pulse_order=(None if pulse_order is None else tuple(str(p) for p in pulse_order))
             ),
-            model=ModelConfig(
-                hidden_dims=tuple(
-                    int(d) for d in model_raw.get("hidden_dims") or ModelConfig().hidden_dims
-                )
+            model=(
+                ModelConfig()
+                if "model" not in mapping
+                else _parse_model_value(mapping["model"], "config.model")
             ),
             label=LabelConfig(
                 transform=cast(

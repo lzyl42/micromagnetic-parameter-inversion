@@ -1,0 +1,30 @@
+# CNN1D training config (usage in README.md; dataset and run_name are placeholders,
+# replace them with actual values before running; do not invent research parameters.)
+# The model block reports the CNN1D baseline architecture documented in results/cnn.md.
+dataset_name: PLACEHOLDER_DATASET_NAME   # Placeholder: replace with the actual dataset under data/raw
+run_name: PLACEHOLDER_RUN_NAME           # Required (no default, must not be null/empty):
+                                         # refuses to start if the output directory exists; no implicit overwrite
+data:
+  pulse_order: null    # null = frozen from the selected first config.yaml and recorded into dataset_meta;
+                       # non-null = explicit pulse_id list (must be consistent with the protocol)
+model:
+  kind: cnn1d
+  channels: [8, 16]           # results/cnn.md baseline: 3 -> 8 -> 16
+  kernel_sizes: [5, 5]        # All odd; same length as channels
+  pool_bins: 16               # AdaptiveAvgPool1d bins; 1 <= pool_bins <= T (T checked at the model layer)
+  head_hidden_dims: [16]      # Flatten(16x16) -> Linear(16) + ReLU -> Linear(2)
+label: {transform: identity}             # identity | logalpha
+preprocessing: {std_eps: 1.0e-8}
+training:
+  seed: 42            # Consistent with configs/base.yaml
+  device: auto        # Delegated to runtime.select_device
+  batch_size: 32
+  max_epochs: 500
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  early_stopping: {patience: 50, min_delta: 0.0}
+split:                # Used only by the prepare script
+  seed: 42
+  ratios: {train: 0.7, val: 0.15, test: 0.15}
+  min_per_split: {train: 2, val: 1, test: 1}
+output_dir: null      # null = output_root()/training/cnn1d/<dataset_name>/<run_name>

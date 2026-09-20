@@ -1,13 +1,14 @@
 """Tests for the evaluation CLI, split/meta binding and exports (offline, CPU).
 
-End to end: the real CLI trains 1 epoch on synthetic tmp samples → evaluate;
+End-to-end: a real CLI training run of 1 epoch (tmp synthetic samples) → evaluation;
 supplemented by unit checks of compute_subset_metrics/export. Fixtures are
-self-contained (no imports across test modules); device is always cpu; no
-GPU/MuMax3/real data.
+self-contained (no cross-test-module import); device is always cpu; no
+GPU/MuMax3/real data is touched.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -20,7 +21,14 @@ import pytest
 import torch
 import yaml
 
-from micromagnetic_parameter_inversion import evaluation, paths, preprocessing, training_data
+from micromagnetic_parameter_inversion import (
+    evaluation,
+    paths,
+    preprocessing,
+    training,
+    training_config,
+    training_data,
+)
 from micromagnetic_parameter_inversion.evaluation import (
     EvaluationError,
     PredictionRow,
@@ -38,9 +46,8 @@ _EVAL_SCRIPT = paths.PROJECT_ROOT / "scripts" / "evaluate_model.py"
 
 
 def _load_script(path: Path, name: str) -> Any:
-    """Load scripts/ modules by path (scripts/ is not a package; self-contained, no
-    cross-test imports).
-    """
+    """Load a scripts/ module by path (scripts/ is not a package; self-contained, no
+    cross-test import)."""
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -70,9 +77,8 @@ def _write_prepared_samples(
     with_zero_ku: bool = False,
     seed: int = 0,
 ) -> Path:
-    """Synthesize npz + dataset_meta.yaml + split.yaml directly (isomorphic to training
-    tests but self-contained).
-    """
+    """Synthesize npz + dataset_meta.yaml + split.yaml directly (isomorphic to the training
+    test but self-contained)."""
     rng = np.random.default_rng(seed)
     psids = tuple(f"ps{i:04d}" for i in range(n_groups))
     pulses = tuple(f"p{j}" for j in range(n_pulses))
@@ -131,7 +137,7 @@ def _train_config_text(dataset: str, run_name: str) -> str:
 
 @pytest.fixture()
 def trained_run(env: tuple[Path, Path]) -> tuple[Path, Path]:
-    """Train 1 epoch via the real CLI → (run_dir, samples_dir)."""
+    """Real CLI training of 1 epoch → (run_dir, samples_dir)."""
     data_root, _ = env
     samples_dir = _write_prepared_samples(data_root, "ds_e2e", with_zero_ku=True)
     config_path = data_root / "cfg.yaml"
@@ -158,7 +164,8 @@ def test_evaluate_end_to_end(
         for key in ("mae_alpha", "rmse_alpha", "mae_ku", "rmse_ku"):
             value = metrics[subset][key]
             assert value is None or math.isfinite(value)
-    # provenance: the JSON source matches the actually loaded ckpt (default best.pt)
+    # provenance: the JSON source corresponds to the actually loaded ckpt (default
+    # best.pt), not a default-path assumption
     assert set(metrics) == {"main", "control", "provenance"}
     assert metrics["provenance"]["checkpoint_path"] == str(run_dir / "best.pt")
     assert metrics["provenance"]["checkpoint_sha256"] == training_data.sha256_file(
@@ -225,12 +232,12 @@ def test_split_sha_mismatch_rejected(
     split_copy = run_dir / "split.yaml"
     split_copy.write_bytes(split_copy.read_bytes() + b"\n# drifted\n")
     script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
-    with pytest.raises(EvaluationError, match="mismatch"):
+    with pytest.raises(EvaluationError, match="does not match ckpt.split_sha256"):
         evaluation.run_evaluation(run_dir)
-    # even with explicit --checkpoint the CLI must bind to the run split: friendly error + exit 2
+    # CLI explicit --checkpoint must still bind the run split: friendly error + exit code 2
     code = script.main(["--run", str(run_dir), "--checkpoint", str(run_dir / "best.pt")])
     assert code == 2
-    assert "mismatch" in capsys.readouterr().err
+    assert "does not match ckpt.split_sha256" in capsys.readouterr().err
 
 
 def test_meta_sha_mismatch_rejected(trained_run: tuple[Path, Path]) -> None:
@@ -247,7 +254,7 @@ def test_meta_relpath_escape_rejected(trained_run: tuple[Path, Path], tmp_path: 
     payload["dataset_meta_relpath"] = "../outside.yaml"
     forged = tmp_path / "forged.pt"
     torch.save(payload, forged)
-    with pytest.raises(EvaluationError, match="escapes"):
+    with pytest.raises(EvaluationError, match="escapes the anchor"):
         evaluation.run_evaluation(run_dir, forged)
 
 
@@ -257,7 +264,7 @@ def test_pulse_time_contract_mismatch_rejected(trained_run: tuple[Path, Path]) -
     victim = samples_dir / f"{run_split['test'][0]}.npz"
     with np.load(victim, allow_pickle=False) as archive:
         arrays = {key: archive[key] for key in archive.files}
-    arrays["x"] = arrays["x"][:, :-1, :]  # one step fewer in T: contract mismatch with the ckpt
+    arrays["x"] = arrays["x"][:, :-1, :]  # one fewer T step: mismatch with the ckpt contract
     arrays["t_s"] = arrays["t_s"][:-1]
     np.savez_compressed(victim, **arrays)
     with pytest.raises(training_data.DataError, match="contract"):
@@ -267,7 +274,8 @@ def test_pulse_time_contract_mismatch_rejected(trained_run: tuple[Path, Path]) -
 def test_samples_resplit_but_run_split_authoritative(trained_run: tuple[Path, Path]) -> None:
     run_dir, samples_dir = trained_run
     original_test = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))["test"]
-    # the split.yaml under samples is re-split (different seed): the run copy remains the authority
+    # the split.yaml under samples is re-cut (different seed): the run copy is still
+    # the only authority
     recut = training_data.make_split(
         tuple(sorted(training_data.load_dataset_meta(samples_dir).members)),
         SplitConfig(
@@ -301,18 +309,19 @@ def test_samples_resplit_but_run_split_authoritative(trained_run: tuple[Path, Pa
 def test_multi_batch_tail_batch_order_and_provenance(
     env: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Many members across batches (including a tail batch): row order strictly follows
-    split.test, main/control are non-empty, and provenance matches the loaded ckpt."""
+    """Multiple members across multiple batches (including a tail batch): row order strictly
+    follows split.test order, main/control non-empty, provenance corresponds to the
+    actually loaded ckpt."""
     data_root, _ = env
     samples_dir = _write_prepared_samples(data_root, "ds_multi", n_groups=7, with_zero_ku=True)
-    # deliberately unsorted test order, including a control (ps0000, Ku=0)
+    # deliberately non-sorted test order, also containing the control (ps0000, Ku=0)
     test_order = ["ps0003", "ps0000", "ps0006", "ps0002", "ps0005"]
     _rewrite_split(samples_dir, ["ps0001"], ["ps0004"], test_order)
     config_path = data_root / "cfg_multi.yaml"
     config_path.write_text(_train_config_text("ds_multi", "r1"), encoding="utf-8")
     run_dir = _load_script(_TRAIN_SCRIPT, "train_mlp_script").run(config_path)
 
-    # detect batch boundaries: transform_x is called exactly once per batch
+    # Detect batch boundaries: transform_x is called exactly once per batch
     batch_shapes: list[tuple[int, ...]] = []
     real_transform_x = preprocessing.transform_x
 
@@ -323,17 +332,17 @@ def test_multi_batch_tail_batch_order_and_provenance(
     monkeypatch.setattr(preprocessing, "transform_x", spy_transform_x)
     report, rows = evaluation.run_evaluation(run_dir)
 
-    # batch_size=2, 5 test members → 2+2+1: the tail batch has 1 sample
+    # batch_size=2, test has 5 members → 2+2+1: tail batch of 1 sample
     assert batch_shapes == [(2, 2, 8, 3), (2, 2, 8, 3), (1, 2, 8, 3)]
-    # row order strictly follows split.test (unsorted)
+    # row order strictly follows split.test order (non-sorted)
     assert [row.parameter_set_id for row in rows] == test_order
     assert all(row.split == "test" for row in rows)
-    # main=4 (control ps0000 excluded), control=1; both non-empty with finite metrics
+    # main=4 (excluding the control ps0000), control=1, both non-empty with finite metrics
     assert report.main.n == 4 and report.control.n == 1
     for subset in (report.main, report.control):
         assert subset.mae_alpha is not None and math.isfinite(subset.mae_alpha)
         assert subset.rmse_ku is not None and math.isfinite(subset.rmse_ku)
-    # provenance: the default best.pt that was actually loaded
+    # provenance: the actually loaded default best.pt
     assert report.provenance.checkpoint_path == str(run_dir / "best.pt")
     assert report.provenance.checkpoint_sha256 == training_data.sha256_file(run_dir / "best.pt")
     assert report.provenance.split_sha256 == training_data.sha256_file(run_dir / "split.yaml")
@@ -342,9 +351,8 @@ def test_multi_batch_tail_batch_order_and_provenance(
 def test_cli_checkpoint_final_provenance_and_rowcount(
     trained_run: tuple[Path, Path], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """``--checkpoint final.pt``: JSON provenance records the actual path/hash;
-    rows == test members.
-    """
+    """``--checkpoint final.pt``: the JSON provenance records the actual path/hash, row
+    count == test member count."""
     run_dir, _ = trained_run
     script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
     final_path = run_dir / "final.pt"
@@ -366,11 +374,12 @@ def test_cli_checkpoint_final_provenance_and_rowcount(
 def test_provenance_tracks_actually_loaded_checkpoint(
     trained_run: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """Same split hash but different model weights: provenance reflects the file actually loaded.
+    """ckpts with the same split hash but different model weights: provenance reflects the
+    actually loaded file.
 
-    The same split across runs is legal (no new restriction); after modifying one
-    weight the split binding is unchanged, but provenance's checkpoint_sha256/path
-    must follow the ckpt actually loaded.
+    The same split across runs is legal (no new restriction); after mutating one set of
+    weights the split binding is unchanged, and provenance's checkpoint_sha256/path must
+    follow the actually loaded ckpt.
     """
     run_dir, _ = trained_run
     report_default, _ = evaluation.run_evaluation(run_dir)
@@ -418,9 +427,8 @@ def test_main_missing_run_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]
 
 
 def _rewrite_split(samples_dir: Path, train: list[str], val: list[str], test: list[str]) -> None:
-    """Rewrite the split.yaml under samples (member completeness/disjointness guaranteed
-    by test data).
-    """
+    """Rewrite the split.yaml under samples (member completeness/mutual exclusion is
+    guaranteed by the test data)."""
     (samples_dir / "split.yaml").write_text(
         yaml.safe_dump(
             {
@@ -468,5 +476,385 @@ def test_train_rejects_empty_train_split(env: tuple[Path, Path]) -> None:
 
 
 def meta_psids(samples_dir: Path) -> list[str]:
-    """Small test helper: take manifest members in order."""
+    """Small in-test helper: list manifest members in order."""
     return list(training_data.load_dataset_meta(samples_dir).members)
+
+
+# ---------------------------------------------------------------------------
+# P3: evaluation integration for the independent CNN checkpoint (CPU-synthetic; no
+# training, no reading real MLP artifacts)
+# ---------------------------------------------------------------------------
+
+_CNN_CHANNELS = (3, 4)  # unit-test-only structure, not a research hyperparameter
+_CNN_KERNELS = (3, 5)
+_CNN_POOL_BINS = 2
+_CNN_HEAD = (5,)
+# Fixed split members: test contains the control ps0000 and two main-domain members
+# (batch_size=2 → 2+1 batches).
+_CNN_SPLIT_OVERRIDE = (["ps0001", "ps0002"], ["ps0003"], ["ps0000", "ps0004", "ps0005"])
+
+
+def _cnn_config(
+    dataset: str, run_name: str, *, model_overrides: dict[str, object] | None = None
+) -> training_config.ExperimentConfig:
+    """Synthesize a CNN config (unit-test-only structure; not via a research YAML)."""
+    model: dict[str, object] = {
+        "kind": "cnn1d",
+        "channels": list(_CNN_CHANNELS),
+        "kernel_sizes": list(_CNN_KERNELS),
+        "pool_bins": _CNN_POOL_BINS,
+        "head_hidden_dims": list(_CNN_HEAD),
+    }
+    if model_overrides is not None:
+        model.update(model_overrides)
+    return training_config.config_from_mapping(
+        {
+            "dataset_name": dataset,
+            "run_name": run_name,
+            "model": model,
+            "training": {
+                "seed": 11,
+                "device": "cpu",
+                "batch_size": 2,
+                "max_epochs": 1,
+                "learning_rate": 0.01,
+                "weight_decay": 0.0,
+            },
+        }
+    )
+
+
+def _make_cnn_run(
+    data_root: Path,
+    run_dir: Path,
+    dataset: str,
+    *,
+    split_override: tuple[list[str], list[str], list[str]] | None = _CNN_SPLIT_OVERRIDE,
+    model_overrides: dict[str, object] | None = None,
+) -> tuple[Path, training.CNNCheckpoint, training_config.ExperimentConfig]:
+    """Synthesize a CNN run: train-only preprocessing + random-weight CNNCheckpoint (no training).
+
+    Only this file's helpers synthesize npz/meta/split; no CNN optimization/training is
+    run and no real MLP checkpoint/artifacts/statistics are read. ``preprocessing.fit``
+    is fed train members only (leak prevention).
+    """
+    samples_dir = _write_prepared_samples(data_root, dataset, n_groups=6, with_zero_ku=True)
+    if split_override is not None:
+        _rewrite_split(samples_dir, *split_override)
+    meta = training_data.load_dataset_meta(samples_dir)
+    split = training_data.load_split(samples_dir, meta)
+
+    config = _cnn_config(dataset, run_dir.name, model_overrides=model_overrides)
+    assert isinstance(config.model, training_config.CNN1DModelConfig)
+    cnn_model = config.model
+
+    train_set = training_data.TrajectoryDataset(samples_dir, meta, split.train)
+    first = train_set.samples[0]
+    contract = training_data.InputContract(
+        pulse_order=first.pulse_ids,
+        n_time_steps=int(first.x.shape[1]),
+        t_s=first.t_s,
+    )
+    state = preprocessing.fit(train_set, config.preprocessing, config.label)
+
+    with torch.random.fork_rng(devices=[]):  # isolate the global RNG, leaving no side effects
+        torch.manual_seed(0)
+        model = training.build_cnn_model(
+            contract,
+            channels=cnn_model.channels,
+            kernel_sizes=cnn_model.kernel_sizes,
+            pool_bins=cnn_model.pool_bins,
+            head_hidden_dims=cnn_model.head_hidden_dims,
+        )
+    state_dict = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+    ckpt = training.CNNCheckpoint(
+        ckpt_format_version=training.CNN_CKPT_FORMAT_VERSION,
+        model_state_dict=state_dict,
+        channels=cnn_model.channels,
+        kernel_sizes=cnn_model.kernel_sizes,
+        pool_bins=cnn_model.pool_bins,
+        head_hidden_dims=cnn_model.head_hidden_dims,
+        activation="relu",
+        contract=contract,
+        preprocessing=state,
+        seed=config.training.seed,
+        config=config,
+        dataset_meta_relpath="dataset_meta.yaml",
+        dataset_meta_sha256=training_data.sha256_file(samples_dir / "dataset_meta.yaml"),
+        split_sha256=training_data.sha256_file(samples_dir / "split.yaml"),
+        best_val_loss=0.5,
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "split.yaml").write_bytes((samples_dir / "split.yaml").read_bytes())
+    training.save_cnn_checkpoint(run_dir / "best.pt", ckpt)
+    return samples_dir, ckpt, config
+
+
+@pytest.fixture()
+def cnn_run(
+    env: tuple[Path, Path], tmp_path: Path
+) -> tuple[Path, Path, training.CNNCheckpoint, training_config.ExperimentConfig]:
+    """Each test gets an independent CNN run (so evaluation artifacts' "refusing to
+    overwrite" do not interfere)."""
+    data_root, _ = env
+    run_dir = tmp_path / "run_cnn"
+    samples_dir, ckpt, config = _make_cnn_run(data_root, run_dir, "ds_cnn")
+    return run_dir, samples_dir, ckpt, config
+
+
+def _expected_cnn_predictions(
+    ckpt: training.CNNCheckpoint, samples_dir: Path, psids: tuple[str, ...]
+) -> dict[str, tuple[float, float]]:
+    """Independent reference: physical-unit predictions from a self-built explicit-structure
+    model + ckpt preprocessing inverse transform."""
+    with torch.random.fork_rng(devices=[]):
+        model = training.build_cnn_model(
+            ckpt.contract,
+            channels=ckpt.channels,
+            kernel_sizes=ckpt.kernel_sizes,
+            pool_bins=ckpt.pool_bins,
+            head_hidden_dims=ckpt.head_hidden_dims,
+        )
+    model.load_state_dict(dict(ckpt.model_state_dict), strict=True)
+    model.eval()
+    expected: dict[str, tuple[float, float]] = {}
+    for psid in psids:
+        sample = training_data.load_sample(samples_dir, psid, ckpt.contract)
+        x_norm = preprocessing.transform_x(ckpt.preprocessing, sample.x[None])
+        with torch.no_grad():
+            pred_norm = model(torch.from_numpy(x_norm))
+        physical = preprocessing.inverse_transform_y(ckpt.preprocessing, pred_norm.numpy())[0]
+        expected[psid] = (float(physical[0]), float(physical[1]))
+    return expected
+
+
+def _corrupt_state_dict(state_dict: training.StateDict, corruption: str) -> dict[str, Any]:
+    """Build a corrupted model_state_dict: missing key / extra key / wrong shape."""
+    state = dict(state_dict)
+    if corruption == "missing_key":
+        state.pop(sorted(state)[0])
+    elif corruption == "extra_key":
+        state["bogus.weight"] = torch.zeros(1)
+    else:  # wrong_shape: keep the element count but change the shape (size mismatch)
+        name = sorted(state)[0]
+        state[name] = state[name].reshape(1, -1)
+    return state
+
+
+def _load_ckpt_payload_for_corruption(ckpt_path: Path) -> dict[str, Any]:
+    """Read a legal ckpt's on-disk payload for "corruption" rewriting (same method as
+    ``_corrupt_state_dict``).
+
+    **Deliberately bypasses ``save_cnn_checkpoint`` validation**: illegal values such as
+    batch_size=inf, y_std=0, x_std=inf would be rejected early by a normal save, so here
+    an existing legal ``best.pt`` payload is ``torch.load``-ed, mutated in place, then
+    ``torch.save``-d to simulate real disk corruption, exercising only the load/evaluate
+    boundary without relaxing or changing save behavior.
+    """
+    return torch.load(ckpt_path, weights_only=True, map_location="cpu")
+
+
+def test_cnn_evaluate_end_to_end(cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any]) -> None:
+    run_dir, samples_dir, ckpt, _ = cnn_run
+    report, rows = evaluation.run_evaluation(run_dir)
+
+    meta = training_data.load_dataset_meta(samples_dir)
+    run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+    test_members = run_split["test"]
+    expected_control = sum(1 for psid in test_members if meta.labels[psid][1] == 0.0)
+
+    assert [row.parameter_set_id for row in rows] == test_members
+    assert len(rows) == len(test_members)
+    assert report.main.n == len(test_members) - expected_control
+    assert report.control.n == expected_control
+    for subset in (report.main, report.control):
+        for key in ("mae_alpha", "rmse_alpha", "mae_ku", "rmse_ku"):
+            value = getattr(subset, key)
+            assert value is None or math.isfinite(value)
+
+    assert report.provenance.checkpoint_path == str(run_dir / "best.pt")
+    assert report.provenance.checkpoint_sha256 == training_data.sha256_file(run_dir / "best.pt")
+    assert report.provenance.split_sha256 == training_data.sha256_file(run_dir / "split.yaml")
+
+    # Physical-unit predictions match the independent reference ("self model + ckpt preprocessing
+    # inverse transform"), not merely asserting existence.
+    expected = _expected_cnn_predictions(ckpt, samples_dir, tuple(test_members))
+    for row in rows:
+        exp_alpha, exp_ku = expected[row.parameter_set_id]
+        assert row.split == "test"
+        assert row.alpha_true == pytest.approx(meta.labels[row.parameter_set_id][0])
+        assert row.ku_true == pytest.approx(meta.labels[row.parameter_set_id][1])
+        assert row.alpha_pred == pytest.approx(exp_alpha, rel=1.0e-5, abs=1.0e-6)
+        assert row.ku_pred == pytest.approx(exp_ku, rel=1.0e-5, abs=1.0e-6)
+
+
+def test_cnn_evaluate_script_end_to_end(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir, _samples_dir, _ckpt, _config = cnn_run
+    script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
+    assert script.run(run_dir) == run_dir
+
+    metrics = json.loads((run_dir / "test_metrics.json").read_text(encoding="utf-8"))
+    assert set(metrics) == {"main", "control", "provenance"}
+    assert metrics["provenance"]["checkpoint_path"] == str(run_dir / "best.pt")
+    assert metrics["provenance"]["checkpoint_sha256"] == training_data.sha256_file(
+        run_dir / "best.pt"
+    )
+    run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+    lines = (run_dir / "test_predictions.csv").read_text(encoding="utf-8").splitlines()
+    assert len(lines) - 1 == len(run_split["test"])
+    assert "evaluation complete" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("case", ["split_sha", "meta_sha", "contract_t_s"])
+def test_cnn_binding_tamper_rejected(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], case: str
+) -> None:
+    run_dir, samples_dir, _ckpt, _config = cnn_run
+    if case == "split_sha":
+        target = run_dir / "split.yaml"
+        target.write_bytes(target.read_bytes() + b"\n# drifted\n")
+        with pytest.raises(EvaluationError, match="does not match ckpt.split_sha256"):
+            evaluation.run_evaluation(run_dir)
+    elif case == "meta_sha":
+        target = samples_dir / "dataset_meta.yaml"
+        target.write_text(target.read_text(encoding="utf-8") + "\n# drifted\n", encoding="utf-8")
+        with pytest.raises(EvaluationError, match="dataset_meta SHA"):
+            evaluation.run_evaluation(run_dir)
+    else:
+        run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+        victim = samples_dir / f"{run_split['test'][0]}.npz"
+        with np.load(victim, allow_pickle=False) as archive:
+            arrays = {key: archive[key] for key in archive.files}
+        # Equal length, finite, strictly increasing, but different values: passes the
+        # checkpoint loader and must be rejected by load_sample's full bitwise t_s
+        # comparison (not just shape/length).
+        arrays["t_s"] = arrays["t_s"] + np.float64(1.0e-15)
+        np.savez_compressed(victim, **arrays)
+        with pytest.raises((training_data.DataError, EvaluationError), match="t_s"):
+            evaluation.run_evaluation(run_dir)
+        assert not (run_dir / "test_metrics.json").exists()
+        assert not (run_dir / "test_predictions.csv").exists()
+        # The CLI rejects it equally and produces no success report.
+        assert (
+            _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(["--run", str(run_dir)]) == 2
+        )
+        assert not (run_dir / "test_metrics.json").exists()
+        assert not (run_dir / "test_predictions.csv").exists()
+
+
+@pytest.mark.parametrize("corruption", ["missing_key", "extra_key", "wrong_shape"])
+def test_cnn_corrupt_state_dict_rejected_at_evaluate(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], tmp_path: Path, corruption: str
+) -> None:
+    run_dir, _samples_dir, ckpt, _config = cnn_run
+    forged = tmp_path / f"corrupt_{corruption}.pt"
+    training.save_cnn_checkpoint(
+        forged,
+        dataclasses.replace(
+            ckpt, model_state_dict=_corrupt_state_dict(ckpt.model_state_dict, corruption)
+        ),
+    )
+    with pytest.raises(EvaluationError):
+        evaluation.run_evaluation(run_dir, forged)
+    # Produces no success report / partial artifacts.
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()
+
+    # The CLI fails equally gracefully (exit 2) and writes no artifacts.
+    assert (
+        _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(
+            ["--run", str(run_dir), "--checkpoint", str(forged)]
+        )
+        == 2
+    )
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()
+
+
+def test_cnn_recovery_uses_explicit_structure_not_nested_config(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], tmp_path: Path
+) -> None:
+    """Same kind=cnn1d but a nested config structure differing from the top-level explicit
+    fields: must restore from the explicit fields."""
+    run_dir, samples_dir, ckpt, _config = cnn_run
+    other_config = _cnn_config(
+        ckpt.config.dataset_name,
+        "other_run",
+        model_overrides={
+            "channels": [5, 6],
+            "kernel_sizes": [3, 3],
+            "pool_bins": 3,
+            "head_hidden_dims": [9],
+        },
+    )
+    forged = tmp_path / "explicit_structure.pt"
+    training.save_cnn_checkpoint(forged, dataclasses.replace(ckpt, config=other_config))
+
+    # Restoring from the nested config structure would cause a load_state_dict shape
+    # mismatch; this must succeed.
+    _report, rows = evaluation.run_evaluation(run_dir, forged)
+    run_split = yaml.safe_load((run_dir / "split.yaml").read_text(encoding="utf-8"))
+    expected = _expected_cnn_predictions(ckpt, samples_dir, tuple(run_split["test"]))
+    for row in rows:
+        exp_alpha, exp_ku = expected[row.parameter_set_id]
+        assert row.alpha_pred == pytest.approx(exp_alpha, rel=1.0e-5, abs=1.0e-6)
+        assert row.ku_pred == pytest.approx(exp_ku, rel=1.0e-5, abs=1.0e-6)
+
+
+def test_cnn_overflow_config_rejected_without_leak(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """config.training.batch_size=inf: the CNN loader must converge to an explicit error,
+    not leak OverflowError."""
+    run_dir, _samples_dir, _ckpt, _config = cnn_run
+    # Bypass save_cnn_checkpoint (which already rejects early correctly) and rewrite the
+    # on-disk payload directly to simulate corruption.
+    payload = _load_ckpt_payload_for_corruption(run_dir / "best.pt")
+    payload["config"]["training"]["batch_size"] = float("inf")
+    forged = tmp_path / "overflow_batch.pt"
+    torch.save(payload, forged)
+
+    code = _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(
+        ["--run", str(run_dir), "--checkpoint", str(forged)]
+    )
+    err = capsys.readouterr().err
+    assert code == 2
+    assert "error:" in err
+    assert "OverflowError" not in err  # does not leak the raw overflow exception
+    assert ("checkpoint" in err) or ("config" in err)  # explicit checkpoint/config error
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()
+
+
+@pytest.mark.parametrize("bad", ["y_std_zero", "x_std_inf"])
+def test_cnn_bad_preprocessing_state_rejected(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    bad: str,
+) -> None:
+    """Illegal CNN normalization state (y_std=0 / x_std=inf): the CLI rejects it with no
+    report artifacts."""
+    run_dir, _samples_dir, _ckpt, _config = cnn_run
+    # Bypass save_cnn_checkpoint (which already rejects early correctly) and rewrite the
+    # on-disk payload directly to simulate corruption.
+    payload = _load_ckpt_payload_for_corruption(run_dir / "best.pt")
+    if bad == "y_std_zero":
+        payload["preprocessing"]["y_stats"]["y_std"] = np.zeros(2, dtype=np.float64).tolist()
+    else:
+        x_std = np.asarray(payload["preprocessing"]["x_stats"]["std"], dtype=np.float64)
+        payload["preprocessing"]["x_stats"]["std"] = np.full_like(x_std, np.inf).tolist()
+    forged = tmp_path / f"bad_preprocessing_{bad}.pt"
+    torch.save(payload, forged)
+
+    code = _load_script(_EVAL_SCRIPT, "evaluate_model_script").main(
+        ["--run", str(run_dir), "--checkpoint", str(forged)]
+    )
+    assert code == 2
+    assert "error:" in capsys.readouterr().err
+    assert not (run_dir / "test_metrics.json").exists()
+    assert not (run_dir / "test_predictions.csv").exists()
