@@ -20,9 +20,13 @@
   一定对应实际加载的模型，而非仅默认路径；跨 run 相同 split 合法，仅
   如实记录来源，不引入新限制。
 
-指标（物理单位，alpha/Ku 分别报告）：首版仅 MAE/RMSE；主域排除 Ku = 0
+指标（物理单位，alpha/Ku 分别报告）：MAE/RMSE 与 MAPE（百分数）；主域排除 Ku = 0
 的 control，control 单独报告、不计入主域；每个子集输出样本数 ``n``，
 空子集（n=0）指标为 ``None``（JSON null，非 NaN/0）；不重切凑指标。
+MAPE 分母取 ``abs(true)``（alpha/Ku 对称）：某子集任一真实 alpha（或 Ku）
+为 0 时仅该列 MAPE 为 ``None``，不加 epsilon、不剔除样本，MAE/RMSE 与
+另一列指标照常；通用指标不施加物理域限制（alpha 可为 0、Ku 可 0/负），
+仅 ``logalpha`` label 变换在拟合/加载侧要求 alpha > 0。
 预测/输入含非有限值 → 明确拒绝（PreprocessingError/EvaluationError），
 不当作空子集。
 
@@ -44,6 +48,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -60,8 +65,10 @@ class EvaluationError(ValueError):
 class SubsetMetrics:
     """单个指标子集（主域或 control）的结果。
 
-    空子集（n=0）：``n`` 如实输出 0，四个指标均为 ``None``（序列化为
-    JSON null，不允许 NaN 或 0 充数）。
+    空子集（n=0）：``n`` 如实输出 0，全部指标均为 ``None``（JSON null）。
+    MAPE = 100 * mean(abs(pred - true) / abs(true))；任一 alpha（或 Ku）
+    真实值为 0 时，仅该列 MAPE 为 None，不加 epsilon、不剔除样本，
+    MAE/RMSE 与另一列 MAPE 照常计算。
     """
 
     n: int  # 子集样本数（总是输出）
@@ -69,6 +76,8 @@ class SubsetMetrics:
     rmse_alpha: float | None  # 物理单位 RMSE（alpha）
     mae_ku: float | None  # 物理单位 MAE（Ku, J/m^3）
     rmse_ku: float | None  # 物理单位 RMSE（Ku, J/m^3）
+    mape_percent_alpha: float | None = None
+    mape_percent_ku: float | None = None
 
 
 @dataclass(frozen=True)
@@ -88,11 +97,12 @@ class EvaluationProvenance:
     checkpoint_path: str
     checkpoint_sha256: str
     split_sha256: str
+    split: Literal["val", "test"] = "test"
 
 
 @dataclass(frozen=True)
 class EvaluationReport:
-    """test 集评估报告（test_metrics.json 的来源）。"""
+    """val/test 评估报告；实际子集由 provenance.split 记录。"""
 
     main: SubsetMetrics  # 主域：排除 Ku = 0 的 control
     control: SubsetMetrics  # Ku = 0 物理 control，单独报告、不计入主域
@@ -101,10 +111,10 @@ class EvaluationReport:
 
 @dataclass(frozen=True)
 class PredictionRow:
-    """test_predictions.csv 的一行（每参数组合一行，无 pulse_id 列）。"""
+    """``<split>_predictions.csv`` 的一行（每参数组合一行，无 pulse_id 列）。"""
 
     parameter_set_id: str
-    split: str  # 常规 evaluate 仅评估 run 内 split 副本的 test
+    split: str  # run 内 split 副本的 val 或 test
     alpha_true: float
     alpha_pred: float
     ku_true: float
@@ -114,13 +124,15 @@ class PredictionRow:
 def compute_subset_metrics(
     y_true: Sequence[Sequence[float]], y_pred: Sequence[Sequence[float]]
 ) -> SubsetMetrics:
-    """物理单位 MAE/RMSE（alpha/Ku 分别报告，不跨列合并、不重切子集）。
+    """物理单位 MAE/RMSE 与 MAPE 百分数（逐输出计算，不重切子集）。
 
     Args:
         y_true/y_pred: ``[n, 2]`` 序列（物理单位，列序 alpha/ku）。
 
     Returns:
-        ``n == 0`` → ``n=0`` 且四个指标为 ``None``（JSON null，非 NaN 非 0）。
+        ``n == 0`` → ``n=0`` 且全部指标为 ``None``（JSON null）。MAPE 分母取
+        ``abs(true)``；某列任一真实值为 0 时该列 MAPE 为 ``None``（不剔除
+        样本、不加 epsilon），其余指标照常。通用指标不限制物理域。
 
     Raises:
         EvaluationError: 两序列长度不一致、形状非 ``[n,2]``，或含非有限值
@@ -149,6 +161,16 @@ def compute_subset_metrics(
         rmse_alpha=float(rmse[0]),
         mae_ku=float(mae[1]),
         rmse_ku=float(rmse[1]),
+        mape_percent_alpha=(
+            None
+            if np.any(true[:, 0] == 0)
+            else float(100 * np.mean(np.abs(diff[:, 0]) / np.abs(true[:, 0])))
+        ),
+        mape_percent_ku=(
+            None
+            if np.any(true[:, 1] == 0)
+            else float(100 * np.mean(np.abs(diff[:, 1]) / np.abs(true[:, 1])))
+        ),
     )
 
 
@@ -160,6 +182,8 @@ def resolve_checkpoint_path(run_dir: Path, checkpoint_path: Path | None = None) 
 def run_evaluation(
     run_dir: Path,
     checkpoint_path: Path | None = None,
+    *,
+    split: Literal["val", "test"] = "test",
 ) -> tuple[EvaluationReport, tuple[PredictionRow, ...]]:
     """常规 evaluate 主流程：返回 ``(EvaluationReport, rows)``（纯计算，不写盘）。
 
@@ -167,12 +191,14 @@ def run_evaluation(
         run_dir: 训练 run 目录（split 副本 / ckpt 的定位来源）。
         checkpoint_path: 缺省 ``<run_dir>/best.pt``；无论显式与否，ckpt 的
             split SHA 必须与 run 内副本一致。
+        split: 仅 val/test，默认 test；val 受 best checkpoint 选择偏差影响，
+            不能作为独立泛化结论；test 不得参与模型选择。
 
     编排：
 
     1. ``ckpt = training.load_any_checkpoint(...)``；按显式 ``model_kind``
-       路由（MLP/CNN，无 fallback），结构/预处理/label 全部来自 ckpt（不经
-       当前 YAML）；
+       路由（MLP/CNN/Transformer，无 fallback），结构/预处理/label 全部来自
+       ckpt（不经当前 YAML）；
     2. run 内 split 副本 sha256 与 ``ckpt.split_sha256`` 核对；随后生成
        ``EvaluationProvenance``（实际 ckpt 路径、文件字节 sha256 一次
        读取、来自该 ckpt 的 split_sha256）；
@@ -180,9 +206,9 @@ def run_evaluation(
        交叉核对；
     4. ``training_data.load_split(samples_dir, meta, split_path=副本)``：
        同一加载边界校验（npz 存在性针对真实样本目录）；
-    5. test 成员按 ``ckpt.config.training.batch_size`` 分批：CPU、eval、
-       ``no_grad`` 前向，``load_sample`` 契约校验（x 形状/pulse_ids 顺序/
-       t_s），``inverse_transform_y`` 还原物理单位；
+    5. 所选 val/test 成员按 ``ckpt.config.training.batch_size`` 分批：CPU、
+       eval、``no_grad`` 前向，``load_sample`` 契约校验（x 形状/pulse_ids
+       顺序/t_s），``inverse_transform_y`` 还原物理单位；
     6. 按 meta psid→Ku 表划分主域/control（Ku = 0 → control），各自
        ``compute_subset_metrics``；
     7. 组装 ``PredictionRow`` 序列（写盘由 ``evaluate_model.py`` 编排）。
@@ -193,6 +219,8 @@ def run_evaluation(
         DataError/PreprocessingError/TrainingError: npz 契约、逆变换非有限、
             ckpt 加载失败（原样上抛，调用方统一呈现）。
     """
+    if split not in ("val", "test"):
+        raise EvaluationError("评估 split 仅允许 val 或 test")
     run_dir = Path(run_dir)
     ckpt_path = resolve_checkpoint_path(run_dir, checkpoint_path)
     ckpt = training.load_any_checkpoint(ckpt_path)
@@ -209,6 +237,7 @@ def run_evaluation(
         checkpoint_path=str(ckpt_path),
         checkpoint_sha256=training_data.sha256_file(ckpt_path),
         split_sha256=ckpt.split_sha256,
+        split=split,
     )
 
     meta_path = _resolve_meta_path(ckpt)
@@ -218,9 +247,9 @@ def run_evaluation(
             f"dataset_meta.dataset_name {meta.dataset_name!r} 与 ckpt 配置 "
             f"{ckpt.config.dataset_name!r} 不一致 ({meta_path})"
         )
-    split = training_data.load_split(samples_dir, meta, split_path=split_copy)
+    split_definition = training_data.load_split(samples_dir, meta, split_path=split_copy)
 
-    rows = _evaluate_test_rows(ckpt, samples_dir, meta, split)
+    rows = _evaluate_rows(ckpt, samples_dir, split_definition, split)
     report = _build_report(rows, meta, provenance)
     return report, tuple(rows)
 
@@ -246,17 +275,18 @@ def _resolve_meta_path(ckpt: training.ModelCheckpoint) -> Path:
     return candidate
 
 
-def _evaluate_test_rows(
+def _evaluate_rows(
     ckpt: training.ModelCheckpoint,
     samples_dir: Path,
-    meta: training_data.DatasetMeta,
-    split: training_data.SplitDefinition,
+    split_definition: training_data.SplitDefinition,
+    split: Literal["val", "test"],
 ) -> list[PredictionRow]:
-    """test 成员分批推理（CPU/eval/no_grad）→ 物理单位 PredictionRow 列表。
+    """val/test 成员分批推理（CPU/eval/no_grad）→ 物理单位 PredictionRow。
 
-    模型结构按 checkpoint 类别恢复：CNN 用 ``ckpt`` 顶层显式结构字段（不看
-    嵌套 config），MLP 沿用既有 ``hidden_dims``；``load_state_dict(strict=True)``
-    键/尺寸不匹配统一收敛为 ``EvaluationError``（不回退、不产出半成品报告）。
+    模型结构按 checkpoint 类别恢复：CNN/Transformer 用 ``ckpt`` 顶层显式结构
+    字段（不看嵌套 config），MLP 沿用既有 ``hidden_dims``；``load_state_dict
+    (strict=True)`` 键/尺寸不匹配统一收敛为 ``EvaluationError``（不回退、
+    不产出半成品报告）。
     """
     if isinstance(ckpt, training.CNNCheckpoint):
         model = training.build_cnn_model(
@@ -266,8 +296,20 @@ def _evaluate_test_rows(
             pool_bins=ckpt.pool_bins,
             head_hidden_dims=ckpt.head_hidden_dims,
         )
-    else:
+    elif isinstance(ckpt, training.Checkpoint):
         model = training.build_model(ckpt.contract, ckpt.hidden_dims)
+    elif isinstance(ckpt, training.TransformerCheckpoint):
+        model = training.build_transformer_model(
+            ckpt.contract,
+            d_model=ckpt.d_model,
+            nhead=ckpt.nhead,
+            num_layers=ckpt.num_layers,
+            dim_feedforward=ckpt.dim_feedforward,
+            dropout=ckpt.dropout,
+            head_hidden_dims=ckpt.head_hidden_dims,
+        )
+    else:
+        raise EvaluationError(f"不支持的 checkpoint 类型: {type(ckpt).__name__}")
     try:
         model.load_state_dict(dict(ckpt.model_state_dict), strict=True)
     except RuntimeError as exc:
@@ -281,8 +323,9 @@ def _evaluate_test_rows(
         raise EvaluationError(f"ckpt.config.training.batch_size 须为正 (got {batch_size})")
 
     rows: list[PredictionRow] = []
-    for start in range(0, len(split.test), batch_size):
-        chunk = split.test[start : start + batch_size]
+    members = split_definition.val if split == "val" else split_definition.test
+    for start in range(0, len(members), batch_size):
+        chunk = members[start : start + batch_size]
         samples = [
             training_data.load_sample(samples_dir, psid, ckpt.contract)  # 契约校验
             for psid in chunk
@@ -296,7 +339,7 @@ def _evaluate_test_rows(
             rows.append(
                 PredictionRow(
                     parameter_set_id=sample.parameter_set_id,
-                    split="test",
+                    split=split,
                     alpha_true=float(sample.y[0]),
                     alpha_pred=float(pred[0]),
                     ku_true=float(sample.y[1]),

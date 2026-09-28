@@ -255,7 +255,7 @@ _BAD_CNN_MODELS: tuple[tuple[str, dict[str, object]], ...] = (
     ("missing_kernel_sizes", _without("kernel_sizes")),
     ("missing_pool_bins", _without("pool_bins")),
     ("missing_head", _without("head_hidden_dims")),
-    ("unknown_kind", _cnn_model(kind="transformer")),
+    ("unknown_kind", _cnn_model(kind="unknown_model")),
     ("kind_non_string", _cnn_model(kind=1)),
     ("kind_bool", _cnn_model(kind=True)),
     ("unknown_key", {**_cnn_model(), "bogus": 1}),
@@ -365,5 +365,73 @@ def test_cnn_model_strict_rejection_both_paths(
     """同一 model 样例：YAML 与 config_from_mapping 两条严格路径都必须拒绝。"""
     with pytest.raises(ConfigError):
         _load_mapping(tmp_path, _root_mapping(bad_model), f"{case}.yaml")
+    with pytest.raises(ConfigError):
+        training_config.config_from_mapping(_root_mapping(bad_model))
+
+
+def _transformer_model(**overrides: object) -> dict[str, object]:
+    block: dict[str, object] = {
+        "kind": "transformer",
+        "d_model": 8,
+        "nhead": 2,
+        "num_layers": 2,
+        "dim_feedforward": 16,
+        "dropout": 0.1,
+        "head_hidden_dims": [4],
+    }
+    block.update(overrides)
+    return block
+
+
+@pytest.mark.parametrize("head", [[], [4]])
+@pytest.mark.parametrize("dropout", [0, 0.1])
+def test_transformer_roundtrip(tmp_path: Path, head: list[int], dropout: float) -> None:
+    block = _transformer_model(head_hidden_dims=head, dropout=dropout)
+    config = _load_mapping(tmp_path, _root_mapping(block), "transformer.yaml")
+    assert isinstance(config.model, training_config.TransformerModelConfig)
+    assert config.model.head_hidden_dims == tuple(head)
+    serialized = training_config.config_to_mapping(config)
+    assert serialized["model"] == block
+    assert training_config.config_from_mapping(serialized) == config
+    assert _load_mapping(tmp_path, serialized, "reloaded.yaml") == config
+
+
+_BAD_TRANSFORMERS = [
+    *[
+        {key: value for key, value in _transformer_model().items() if key != missing}
+        for missing in _transformer_model()
+    ],
+    *[
+        _transformer_model(**{field: value})
+        for field in ("d_model", "nhead", "num_layers", "dim_feedforward")
+        for value in (True, 0, -1, 2.0, "2", None)
+    ],
+    _transformer_model(d_model=7),
+    _transformer_model(nhead=3),
+    *[
+        _transformer_model(dropout=value)
+        for value in (True, "0.1", None, -0.1, 1, float("nan"), float("inf"))
+    ],
+    *[
+        _transformer_model(head_hidden_dims=value)
+        for value in (None, 3, "3", [True], [0], [-1], [2.0], ["2"])
+    ],
+    *[
+        _transformer_model(**{field: [4]})
+        for field in ("hidden_dims", "channels", "kernel_sizes", "pool_bins", "unknown")
+    ],
+    _transformer_model(kind="mlp"),
+    _transformer_model(kind="cnn1d"),
+    _cnn_model(d_model=8),
+    {"hidden_dims": [4], "d_model": 8},
+]
+
+
+@pytest.mark.parametrize("bad_model", _BAD_TRANSFORMERS)
+def test_transformer_strict_rejection_both_paths(
+    tmp_path: Path, bad_model: dict[str, object]
+) -> None:
+    with pytest.raises(ConfigError):
+        _load_mapping(tmp_path, _root_mapping(bad_model), "invalid_transformer.yaml")
     with pytest.raises(ConfigError):
         training_config.config_from_mapping(_root_mapping(bad_model))

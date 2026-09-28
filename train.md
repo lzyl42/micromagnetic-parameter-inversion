@@ -1,57 +1,35 @@
-# MLP 训练反演：首版实现说明（工程完成，非正式研究验证）
+# MLP / CNN1D / Temporal Transformer 训练反演：实现说明
 
-**状态**：prepare / train / evaluate 首版代码已实现（含本轮新增的停止
-原因记录与 test_metrics provenance），工程验证以聚焦离线测试（tmp 合成
-数据、CPU）为准；**未在正式研究数据上训练，不存在可靠科研结果，未做
-科研有效性验证**。`configs/training/mlp.yaml` 的 `dataset_name`/`run_name`
-仍为占位符，运行前必须替换（`load_config` 拒绝占位值），因此下述命令在
-占位状态下不会成功。现有 `data/raw/` 各数据集（哨兵/QC 轮）仅验证过格式
-与执行链，不构成科研训练有效性依据。
+**状态**：prepare / train / evaluate 工程支持三类模型；实现与离线单元验证
+不等于正式研究验证。**本轮仅获批实现主 Transformer 方案，未获准执行真实
+训练；尚未训练 Transformer，也未开展其轻量版实验。未在正式研究数据上
+训练，不存在可靠科研结论，未做 MuMax3 正向回代验证。**
 
-> **CNN1D 分支（P1 配置 + P2 模型 + P3 独立 checkpoint/工厂/评估 + P4 训练链
-> 已接通）**：P1 配置层已支持 `model.kind` 判别（缺省 `mlp`）与
-> CNN 结构字段 `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 的严格
-> 校验（YAML 与 `config_from_mapping` 共用同一 schema）；P2 已实现
-> `src/micromagnetic_parameter_inversion/models/cnn1d.py` 的 `CNN1DRegressor`
-> 并有 CPU 合成单元测试；P3 已实现独立 CNN checkpoint 与工厂（`training.py`
-> 的 `CNN_CKPT_FORMAT_VERSION=1`、冻结 `CNNCheckpoint`、
-> `save_cnn_checkpoint`/`load_cnn_checkpoint`、`ModelCheckpoint` 联合与
-> `load_any_checkpoint` 显式类别路由、`build_cnn_model`），以及评估侧对 CNN 的
-> 显式路由。CNN 完整结构、契约、预处理与元数据可独立保存/回读并在 CPU 上逐位
-> 复现预测；载荷以**顶层显式结构为权威**，嵌套 `config` 仅记录、不覆盖。MLP 的
-> `Checkpoint`/`save_checkpoint`/`load_checkpoint` 与序列化布局、版本**原样
-> 不变**；MLP 与 CNN checkpoint **互不接受**对方文件，未知/缺失/显式 `mlp`
-> kind 或残留 CNN 结构字段一律报错、绝不回退。
->
-> **P4 训练链已接通**：共享编排 `training.run(config_path, *, expected_kind)`
-> 落地在既有 `training.py`（**不新增 runner 模块**，无 `cnn1d.md`）；
-> `scripts/train_mlp.py` / `scripts/train_cnn1d.py` 均为其**薄入口**，分别声明
-> `expected_kind`，对非法/错配 `model.kind` 在读数据、建目录**之前**早拒；
-> `--config` 必填，两个入口命令用法与默认输出目录保持
-> `output_root()/training/<kind>/<dataset_name>/<run_name>`（`output_dir` 显式
-> 覆盖时原样使用，目录已存在拒绝覆盖）。`training.train_model` 现支持两类模型，
-> `TrainingResult.best_checkpoint`/`final_checkpoint` 为联合类型，
-> `save_model_checkpoint` 按 checkpoint 类别 dispatch 到独立 save 函数。
->
-> **独立与共同点**：CNN 与 MLP 只共用**同一 dataset 与冻结 split**；
-> checkpoint、训练产物与预处理统计**完全独立**——每个 run 自行做
-> **train-only** `preprocessing.fit`，不复用对方权重/checkpoint/统计/产物。
->
-> **验证范围**：P1–P4 均只经 CPU、tmp 合成数据、小 `max_epochs` 的离线测试
-> 验证（`tests/test_training.py`、`tests/test_evaluation.py`、
-> `tests/test_cnn1d.py`、`tests/test_training_config.py`）；**未在正式研究数据
-> 上训练，无超参搜索，不存在可靠科研结果**。`configs/training/cnn1d.yaml` 仍是
-> **全注释占位、无研究超参**：它**不能直接照抄运行**，须用户逐字段审定并显式
-> 填写 `model` 结构、替换 `dataset_name`/`run_name` 后才可加载执行；本文档不
-> 预填任何模型研究超参。
+仓库 `results/mlp.md`、`results/cnn.md`、`results/compare.md` 已保留历史
+MLP/CNN 合成 benchmark 的 val 报告（不是仅有单元测试，也不是可靠科研
+结论）。本轮未复核完整 1024 组数据、冻结 split 与历史 run 产物；本地缺少
+产物不能据此否认历史运行。val 曾用于选取 best checkpoint，相关报告具有
+选择偏差，不能作为独立 test 泛化结论。
+
+- 模型类别由 `model.kind` 严格判别：缺省为旧 `mlp`，另支持 `cnn1d`、
+  `transformer`；跨类别结构字段拒绝，YAML 与 mapping 共用解析器。
+- 三个训练薄入口调用 `training.run(config_path, *, expected_kind)`，均要求
+  `--config`；类别错配在读数据、建目录前报错。默认输出为
+  `output_root()/training/<kind>/<dataset_name>/<run_name>`，已有目录拒绝覆盖。
+- 三类模型共用同一 prepared dataset 与**冻结 split**，但权重、checkpoint、
+  预处理统计和训练产物独立。每个 run 自行执行 **train-only** 拟合。
+- 旧 MLP/CNN checkpoint 格式与版本保留；Transformer 使用独立 v1 格式，
+  `load_any_checkpoint` 显式路由，专用 loader 不接受其他模型类别。
+  显式结构与固定语义用于恢复模型，不由当前 YAML 覆盖。
+- `mlp.yaml` 的 dataset/run 名仍为占位符；`cnn1d.yaml` 仍为全注释大纲。
+  Transformer 主结构及入口见第 5、7 节；配置文件与示例命令不构成执行批准。
 
 ## 1. 目标与非目标
 
 - 目标：把已生成的 MuMax3 raw 输出规范化为模型可直接读取的 npz 样本，训练
-  MLP 反演 `alpha`、`Ku`。网络隐层规模采用本计划的首批工程候选
-  `64/32/32`（是否扩大由学习曲线决定）。
-- **首版已实现**：prepare（raw → npz/meta/split）、MLP 训练（仅 train/val）、
-  独立 evaluate（test）与 checkpoint 读写；工程验证为聚焦离线测试（见第 9
+  MLP、CNN1D 或 Temporal Transformer 反演 `alpha`、`Ku`。
+- **已实现**：prepare（raw → npz/meta/split）、三类模型训练（仅 train/val）、
+  独立 evaluate（val/test）与 checkpoint 读写；工程验证为聚焦离线测试（见第 9
   节）。正式数据实验、超参搜索与科研结论（含 MuMax3 正向回代）不在首版
   范围（见第 10 节待定研究项）。
 - 不重复物理 QC：生成侧 `parse_table` 已校验每行 |磁化分量| <= 1+1e-6、
@@ -168,12 +146,28 @@ index 列固定 `parameter_set_id,pulse_id,alpha,ku_j_per_m3,b_ext_x_T,b_ext_y_T
   （防 train 内某输出零方差——如同 alpha 场景——在 val/test 上除 0）；
   val/test 复用同一统计量；逆变换所需全部参数随 ckpt 保存。
 
-## 5. 模型与优化（models/mlp.py + training.py）
+## 5. 模型与优化（models/ + training.py）
 
 - 输入维度 `D = P × T × 3`，模型内 `Flatten([P,T,3] → D)` 后接 MLP：
   `Linear D→h1 → ReLU → … → Linear→2`（线性输出，无激活/约束）；
   `model.hidden_dims: [64, 32, 32]` 配置化。参数量参考：[64,32,32] 时为
   `64·D + 3266`（首层 D→64 主导），仅作容量参考。
+- CNN1D：按 `p*3+c` 排列为 `[B,3P,T]`，经过 Conv1d/ReLU、
+  AdaptiveAvgPool1d 与 Linear/ReLU 回归头；末层线性输出。
+- Temporal Transformer（`TemporalTransformerRegressor`）：外部输入仍为
+  `[B,P,T,3]`；`permute(0,2,1,3)` 后 reshape 为 `[B,T,3P]`，每个时间
+  token 内部顺序为 `p*3+c`。`Linear(3P,d_model)` 后加固定 index 正弦位置
+  编码（index `0..T-1`、base `10000`，不是按物理秒值编码），再做 Dropout。
+  Encoder 使用 `batch_first=True`、pre-LayerNorm、GELU，末尾有独立
+  LayerNorm；沿时间取 mean 后接 Linear/GELU 隐层和末层 Linear→2。
+  无 mask、patch、CLS 或 CNN stem；输入完整 `(P,T,3)` 必须匹配契约。
+  位置编码是非 persistent buffer，按固定算法重建、不参与优化；Encoder
+  各层矩阵（含 packed QKV）独立 Xavier 初始化，bias=0、LayerNorm
+  weight=1/bias=0，投影与回归头保留 PyTorch 默认初始化，模型内部不重设 seed。
+  `eval()` 关闭 dropout。
+- **已审定 Transformer 主结构**：`P=1,T=401,d_model=64,nhead=4,
+  num_layers=2,dim_feedforward=128,dropout=0.1,head_hidden_dims=[32]`，
+  参数量 **69,474**。这是实现配置，不是经训练证实的最优结构或性能结果。
 - 损失：MSE（标准化标签空间）。优化器：Adam。
 - **初始超参为工程候选，不是已验证的科研参数**，仅供起步：
   `lr=1e-3, weight_decay=0.0, batch_size=32, max_epochs=500,
@@ -191,18 +185,21 @@ src/micromagnetic_parameter_inversion/
   preprocessing.py     # [P,1,3] 广播标准化、标签变换与逆变换
   models/mlp.py        # MLP 定义（携带输入契约：P、T、C=3、pulse 顺序）
   models/cnn1d.py      # CNN1DRegressor（卷积特征 + 池化 + 回归头）
+  models/transformer.py # TemporalTransformerRegressor（时间 token + 固定 PE）
   training.py          # 训练循环、early stopping、ckpt 读写；共享 run 编排
                        # （load_config 一次 → kind 早拒 → train-only fit →
                        #  训练 → 产物）与 save_model_checkpoint 类别 dispatch
-  evaluation.py        # val/test 评估、物理单位指标、test_predictions 导出
+  evaluation.py        # val/test 评估、物理单位指标、逐参数组预测导出
 scripts/
   prepare_training_samples.py  # raw → samples/<dataset>/ npz + dataset_meta + split
   train_mlp.py                 # MLP 薄入口（training.run, expected_kind="mlp"）
   train_cnn1d.py               # CNN 薄入口（training.run, expected_kind="cnn1d"）
-  evaluate_model.py            # run/ckpt 定位 → run 内 split 副本的 test 指标
-                               # 与 test_predictions.csv
+  train_transformer.py         # Transformer 薄入口（expected_kind="transformer"）
+  evaluate_model.py            # run/ckpt 定位 → run 内 split 副本的 val/test 指标
+                               # 与 <split>_predictions.csv；默认 test
 configs/training/mlp.yaml       # MLP 训练配置（见第 7 节）
 configs/training/cnn1d.yaml     # CNN 配置：全注释占位，须审定填写后才可加载
+configs/training/transformer.yaml # 已审定 Transformer 主结构配置
 ```
 
 复用：`paths.data_root()/output_root()`（不硬编码机器路径）、
@@ -242,20 +239,46 @@ split:                # 仅 prepare 脚本使用
 output_dir: null      # null = output_root()/training/mlp/<dataset_name>/<run_name>
 ```
 
-调用流程（首版接口；占位符未替换时 `load_config` 拒绝运行，替换后按
-实际 dataset 使用）：
+Transformer 配置使用 `configs/training/transformer.yaml`，模型块为：
+
+```yaml
+model:
+  kind: transformer
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 128
+  dropout: 0.1
+  head_hidden_dims: [32]
+```
+
+六个结构字段均须显式填写：整数严格拒绝 bool/float/string，`d_model`
+须为正偶数且能被 `nhead` 整除，dropout 为有限实数且 `0 <= p < 1`；
+head 隐层允许空列表。MLP/CNN 继续使用 ReLU，Transformer 使用 GELU。
+dataset/run 名、标签变换与训练参数以实验配置为准；主结构获批不代表可以
+立即启动训练。再次使用已有 prepared dataset 时复用原冻结 split，不重跑
+prepare 来生成另一划分。
+当前主配置采用 `identity` 标签、seed 42，指向历史报告的
+`cofeb_protocol_b_a2_sobol1024_v1`；运行前须恢复并核对真实样本及原冻结
+split。`logalpha` 条件须使用另一份实验配置与独立 run，不能混写产物。
+
+调用流程（**获得相应执行批准后**按实际 dataset 使用；下列训练命令为各模型
+入口示例，并非要求连续执行三次训练；占位符未替换时配置加载会拒绝）：
 
 ```bash
 uv run python scripts/prepare_training_samples.py \
   --config configs/training/mlp.yaml --parameter-set-ids all
 uv run python scripts/train_mlp.py --config configs/training/mlp.yaml
 uv run python scripts/train_cnn1d.py --config configs/training/cnn1d.yaml
+uv run python scripts/train_transformer.py --config configs/training/transformer.yaml
+uv run python scripts/evaluate_model.py --run RUN_DIR --split val
 uv run python scripts/evaluate_model.py --run RUN_DIR
 ```
 
-训练入口只有 `--config` 一个开关，`--config` **必填**；MLP/CNN 两入口共用
+训练入口只有 `--config` 一个开关，`--config` **必填**；三类模型共用
 同一份 prepared dataset 与**冻结 split**，但各自写独立目录
-（`training/mlp/...` 与 `training/cnn1d/...`）并各自做 train-only 拟合。
+（`training/mlp/...`、`training/cnn1d/...`、`training/transformer/...`）
+并各自做 train-only 拟合。
 `configs/training/mlp.yaml` 的 `dataset_name`/`run_name` 仍为占位符，运行前
 必须替换；**`configs/training/cnn1d.yaml` 当前是全注释占位、无研究超参，不能
 直接执行**——须先由用户逐字段审定并显式填写 `model` 结构与
@@ -265,6 +288,10 @@ uv run python scripts/evaluate_model.py --run RUN_DIR
 evaluate 的 `--checkpoint CKPT` 为可选（默认 `<run>/best.pt`）；无论显式
 与否，ckpt 必须与 run 内 split 副本 SHA 绑定一致，结构/预处理全部取自
 ckpt，不要求提供当前训练 config 重建模型。
+`--split val|test` 只选择绑定 split 副本中的成员，默认 `test`，不允许传入
+替代划分文件。val 产物为 `val_metrics.json` / `val_predictions.csv`；
+test 保留 `test_metrics.json` / `test_predictions.csv`。val 有 best 选择
+偏差；test 不得用于调参或模型选择。
 
 ## 8. 训练循环、指标与产物
 
@@ -287,15 +314,19 @@ ckpt，不要求提供当前训练 config 重建模型。
   `numerical_failure`）、`stop_epoch` 与 `detail`（记录停止时的 metrics），
   随 run 产物保存。数值失败（非有限 loss/grad/pred）以**非零退出码**
   结束；此时保留的此前有效权重（best/final）**不代表训练成功**。
-- 指标（物理单位，alpha 与 Ku **分别**报告）：首版仅 MAE、RMSE；主域排除
+- 指标（物理单位，alpha 与 Ku **分别**报告）：MAE、RMSE 与 MAPE 百分数；主域排除
   Ku = 0 的物理 control（按 dataset_meta 的 psid→Ku 表识别），control
-  单独一行报告、不计入主域指标；相对误差不在首版指标内（未来可选，届时
-  再定义零值剔除与计数口径）。每个指标子集同时输出样本数 `n`；某子集为
+  单独报告、不计入主域指标。MAPE 为 `100 * mean(abs(pred-true)/abs(true))`
+  （分母取绝对值，通用指标不限制 alpha/Ku 的物理域）；某子集任一真实
+  alpha（或 Ku）为 0 时，仅该列 MAPE 为 `null`（alpha/Ku 对称），不加
+  epsilon、不剔除零值来改动子集，MAE/RMSE 与另一列指标照常计算。仅
+  `logalpha` label 变换要求 alpha > 0，与指标计算无关。
+  每个指标子集同时输出样本数 `n`；某子集为
   空（如 control 为空）时该子集指标输出 `null`（JSON null，**非 NaN、
   非 0**）；不得为凑出非空指标重新切分子集或追加剔除样本。预测含非有限
   值 → 报错，不当作空子集。
-- 常规 evaluate（`scripts/evaluate_model.py --run RUN_DIR`）：split 仅
-  从该 run 保存的 split 副本定位（接口不接收 split 参数；经
+- 常规 evaluate（`scripts/evaluate_model.py --run RUN_DIR [--split val|test]`）：
+  默认 test；划分仅从该 run 保存的 split 副本定位（不接收替代 split 路径；经
   `load_split(..., split_path=副本)` 走同一校验边界）；checkpoint 保存
   该副本的 SHA-256，加载时核对，不一致即报错（防另选 checkpoint 与 run
   划分错配）；dataset_meta 按锚点 `data_root()/samples/<dataset>/` +
@@ -305,9 +336,9 @@ ckpt，不要求提供当前训练 config 重建模型。
   一致：`x` 形状 `[P,T,3]`、`pulse_ids` 顺序、`t_s` 数组，任一不符即
   报错——这是契约校验，**不是物理 QC**。`run_evaluation` 返回
   `(report, rows)`；推理在 CPU 上按 ckpt 的 batch_size 分批
-  （eval/`no_grad`），产物 `test_metrics.json`（main/control 的 n 与
-  MAE/RMSE，另含 provenance：实际使用的 checkpoint 路径、checkpoint
-  sha256 与 split sha256）与 `test_predictions.csv`（行序按 split.test
+  （eval/`no_grad`），产物 `<split>_metrics.json`（main/control 的 n 与
+  MAE/RMSE/MAPE，另含 provenance：实际使用的 checkpoint 路径、checkpoint
+  sha256、split sha256 与所选 val/test）与 `<split>_predictions.csv`（行序按所选 split
   成员顺序）写入 run 目录，各只写一次、拒绝覆盖旧评估。
 - 输出目录（`output_root()/training/...`，不入库）：
   `config_resolved.yaml`（生效配置快照）、split.yaml 副本（唯一权威
@@ -324,8 +355,10 @@ ckpt，不要求提供当前训练 config 重建模型。
 - ckpt 内容包含：
   - `ckpt_format_version`（ckpt schema 版本号）
   - `model_state_dict`
-  - 模型结构显式字段：`hidden_dims`（如 [64,32,32]）与激活函数配置
-    （不只藏在 config 副本里）
+  - 模型结构显式字段：MLP 的 `hidden_dims`、CNN 的四个结构字段，或
+    Transformer 的六个结构字段及固定语义（GELU、index sinusoidal PE、
+    pre-norm、mean pooling、时间 token 布局）；不只藏在 config 副本里。
+    Transformer 独立 v1 checkpoint 按算法重建 PE，旧 MLP/CNN 格式保留。
   - 输入契约：P、T、C=3、pulse 顺序（冻结 pulse_id 序列）、磁化分量序
     （mx,my,mz）、实际时间网格（t_s 数组）；dataset_meta 引用（锚点内
     相对路径 + sha256）——**不内嵌协议摘要**，协议元信息仍以外部
@@ -356,8 +389,10 @@ ckpt，不要求提供当前训练 config 重建模型。
 5. preprocessing：仅 train 拟合（val/test 统计不影响输出）；[P,1,3] 广播
    形状正确；x/y 零方差位置除数均取 1；y 变换-逆变换往返恢复原值；
    logalpha 遇 alpha <= 0 报错。
-6. 模型：输入 [N,P,T,3] 展平 D=P*T*3，前向输出 [N,2]；hidden_dims 配置
-   生效。
+6. 模型：MLP 展平与 CNN 通道布局；Transformer 时间 token 的多 pulse
+   布局、非连续输入、PE 广播/buffer/时间排列敏感性、有限 forward/backward、
+   同 seed 复现、Encoder 层独立初始化、eval batch 一致性及主结构参数量。
+   各模型输入 [N,P,T,3]、输出 [N,2]。
 7. CPU smoke：微型合成集跑 1–2 epoch 全流程（zero_grad/backward/step 后
    权重发生有限更新），产物齐全、ckpt 重载一致、evaluate 输出每参数组合
    一行、两次重载推理结果一致。
@@ -383,23 +418,28 @@ ckpt，不要求提供当前训练 config 重建模型。
 
 - 配置/数据：`training_config.py`（严格 YAML 加载，`model.kind` 判别）、
   `training_data.py`（npz/协议快照/split/Dataset）、
-  `configs/training/mlp.yaml`、`configs/training/cnn1d.yaml`（全注释占位）
+  `configs/training/mlp.yaml`、`configs/training/cnn1d.yaml`（全注释占位）、
+  `configs/training/transformer.yaml`（主结构）
 - 预处理/模型：`preprocessing.py`（train-only 拟合与变换）、
-  `models/mlp.py`（MLPRegressor）、`models/cnn1d.py`（CNN1DRegressor，P2）
+  `models/mlp.py`（MLPRegressor）、`models/cnn1d.py`（CNN1DRegressor）、
+  `models/transformer.py`（TemporalTransformerRegressor）
 - 训练/评估：`training.py`（训练循环/early stopping/ckpt 读写；P3 独立
   `CNNCheckpoint` 与 `build_cnn_model`/`save_cnn_checkpoint`/
   `load_cnn_checkpoint`/`load_any_checkpoint`；P4 共享 `run` 编排、
-  两模型 `train_model`、`save_model_checkpoint` 类别 dispatch）、
+  三模型 `train_model`、`save_model_checkpoint` 类别 dispatch；Transformer
+  独立 v1 checkpoint 与工厂）、
   `evaluation.py`（绑定校验/指标，按 ckpt 类别显式路由）；入口
   `scripts/prepare_training_samples.py`、`scripts/train_mlp.py`、
-  `scripts/train_cnn1d.py`、`scripts/evaluate_model.py`；测试
+  `scripts/train_cnn1d.py`、`scripts/train_transformer.py`、
+  `scripts/evaluate_model.py`；测试
   `tests/test_training_config.py`、`tests/test_training_data.py`、
   `tests/test_preprocessing.py`、`tests/test_mlp.py`、
-  `tests/test_cnn1d.py`、`tests/test_training.py`、
+  `tests/test_cnn1d.py`、`tests/test_transformer.py`、`tests/test_training.py`、
   `tests/test_evaluation.py`
 
-**以上为工程实现与离线验证：未在正式研究数据上训练，未做科研有效性
-验证，不存在任何研究结论。**
+**以上为工程实现与离线验证范围，不是全套测试通过声明。历史 MLP/CNN
+合成 val 报告见本文开头；Transformer 尚未训练。未在正式研究数据上训练，
+未做科研有效性验证，不存在可靠科研结论。**
 
 待定研究项（不阻塞工程实现，需研究决策/数据后定）：
 - 正式协议的 pulse 集合与时间网格冻结；
