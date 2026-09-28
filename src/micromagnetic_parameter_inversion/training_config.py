@@ -54,7 +54,7 @@ type LabelTransform = Literal["identity", "logalpha"]
 type ActivationName = Literal["relu"]
 
 # Model kind declared by the training entry (``training.run`` expected_kind).
-type ModelKind = Literal["mlp", "cnn1d"]
+type ModelKind = Literal["mlp", "cnn1d", "transformer"]
 
 _TOP_LEVEL_KEYS = frozenset(
     {
@@ -72,10 +72,14 @@ _TOP_LEVEL_KEYS = frozenset(
 _DATA_KEYS = frozenset({"pulse_order"})
 # model block: kind values and per-kind mutually exclusive field sets
 # (unknown/cross-kind fields are always rejected).
-_MODEL_KINDS = frozenset({"mlp", "cnn1d"})
+_MODEL_KINDS = frozenset({"mlp", "cnn1d", "transformer"})
 _MODEL_KEYS_MLP = frozenset({"kind", "hidden_dims"})
 _MODEL_KEYS_CNN1D = frozenset({"kind", "channels", "kernel_sizes", "pool_bins", "head_hidden_dims"})
 _CNN1D_REQUIRED = frozenset({"channels", "kernel_sizes", "pool_bins", "head_hidden_dims"})
+_TRANSFORMER_REQUIRED = frozenset(
+    {"d_model", "nhead", "num_layers", "dim_feedforward", "dropout", "head_hidden_dims"}
+)
+_MODEL_KEYS_TRANSFORMER = _TRANSFORMER_REQUIRED | {"kind"}
 _LABEL_KEYS = frozenset({"transform"})
 _PREPROCESSING_KEYS = frozenset({"std_eps"})
 _TRAINING_KEYS = frozenset(
@@ -136,6 +140,19 @@ class CNN1DModelConfig:
     pool_bins: int
     head_hidden_dims: tuple[int, ...]
     kind: Literal["cnn1d"] = field(default="cnn1d", init=False)
+
+
+@dataclass(frozen=True)
+class TransformerModelConfig:
+    """Temporal Transformer structure: all fields explicit; head_hidden_dims may be empty."""
+
+    d_model: int
+    nhead: int
+    num_layers: int
+    dim_feedforward: int
+    dropout: float
+    head_hidden_dims: tuple[int, ...]
+    kind: Literal["transformer"] = field(default="transformer", init=False)
 
 
 @dataclass(frozen=True)
@@ -220,7 +237,7 @@ class ExperimentConfig:
     dataset_name: str
     run_name: str
     data: DataConfig = DataConfig()
-    model: ModelConfig | CNN1DModelConfig = ModelConfig()
+    model: ModelConfig | CNN1DModelConfig | TransformerModelConfig = ModelConfig()
     label: LabelConfig = LabelConfig()
     preprocessing: PreprocessingConfig = PreprocessingConfig()
     training: TrainingParams = TrainingParams()
@@ -284,7 +301,9 @@ def _parse_int_sequence(value: object, field: str, *, allow_empty: bool) -> tupl
     return tuple(_require_positive_int(item, f"{field}[{i}]") for i, item in enumerate(value))
 
 
-def _parse_model_value(value: object, field: str) -> ModelConfig | CNN1DModelConfig:
+def _parse_model_value(
+    value: object, field: str
+) -> ModelConfig | CNN1DModelConfig | TransformerModelConfig:
     """Strict ``model`` block parsing (shared by YAML and config_from_mapping).
 
     - ``kind`` absent is equivalent to ``"mlp"`` (only the old MLP field
@@ -293,6 +312,9 @@ def _parse_model_value(value: object, field: str) -> ModelConfig | CNN1DModelCon
       are non-empty positive integers with matching layer counts and all-odd
       kernels, ``pool_bins`` is a positive integer, and ``head_hidden_dims`` is
       provided explicitly (may be empty) with each element a positive integer;
+    - ``kind="transformer"`` requires all six structure fields; the width must
+      be even and divisible by the head count, dropout is finite in [0,1), and
+      ``head_hidden_dims`` may be empty;
     - kind fields are strictly mutually exclusive, unknown fields are rejected;
       ``kind`` and sequence elements both reject bool.
     """
@@ -300,6 +322,27 @@ def _parse_model_value(value: object, field: str) -> ModelConfig | CNN1DModelCon
     kind = raw.get("kind", "mlp")
     if isinstance(kind, bool) or not isinstance(kind, str) or kind not in _MODEL_KINDS:
         _fail(f"{field}.kind", f"must be one of {sorted(_MODEL_KINDS)} (got {kind!r})")
+    if kind == "transformer":
+        _check_keys(raw, field, _MODEL_KEYS_TRANSFORMER, _TRANSFORMER_REQUIRED)
+        d_model = _require_positive_int(raw["d_model"], f"{field}.d_model")
+        nhead = _require_positive_int(raw["nhead"], f"{field}.nhead")
+        if d_model % 2 or d_model % nhead:
+            _fail(f"{field}.d_model", "must be even and divisible by nhead")
+        dropout = _require_non_negative_number(raw["dropout"], f"{field}.dropout")
+        if dropout >= 1:
+            _fail(f"{field}.dropout", "must be < 1")
+        return TransformerModelConfig(
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=_require_positive_int(raw["num_layers"], f"{field}.num_layers"),
+            dim_feedforward=_require_positive_int(
+                raw["dim_feedforward"], f"{field}.dim_feedforward"
+            ),
+            dropout=dropout,
+            head_hidden_dims=_parse_int_sequence(
+                raw["head_hidden_dims"], f"{field}.head_hidden_dims", allow_empty=True
+            ),
+        )
     if kind == "cnn1d":
         _check_keys(raw, field, _MODEL_KEYS_CNN1D, _CNN1D_REQUIRED)
         channels = _parse_int_sequence(raw["channels"], f"{field}.channels", allow_empty=False)
@@ -365,7 +408,9 @@ def _parse_data(root: dict[Any, Any]) -> DataConfig:
     return DataConfig(**kwargs)
 
 
-def _parse_model(root: dict[Any, Any]) -> ModelConfig | CNN1DModelConfig:
+def _parse_model(
+    root: dict[Any, Any],
+) -> ModelConfig | CNN1DModelConfig | TransformerModelConfig:
     """``model`` section: absent → MLP default; present → shared strict parser (null rejected)."""
     if "model" not in root:
         return ModelConfig()
@@ -466,16 +511,17 @@ def load_config(path: Path) -> ExperimentConfig:
     level uses a strict schema (unknown fields and duplicate YAML keys rejected);
     dataset_name/run_name are required, safe single path segments, and must not
     keep placeholders; data.pulse_order is null or a duplicate-free pulse_id
-    list; model.kind ∈ {mlp,cnn1d} and is validated strictly per kind (MLP
-    hidden_dims non-empty positive integers; CNN channels/kernel_sizes non-empty
-    positive integers with matching layer counts and odd kernels, pool_bins a
-    positive integer, head_hidden_dims explicitly present and possibly empty);
-    label.transform takes a legal value; std_eps/learning_rate/batch_size/
-    max_epochs/patience are positive, weight_decay/min_delta non-negative (0 is
-    valid); device ∈ {auto,cpu,cuda} (same semantics as runtime.select_device);
-    ratios are non-negative, finite, and sum to 1 (tolerance 1e-9);
-    min_per_split are non-negative integers; output_dir is null or a non-empty
-    string. Absent optional sections use dataclass defaults.
+    list; model.kind ∈ {mlp,cnn1d,transformer} and is validated strictly per
+    kind (MLP hidden_dims non-empty positive integers; CNN channels/kernel_sizes
+    non-empty positive integers with matching layer counts and odd kernels,
+    pool_bins a positive integer, head_hidden_dims explicitly present and
+    possibly empty; Transformer structure fields explicitly present and strictly
+    validated); label.transform takes a legal value; std_eps/learning_rate/
+    batch_size/max_epochs/patience are positive, weight_decay/min_delta
+    non-negative (0 is valid); device ∈ {auto,cpu,cuda} (same semantics as
+    runtime.select_device); ratios are non-negative, finite, and sum to 1
+    (tolerance 1e-9); min_per_split are non-negative integers; output_dir is
+    null or a non-empty string. Absent optional sections use dataclass defaults.
 
     Raises:
         ConfigError: messages include the field path (e.g. training.batch_size).
@@ -510,11 +556,23 @@ def load_config(path: Path) -> ExperimentConfig:
     )
 
 
-def _model_to_mapping(model: ModelConfig | CNN1DModelConfig) -> dict[str, Any]:
+def _model_to_mapping(
+    model: ModelConfig | CNN1DModelConfig | TransformerModelConfig,
+) -> dict[str, Any]:
     """model → plain dict: MLP keeps the old layout (no kind, for old ckpt nested
-    config compatibility); CNN emits kind + the four fields (reloadable by
-    ``config_from_mapping``).
+    config compatibility); CNN/Transformer emit kind + structure fields
+    (reloadable by ``config_from_mapping``).
     """
+    if isinstance(model, TransformerModelConfig):
+        return {
+            "kind": model.kind,
+            "d_model": model.d_model,
+            "nhead": model.nhead,
+            "num_layers": model.num_layers,
+            "dim_feedforward": model.dim_feedforward,
+            "dropout": model.dropout,
+            "head_hidden_dims": list(model.head_hidden_dims),
+        }
     if isinstance(model, CNN1DModelConfig):
         return {
             "kind": model.kind,

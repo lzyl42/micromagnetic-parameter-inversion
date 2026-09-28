@@ -8,22 +8,25 @@ import pytest
 import yaml
 
 from micromagnetic_parameter_inversion import training_config
-from micromagnetic_parameter_inversion.models import CNN1DRegressor
+from micromagnetic_parameter_inversion.models import CNN1DRegressor, TemporalTransformerRegressor
 from micromagnetic_parameter_inversion.training_config import (
     CNN1DModelConfig,
     ConfigError,
     ModelConfig,
     SplitRatios,
+    TransformerModelConfig,
     load_config,
 )
 
 _MINIMAL = "dataset_name: demo_ds\nrun_name: run_001\n"
 
-# Real checked-in templates (not duplicated fixtures): the CNN config must stay a
-# valid YAML template that mirrors the MLP config and keeps its placeholders.
+# Real checked-in templates (not duplicated fixtures): the CNN and Transformer
+# configs must stay valid YAML templates that mirror the MLP config and keep
+# their placeholders.
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _CNN_TEMPLATE_PATH = _PROJECT_ROOT / "configs" / "training" / "cnn1d.yaml"
 _MLP_TEMPLATE_PATH = _PROJECT_ROOT / "configs" / "training" / "mlp.yaml"
+_TRANSFORMER_TEMPLATE_PATH = _PROJECT_ROOT / "configs" / "training" / "transformer.yaml"
 
 
 def _write(tmp_path: Path, text: str, name: str = "mlp.yaml") -> Path:
@@ -267,7 +270,7 @@ _BAD_CNN_MODELS: tuple[tuple[str, dict[str, object]], ...] = (
     ("missing_kernel_sizes", _without("kernel_sizes")),
     ("missing_pool_bins", _without("pool_bins")),
     ("missing_head", _without("head_hidden_dims")),
-    ("unknown_kind", _cnn_model(kind="transformer")),
+    ("unknown_kind", _cnn_model(kind="unknown_model")),
     ("kind_non_string", _cnn_model(kind=1)),
     ("kind_bool", _cnn_model(kind=True)),
     ("unknown_key", {**_cnn_model(), "bogus": 1}),
@@ -436,3 +439,134 @@ def test_checked_in_cnn_template_parameter_count(tmp_path: Path) -> None:
         head_hidden_dims=config.model.head_hidden_dims,
     )
     assert sum(parameter.numel() for parameter in model.parameters()) == 4930
+
+
+# --- transformer model block: synthetic roundtrip and strict rejection (both paths) ---
+
+
+def _transformer_model(**overrides: object) -> dict[str, object]:
+    block: dict[str, object] = {
+        "kind": "transformer",
+        "d_model": 8,
+        "nhead": 2,
+        "num_layers": 2,
+        "dim_feedforward": 16,
+        "dropout": 0.1,
+        "head_hidden_dims": [4],
+    }
+    block.update(overrides)
+    return block
+
+
+@pytest.mark.parametrize("head", [[], [4]])
+@pytest.mark.parametrize("dropout", [0, 0.1])
+def test_transformer_roundtrip(tmp_path: Path, head: list[int], dropout: float) -> None:
+    block = _transformer_model(head_hidden_dims=head, dropout=dropout)
+    config = _load_mapping(tmp_path, _root_mapping(block), "transformer.yaml")
+    assert isinstance(config.model, training_config.TransformerModelConfig)
+    assert config.model.head_hidden_dims == tuple(head)
+    serialized = training_config.config_to_mapping(config)
+    assert serialized["model"] == block
+    assert training_config.config_from_mapping(serialized) == config
+    assert _load_mapping(tmp_path, serialized, "reloaded.yaml") == config
+
+
+_BAD_TRANSFORMERS = [
+    *[
+        {key: value for key, value in _transformer_model().items() if key != missing}
+        for missing in _transformer_model()
+    ],
+    *[
+        _transformer_model(**{field: value})
+        for field in ("d_model", "nhead", "num_layers", "dim_feedforward")
+        for value in (True, 0, -1, 2.0, "2", None)
+    ],
+    _transformer_model(d_model=7),
+    _transformer_model(nhead=3),
+    *[
+        _transformer_model(dropout=value)
+        for value in (True, "0.1", None, -0.1, 1, float("nan"), float("inf"))
+    ],
+    *[
+        _transformer_model(head_hidden_dims=value)
+        for value in (None, 3, "3", [True], [0], [-1], [2.0], ["2"])
+    ],
+    *[
+        _transformer_model(**{field: [4]})
+        for field in ("hidden_dims", "channels", "kernel_sizes", "pool_bins", "unknown")
+    ],
+    _transformer_model(kind="mlp"),
+    _transformer_model(kind="cnn1d"),
+    _cnn_model(d_model=8),
+    {"hidden_dims": [4], "d_model": 8},
+]
+
+
+@pytest.mark.parametrize("bad_model", _BAD_TRANSFORMERS)
+def test_transformer_strict_rejection_both_paths(
+    tmp_path: Path, bad_model: dict[str, object]
+) -> None:
+    with pytest.raises(ConfigError):
+        _load_mapping(tmp_path, _root_mapping(bad_model), "invalid_transformer.yaml")
+    with pytest.raises(ConfigError):
+        training_config.config_from_mapping(_root_mapping(bad_model))
+
+
+# --- checked-in transformer template: valid YAML, placeholders rejected, substitutes load ---
+
+
+def test_checked_in_transformer_template_is_valid_yaml_and_rejects_placeholders() -> None:
+    # The shipped template is a real YAML mapping that intentionally keeps its
+    # placeholders, so load_config refuses it until they are replaced.
+    loaded = yaml.safe_load(_TRANSFORMER_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict)
+    with pytest.raises(ConfigError, match="placeholder"):
+        load_config(_TRANSFORMER_TEMPLATE_PATH)
+
+
+def test_checked_in_transformer_template_loads_after_placeholder_substitution(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(_TRANSFORMER_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    model_block = raw["model"]
+    assert isinstance(model_block, dict)
+    config = load_config(
+        _template_with_names(tmp_path, _TRANSFORMER_TEMPLATE_PATH, "transformer.yaml")
+    )
+    assert isinstance(config.model, TransformerModelConfig)
+    assert config.model.kind == "transformer"
+    assert config.model.d_model == model_block["d_model"]
+    assert config.model.nhead == model_block["nhead"]
+    assert config.model.num_layers == model_block["num_layers"]
+    assert config.model.dim_feedforward == model_block["dim_feedforward"]
+    assert config.model.dropout == pytest.approx(model_block["dropout"])
+    assert 0 <= config.model.dropout < 1
+    assert config.model.head_hidden_dims == tuple(model_block["head_hidden_dims"])
+    # Every shared field equals the MLP template (structural mirroring).
+    mlp = load_config(_template_with_names(tmp_path, _MLP_TEMPLATE_PATH, "mlp.yaml"))
+    assert config.data == mlp.data
+    assert config.label == mlp.label
+    assert config.preprocessing == mlp.preprocessing
+    assert config.training == mlp.training
+    assert config.split == mlp.split
+    assert config.output_dir == mlp.output_dir is None
+
+
+def test_checked_in_transformer_template_parameter_count(tmp_path: Path) -> None:
+    # The template architecture is instantiated offline only (no data, no training)
+    # and yields the parameter count reported in results/transformer.md.
+    config = load_config(
+        _template_with_names(tmp_path, _TRANSFORMER_TEMPLATE_PATH, "transformer.yaml")
+    )
+    assert isinstance(config.model, TransformerModelConfig)
+    model = TemporalTransformerRegressor(
+        (1, 401, 3),
+        d_model=config.model.d_model,
+        nhead=config.model.nhead,
+        num_layers=config.model.num_layers,
+        dim_feedforward=config.model.dim_feedforward,
+        dropout=config.model.dropout,
+        head_hidden_dims=config.model.head_hidden_dims,
+    )
+    assert sum(parameter.numel() for parameter in model.parameters()) == 69474

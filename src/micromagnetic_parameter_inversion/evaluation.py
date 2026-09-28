@@ -25,17 +25,23 @@ EvaluationError):
   default path; the same split across runs is legal and simply recorded
   faithfully without introducing new restrictions.
 
-Metrics (physical units, alpha/Ku reported separately): first version reports
-only MAE/RMSE; the main domain excludes the Ku = 0 control, which is reported
+Metrics (physical units, alpha/Ku reported separately): MAE/RMSE and MAPE
+(percent); the main domain excludes the Ku = 0 control, which is reported
 separately and not counted in the main domain; each subset outputs its sample
 count ``n``, and an empty subset (n=0) has ``None`` metrics (JSON null, not
-NaN/0); no re-splitting to pad metrics. Predictions/inputs containing
-non-finite values are explicitly rejected (PreprocessingError/EvaluationError),
-not treated as an empty subset.
+NaN/0); no re-splitting to pad metrics. The MAPE denominator is ``abs(true)``
+(symmetric in alpha/Ku): if any true alpha (or Ku) in a subset is 0, only that
+column's MAPE is ``None``, with no epsilon and no dropped samples, while
+MAE/RMSE and the other column's metrics are computed as usual; the generic
+metrics impose no physical-domain restriction (alpha may be 0, Ku may be
+0/negative), and only the ``logalpha`` label transform requires alpha > 0 on
+the fitting/loading side. Predictions/inputs containing non-finite values are
+explicitly rejected (PreprocessingError/EvaluationError), not treated as an
+empty subset.
 
 ``run_evaluation`` is pure computation (no disk writes) and returns
-``(EvaluationReport, rows)``; the writes of test_metrics.json /
-test_predictions.csv are orchestrated by ``evaluate_model.py`` (via
+``(EvaluationReport, rows)``; the writes of ``<split>_metrics.json`` /
+``<split>_predictions.csv`` are orchestrated by ``evaluate_model.py`` (via
 ``export_test_predictions``, refusing overwrite, LF line endings, one row per
 psid).
 
@@ -55,6 +61,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import torch
@@ -71,8 +78,11 @@ class EvaluationError(ValueError):
 class SubsetMetrics:
     """Result for a single metric subset (main domain or control).
 
-    Empty subset (n=0): ``n`` is reported as 0 and all four metrics are
-    ``None`` (serialized as JSON null; NaN or 0 padding is not allowed).
+    Empty subset (n=0): ``n`` is reported as 0 and all metrics are ``None``
+    (JSON null). MAPE = 100 * mean(abs(pred - true) / abs(true)); if any true
+    alpha (or Ku) is 0, only that column's MAPE is None, with no epsilon and no
+    dropped samples, while MAE/RMSE and the other column's MAPE are computed as
+    usual.
     """
 
     n: int  # subset sample count (always reported)
@@ -80,6 +90,8 @@ class SubsetMetrics:
     rmse_alpha: float | None  # physical-unit RMSE (alpha)
     mae_ku: float | None  # physical-unit MAE (Ku, J/m^3)
     rmse_ku: float | None  # physical-unit RMSE (Ku, J/m^3)
+    mape_percent_alpha: float | None = None
+    mape_percent_ku: float | None = None
 
 
 @dataclass(frozen=True)
@@ -101,11 +113,12 @@ class EvaluationProvenance:
     checkpoint_path: str
     checkpoint_sha256: str
     split_sha256: str
+    split: Literal["val", "test"] = "test"
 
 
 @dataclass(frozen=True)
 class EvaluationReport:
-    """Test-set evaluation report (source of test_metrics.json)."""
+    """val/test evaluation report; the actual subset is recorded by provenance.split."""
 
     main: SubsetMetrics  # main domain: excludes the Ku = 0 control
     control: SubsetMetrics  # Ku = 0 physical control, reported separately; excluded from main
@@ -114,10 +127,10 @@ class EvaluationReport:
 
 @dataclass(frozen=True)
 class PredictionRow:
-    """One row of test_predictions.csv (one row per parameter set, no pulse_id column)."""
+    """One row of ``<split>_predictions.csv`` (one row per parameter set, no pulse_id column)."""
 
     parameter_set_id: str
-    split: str  # normal evaluate only evaluates the run split copy's test members
+    split: str  # val or test members of the run's split copy
     alpha_true: float
     alpha_pred: float
     ku_true: float
@@ -127,13 +140,17 @@ class PredictionRow:
 def compute_subset_metrics(
     y_true: Sequence[Sequence[float]], y_pred: Sequence[Sequence[float]]
 ) -> SubsetMetrics:
-    """Physical-unit MAE/RMSE (alpha/Ku reported separately, no cross-column merge, no re-split).
+    """Physical-unit MAE/RMSE and MAPE percent (computed per output, no re-split).
 
     Args:
         y_true/y_pred: ``[n, 2]`` sequences (physical units, column order alpha/ku).
 
     Returns:
-        ``n == 0`` → ``n=0`` and all four metrics are ``None`` (JSON null, neither NaN nor 0).
+        ``n == 0`` → ``n=0`` and all metrics are ``None`` (JSON null). The MAPE
+        denominator is ``abs(true)``; if any true value in a column is 0, that
+        column's MAPE is ``None`` (no dropped samples, no epsilon), while the
+        other metrics are computed as usual. The generic metrics impose no
+        physical-domain restriction.
 
     Raises:
         EvaluationError: the two sequences have different lengths, their shape is
@@ -168,6 +185,16 @@ def compute_subset_metrics(
         rmse_alpha=float(rmse[0]),
         mae_ku=float(mae[1]),
         rmse_ku=float(rmse[1]),
+        mape_percent_alpha=(
+            None
+            if np.any(true[:, 0] == 0)
+            else float(100 * np.mean(np.abs(diff[:, 0]) / np.abs(true[:, 0])))
+        ),
+        mape_percent_ku=(
+            None
+            if np.any(true[:, 1] == 0)
+            else float(100 * np.mean(np.abs(diff[:, 1]) / np.abs(true[:, 1])))
+        ),
     )
 
 
@@ -179,6 +206,8 @@ def resolve_checkpoint_path(run_dir: Path, checkpoint_path: Path | None = None) 
 def run_evaluation(
     run_dir: Path,
     checkpoint_path: Path | None = None,
+    *,
+    split: Literal["val", "test"] = "test",
 ) -> tuple[EvaluationReport, tuple[PredictionRow, ...]]:
     """Normal evaluate main flow: returns ``(EvaluationReport, rows)`` (pure computation,
     no writes).
@@ -187,12 +216,15 @@ def run_evaluation(
         run_dir: training run directory (source for locating the split copy / ckpt).
         checkpoint_path: default ``<run_dir>/best.pt``; whether explicit or not,
             the ckpt split SHA must match the run copy.
+        split: val/test only, default test; val is affected by best-checkpoint
+            selection bias and cannot be an independent generalization
+            conclusion; test must never be used for model selection.
 
     Orchestration:
 
     1. ``ckpt = training.load_any_checkpoint(...)``; route on the explicit
-       ``model_kind`` (MLP/CNN, no fallback), with structure/preprocessing/label
-       all from the ckpt (not the current YAML);
+       ``model_kind`` (MLP/CNN/Transformer, no fallback), with structure/
+       preprocessing/label all from the ckpt (not the current YAML);
     2. check the run split copy sha256 against ``ckpt.split_sha256``; then build
        ``EvaluationProvenance`` (actual ckpt path, file-bytes sha256 read once,
        and the split_sha256 from that ckpt);
@@ -200,9 +232,10 @@ def run_evaluation(
        dataset_name cross-check;
     4. ``training_data.load_split(samples_dir, meta, split_path=copy)``: the same
        load boundary (npz existence against the real sample directory);
-    5. batch the test members by ``ckpt.config.training.batch_size``: CPU, eval,
-       ``no_grad`` forward, ``load_sample`` contract validation (x shape/pulse_ids
-       order/t_s), and ``inverse_transform_y`` to restore physical units;
+    5. batch the selected val/test members by ``ckpt.config.training.batch_size``:
+       CPU, eval, ``no_grad`` forward, ``load_sample`` contract validation
+       (x shape/pulse_ids order/t_s), and ``inverse_transform_y`` to restore
+       physical units;
     6. divide main domain/control by the meta psid→Ku table (Ku = 0 → control),
        each with ``compute_subset_metrics``;
     7. assemble the ``PredictionRow`` sequence (the writes are orchestrated by
@@ -216,6 +249,8 @@ def run_evaluation(
             inverse transform, or ckpt load failure (re-raised as-is; the caller
             presents them uniformly).
     """
+    if split not in ("val", "test"):
+        raise EvaluationError("evaluation split must be val or test")
     run_dir = Path(run_dir)
     ckpt_path = resolve_checkpoint_path(run_dir, checkpoint_path)
     ckpt = training.load_any_checkpoint(ckpt_path)
@@ -232,6 +267,7 @@ def run_evaluation(
         checkpoint_path=str(ckpt_path),
         checkpoint_sha256=training_data.sha256_file(ckpt_path),
         split_sha256=ckpt.split_sha256,
+        split=split,
     )
 
     meta_path = _resolve_meta_path(ckpt)
@@ -241,9 +277,9 @@ def run_evaluation(
             f"dataset_meta.dataset_name {meta.dataset_name!r} does not match ckpt config "
             f"{ckpt.config.dataset_name!r} ({meta_path})"
         )
-    split = training_data.load_split(samples_dir, meta, split_path=split_copy)
+    split_definition = training_data.load_split(samples_dir, meta, split_path=split_copy)
 
-    rows = _evaluate_test_rows(ckpt, samples_dir, meta, split)
+    rows = _evaluate_rows(ckpt, samples_dir, split_definition, split)
     report = _build_report(rows, meta, provenance)
     return report, tuple(rows)
 
@@ -272,18 +308,18 @@ def _resolve_meta_path(ckpt: training.ModelCheckpoint) -> Path:
     return candidate
 
 
-def _evaluate_test_rows(
+def _evaluate_rows(
     ckpt: training.ModelCheckpoint,
     samples_dir: Path,
-    meta: training_data.DatasetMeta,
-    split: training_data.SplitDefinition,
+    split_definition: training_data.SplitDefinition,
+    split: Literal["val", "test"],
 ) -> list[PredictionRow]:
-    """Batched inference over the test members (CPU/eval/no_grad) → physical-unit
-    PredictionRow list.
+    """Batched inference over the selected val/test members (CPU/eval/no_grad) →
+    physical-unit PredictionRow list.
 
-    The model structure is restored by checkpoint kind: the CNN uses the ``ckpt``
-    top-level explicit structure fields (not the nested config), while the MLP
-    reuses the existing ``hidden_dims``; a ``load_state_dict(strict=True)``
+    The model structure is restored by checkpoint kind: CNN/Transformer use the
+    ``ckpt`` top-level explicit structure fields (not the nested config), while
+    the MLP reuses the existing ``hidden_dims``; a ``load_state_dict(strict=True)``
     key/shape mismatch is uniformly converged to ``EvaluationError`` (no
     fallback, no partial report).
     """
@@ -295,8 +331,20 @@ def _evaluate_test_rows(
             pool_bins=ckpt.pool_bins,
             head_hidden_dims=ckpt.head_hidden_dims,
         )
-    else:
+    elif isinstance(ckpt, training.Checkpoint):
         model = training.build_model(ckpt.contract, ckpt.hidden_dims)
+    elif isinstance(ckpt, training.TransformerCheckpoint):
+        model = training.build_transformer_model(
+            ckpt.contract,
+            d_model=ckpt.d_model,
+            nhead=ckpt.nhead,
+            num_layers=ckpt.num_layers,
+            dim_feedforward=ckpt.dim_feedforward,
+            dropout=ckpt.dropout,
+            head_hidden_dims=ckpt.head_hidden_dims,
+        )
+    else:
+        raise EvaluationError(f"unsupported checkpoint type: {type(ckpt).__name__}")
     try:
         model.load_state_dict(dict(ckpt.model_state_dict), strict=True)
     except RuntimeError as exc:
@@ -313,8 +361,9 @@ def _evaluate_test_rows(
         )
 
     rows: list[PredictionRow] = []
-    for start in range(0, len(split.test), batch_size):
-        chunk = split.test[start : start + batch_size]
+    members = split_definition.val if split == "val" else split_definition.test
+    for start in range(0, len(members), batch_size):
+        chunk = members[start : start + batch_size]
         samples = [
             training_data.load_sample(samples_dir, psid, ckpt.contract)  # contract validation
             for psid in chunk
@@ -328,7 +377,7 @@ def _evaluate_test_rows(
             rows.append(
                 PredictionRow(
                     parameter_set_id=sample.parameter_set_id,
-                    split="test",
+                    split=split,
                     alpha_true=float(sample.y[0]),
                     alpha_pred=float(pred[0]),
                     ku_true=float(sample.y[1]),
