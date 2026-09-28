@@ -12,8 +12,9 @@
   ``min_delta`` 才更新），与绝对 best（严格更低即更新）分开。
 - checkpoint：``save_checkpoint``/``load_checkpoint`` 为 **MLP 专用**，
   ``CKPT_FORMAT_VERSION`` 与既有 payload/schema 不变。CNN 使用独立的
-  ``CNNCheckpoint``/``save_cnn_checkpoint``/``load_cnn_checkpoint``
-  （``CNN_CKPT_FORMAT_VERSION`` + ``model_kind="cnn1d"``）；
+  ``CNNCheckpoint``/``save_cnn_checkpoint``/``load_cnn_checkpoint``；Transformer
+  使用 ``TransformerCheckpoint``/``save_transformer_checkpoint``/
+  ``load_transformer_checkpoint``（独立 v1 + ``model_kind="transformer"``）。
   ``load_any_checkpoint`` 单次安全读取后按显式 ``model_kind`` 路由，缺 kind
   仅接受合法旧 MLP 形态，未知/损坏一律 ``TrainingError``、不回退。CNN save 侧
   接受任意正常 Tensor 设备（不限定 CPU），落盘前统一 ``detach().to("cpu")``；
@@ -22,7 +23,7 @@
   ``torch.load(weights_only=True, map_location="cpu")`` 显式安全模式。
 - 数据流：``train_model`` 返回 ``TrainingResult``（best/final checkpoint +
   逐 epoch history）；``run(config_path, expected_kind=...)`` 为
-  ``train_mlp.py``/``train_cnn1d.py`` 共用的编排，负责 load_config（一次）、
+  三类训练入口共用的编排，负责 load_config（一次）、
   kind 早拒（读数据/建目录前）、train-only 拟合与 best.pt/final.pt/
   metrics.json 等磁盘写出；checkpoint 读写仅在本模块。按类别落盘经
   ``save_model_checkpoint`` dispatch（CNN 独立 schema，不写进 MLP）。
@@ -57,6 +58,7 @@ from micromagnetic_parameter_inversion import (
 )
 from micromagnetic_parameter_inversion.models.cnn1d import CNN1DRegressor
 from micromagnetic_parameter_inversion.models.mlp import MLPRegressor
+from micromagnetic_parameter_inversion.models.transformer import TemporalTransformerRegressor
 from micromagnetic_parameter_inversion.preprocessing import (
     PreprocessingError,
     PreprocessingState,
@@ -69,7 +71,9 @@ from micromagnetic_parameter_inversion.training_config import (
     CNN1DModelConfig,
     ConfigError,
     ExperimentConfig,
+    ModelConfig,
     ModelKind,
+    TransformerModelConfig,
     _require_positive_int,
     load_config,
 )
@@ -94,6 +98,23 @@ _N_CHANNELS = 3  # 磁化分量数 (mx, my, mz)
 CNN_CKPT_FORMAT_VERSION = 1
 # CNN 顶层显式结构字段（恢复权威；嵌套 config 的 model 结构仅记录）。
 _CNN_STRUCTURE_FIELDS = ("channels", "kernel_sizes", "pool_bins", "head_hidden_dims")
+TRANSFORMER_CKPT_FORMAT_VERSION = 1
+_TRANSFORMER_STRUCTURE_FIELDS = (
+    "d_model",
+    "nhead",
+    "num_layers",
+    "dim_feedforward",
+    "dropout",
+    "head_hidden_dims",
+)
+_TRANSFORMER_SEMANTICS = {
+    "activation": "gelu",
+    "position_encoding": "sinusoidal",
+    "position_encoding_base": 10000,
+    "pooling": "mean",
+    "norm_first": True,
+    "token_layout": "time_pulse_component",
+}
 _MODEL_COMPONENT_ORDER = ("mx", "my", "mz")
 
 
@@ -191,8 +212,40 @@ class CNNCheckpoint:
     numpy_version: str = ""
 
 
+@dataclass(frozen=True, eq=False)
+class TransformerCheckpoint:
+    """Independent v1 schema; top-level structure and fixed semantics are authoritative."""
+
+    ckpt_format_version: int
+    model_state_dict: StateDict
+    d_model: int
+    nhead: int
+    num_layers: int
+    dim_feedforward: int
+    dropout: float
+    head_hidden_dims: tuple[int, ...]
+    contract: InputContract
+    preprocessing: PreprocessingState
+    seed: int
+    config: ExperimentConfig
+    dataset_meta_relpath: str
+    dataset_meta_sha256: str
+    split_sha256: str
+    best_val_loss: float | None
+    activation: Literal["gelu"] = "gelu"
+    position_encoding: Literal["sinusoidal"] = "sinusoidal"
+    position_encoding_base: int = 10000
+    pooling: Literal["mean"] = "mean"
+    norm_first: bool = True
+    token_layout: Literal["time_pulse_component"] = "time_pulse_component"
+    git_sha: str | None = None
+    git_dirty: bool | None = None
+    torch_version: str = ""
+    numpy_version: str = ""
+
+
 # 显式模型类别路由结果（load_any_checkpoint 返回类型）。
-type ModelCheckpoint = Checkpoint | CNNCheckpoint
+type ModelCheckpoint = Checkpoint | CNNCheckpoint | TransformerCheckpoint
 
 
 @dataclass(frozen=True)
@@ -272,6 +325,29 @@ def build_cnn_model(
         kernel_sizes=tuple(kernel_sizes),
         pool_bins=pool_bins,
         head_hidden_dims=tuple(head_hidden_dims),
+    )
+
+
+def build_transformer_model(
+    contract: InputContract,
+    *,
+    d_model: int,
+    nhead: int,
+    num_layers: int,
+    dim_feedforward: int,
+    dropout: float,
+    head_hidden_dims: tuple[int, ...],
+) -> TemporalTransformerRegressor:
+    """Build from the frozen input contract and explicit structure (no seed side effects)."""
+    _validate_cnn_contract(contract, "build_transformer_model")
+    return TemporalTransformerRegressor(
+        contract.input_shape,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers=num_layers,
+        dim_feedforward=dim_feedforward,
+        dropout=dropout,
+        head_hidden_dims=head_hidden_dims,
     )
 
 
@@ -453,8 +529,20 @@ def train_model(
                 pool_bins=int(model_config.pool_bins),
                 head_hidden_dims=tuple(model_config.head_hidden_dims),
             )
-        else:
+        elif isinstance(model_config, TransformerModelConfig):
+            model = build_transformer_model(
+                contract,
+                d_model=model_config.d_model,
+                nhead=model_config.nhead,
+                num_layers=model_config.num_layers,
+                dim_feedforward=model_config.dim_feedforward,
+                dropout=model_config.dropout,
+                head_hidden_dims=model_config.head_hidden_dims,
+            )
+        elif isinstance(model_config, ModelConfig):
             model = build_model(contract, model_config.hidden_dims)
+        else:
+            raise TrainingError(f"未知模型配置: {type(model_config)!r}")
     except ValueError as exc:  # 模型层结构校验失败（如 pool_bins > T）→ 领域错误
         raise TrainingError(f"模型结构非法: {exc}") from exc
     device = runtime.select_device(config.training.device)
@@ -531,7 +619,6 @@ def train_model(
 
     git_sha, git_dirty = _git_info()
     common_meta: dict[str, Any] = dict(
-        activation="relu",
         contract=contract,
         preprocessing=state,
         seed=config.training.seed,
@@ -547,6 +634,7 @@ def train_model(
     best_checkpoint: ModelCheckpoint
     if isinstance(model_config, CNN1DModelConfig):
         best_checkpoint = CNNCheckpoint(
+            activation="relu",
             ckpt_format_version=CNN_CKPT_FORMAT_VERSION,
             model_state_dict=best_state,
             channels=tuple(model_config.channels),
@@ -556,14 +644,30 @@ def train_model(
             best_val_loss=best_val,
             **common_meta,
         )
-    else:
+    elif isinstance(model_config, TransformerModelConfig):
+        best_checkpoint = TransformerCheckpoint(
+            ckpt_format_version=TRANSFORMER_CKPT_FORMAT_VERSION,
+            model_state_dict=best_state,
+            d_model=model_config.d_model,
+            nhead=model_config.nhead,
+            num_layers=model_config.num_layers,
+            dim_feedforward=model_config.dim_feedforward,
+            dropout=model_config.dropout,
+            head_hidden_dims=model_config.head_hidden_dims,
+            best_val_loss=best_val,
+            **common_meta,
+        )
+    elif isinstance(model_config, ModelConfig):
         best_checkpoint = Checkpoint(
+            activation="relu",
             ckpt_format_version=CKPT_FORMAT_VERSION,
             model_state_dict=best_state,
             hidden_dims=tuple(model_config.hidden_dims),
             best_val_loss=best_val,
             **common_meta,
         )
+    else:
+        raise TrainingError(f"未知模型配置: {type(model_config)!r}")
     final_checkpoint = replace(best_checkpoint, model_state_dict=final_state, best_val_loss=None)
     return TrainingResult(
         best_checkpoint=best_checkpoint,
@@ -577,13 +681,13 @@ def train_model(
 
 # --- 共享训练编排：train_mlp.py / train_cnn1d.py 的唯一实现 ------------------
 
-_EXPECTED_KINDS: frozenset[str] = frozenset({"mlp", "cnn1d"})
+_EXPECTED_KINDS: frozenset[str] = frozenset({"mlp", "cnn1d", "transformer"})
 
 
 def _resolve_expected_kind(expected_kind: object) -> ModelKind:
-    """入口声明的模型类别：仅接受 ``"mlp"``/``"cnn1d"``，否则 ConfigError。"""
+    """入口声明的模型类别：MLP/CNN1D/Transformer，否则 ConfigError。"""
     if not isinstance(expected_kind, str) or expected_kind not in _EXPECTED_KINDS:
-        raise ConfigError(f"expected_kind 非法: {expected_kind!r}（须为 'mlp' 或 'cnn1d'）")
+        raise ConfigError(f"expected_kind 非法: {expected_kind!r}（须为 mlp/cnn1d/transformer）")
     return cast(ModelKind, expected_kind)
 
 
@@ -803,6 +907,9 @@ def save_model_checkpoint(path: Path, ckpt: ModelCheckpoint) -> None:
     if isinstance(ckpt, CNNCheckpoint):
         save_cnn_checkpoint(path, ckpt)
         return
+    if isinstance(ckpt, TransformerCheckpoint):
+        save_transformer_checkpoint(path, ckpt)
+        return
     save_checkpoint(path, ckpt)
 
 
@@ -907,6 +1014,10 @@ def _mlp_checkpoint_from_payload(payload: dict[str, Any], path: Path) -> Checkpo
         raise TrainingError(f"MLP checkpoint 不接受 model_kind 字段 ({path})")
     if any(field in payload for field in _CNN_STRUCTURE_FIELDS):
         raise TrainingError(f"MLP checkpoint 不接受 CNN 结构字段 ({path})")
+    if any(field in payload for field in _TRANSFORMER_STRUCTURE_FIELDS) or any(
+        field in payload for field in _TRANSFORMER_SEMANTICS if field != "activation"
+    ):
+        raise TrainingError(f"MLP checkpoint 不接受 Transformer 字段 ({path})")
     missing = sorted(_MLP_CKPT_REQUIRED_KEYS.difference(payload))
     if missing:
         raise TrainingError(f"checkpoint 缺失键 {missing} ({path})")
@@ -934,6 +1045,8 @@ def _mlp_checkpoint_from_payload(payload: dict[str, Any], path: Path) -> Checkpo
         payload["preprocessing"], len(contract.pulse_order), path
     )
     config = _config_from_dict(payload["config"], path)
+    if not isinstance(config.model, ModelConfig):
+        raise TrainingError(f"MLP checkpoint 的 config.model 须为 ModelConfig ({path})")
     best_val_loss = payload["best_val_loss"]
     if best_val_loss is not None and not isinstance(best_val_loss, (int, float)):
         raise TrainingError(f"best_val_loss 类型非法 ({path})")
@@ -979,7 +1092,7 @@ def load_cnn_checkpoint(path: Path) -> CNNCheckpoint:
 
 
 def load_any_checkpoint(path: Path) -> ModelCheckpoint:
-    """单次安全读取后按显式 ``model_kind`` 路由：``cnn1d``→CNN；缺 kind→仅合法旧 MLP。
+    """单次安全读取后按显式 kind 路由 CNN/Transformer；缺 kind→仅合法旧 MLP。
 
     其它显式 kind（含 ``"mlp"``）、未知/null/坏值均 ``TrainingError``；缺 kind
     但残留任意 CNN 结构字段同样拒绝，不猜测、不回退。
@@ -988,6 +1101,8 @@ def load_any_checkpoint(path: Path) -> ModelCheckpoint:
     if "model_kind" in payload:
         if payload["model_kind"] == "cnn1d":
             return _cnn_checkpoint_from_payload(payload, path)
+        if payload["model_kind"] == "transformer":
+            return _transformer_checkpoint_from_payload(payload, path)
         raise TrainingError(f"不支持的 model_kind: {payload['model_kind']!r} ({path})")
     if any(field in payload for field in _CNN_STRUCTURE_FIELDS):
         raise TrainingError(f"缺 model_kind 却残留 CNN 结构字段，拒绝按 MLP 读取 ({path})")
@@ -1262,6 +1377,12 @@ def _cnn_checkpoint_from_payload(payload: dict[str, Any], path: Path) -> CNNChec
         raise TrainingError(f"model_kind 须为 'cnn1d' (got {payload['model_kind']!r}) ({path})")
     if "hidden_dims" in payload:
         raise TrainingError(f"CNN checkpoint 不接受 hidden_dims 字段 ({path})")
+    if any(
+        field in payload
+        for field in (*_TRANSFORMER_STRUCTURE_FIELDS, *_TRANSFORMER_SEMANTICS)
+        if field not in {"head_hidden_dims", "activation"}
+    ):
+        raise TrainingError(f"CNN checkpoint 不接受 Transformer 字段 ({path})")
     _require_ckpt_version(payload["ckpt_format_version"], CNN_CKPT_FORMAT_VERSION, path)
     if payload["activation"] not in _ACTIVATIONS:
         raise TrainingError(f"未知激活函数 {payload['activation']!r} ({path})")
@@ -1313,6 +1434,133 @@ def _cnn_checkpoint_from_payload(payload: dict[str, Any], path: Path) -> CNNChec
         torch_version=str(payload.get("torch_version", "")),
         numpy_version=str(payload.get("numpy_version", "")),
     )
+
+
+def _transformer_checkpoint_from_payload(
+    payload: dict[str, Any], path: Path
+) -> TransformerCheckpoint:
+    """Strict v1 parsing without constructing a model or consuming RNG state."""
+    required = (
+        (_MLP_CKPT_REQUIRED_KEYS - {"hidden_dims"})
+        | set(_TRANSFORMER_STRUCTURE_FIELDS)
+        | set(_TRANSFORMER_SEMANTICS)
+        | {"model_kind"}
+    )
+    missing = sorted(required.difference(payload))
+    if missing:
+        raise TrainingError(f"Transformer checkpoint 缺失键 {missing} ({path})")
+    if payload["model_kind"] != "transformer":
+        raise TrainingError(f"model_kind 须为 'transformer' ({path})")
+    if any(field in payload for field in ("hidden_dims", "channels", "kernel_sizes", "pool_bins")):
+        raise TrainingError(f"Transformer checkpoint 不接受 MLP/CNN 结构字段 ({path})")
+    _require_ckpt_version(payload["ckpt_format_version"], TRANSFORMER_CKPT_FORMAT_VERSION, path)
+    for field, expected in _TRANSFORMER_SEMANTICS.items():
+        value = payload[field]
+        if type(value) is not type(expected) or value != expected:
+            raise TrainingError(f"Transformer v1 {field} 须为 {expected!r} ({path})")
+    dims = {
+        field: _cnn_positive_int(payload[field], f"{path}: {field}")
+        for field in ("d_model", "nhead", "num_layers", "dim_feedforward")
+    }
+    if dims["d_model"] % 2 or dims["d_model"] % dims["nhead"]:
+        raise TrainingError(f"d_model 须为偶数且能被 nhead 整除 ({path})")
+    dropout = payload["dropout"]
+    if (
+        isinstance(dropout, bool)
+        or not isinstance(dropout, (int, float))
+        or not math.isfinite(dropout)
+        or not 0 <= dropout < 1
+    ):
+        raise TrainingError(f"dropout 须为 [0,1) 有限数值 ({path})")
+    head = _cnn_int_sequence(payload["head_hidden_dims"], "head_hidden_dims", allow_empty=True)
+    state_dict = _cnn_state_dict_from_payload(payload["model_state_dict"], path)
+    contract = _cnn_contract_from_dict(payload["contract"], path)
+    state = _preprocessing_from_dict(payload["preprocessing"], len(contract.pulse_order), path)
+    _validate_cnn_preprocessing(state, path)
+    config = _config_from_dict(payload["config"], path)
+    if not isinstance(config.model, TransformerModelConfig):
+        raise TrainingError(
+            f"Transformer checkpoint 的 config.model 须为 TransformerModelConfig ({path})"
+        )
+    seed = payload["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise TrainingError(f"seed 须为非负整数 ({path})")
+    loss = payload["best_val_loss"]
+    if loss is not None and (
+        isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(loss)
+    ):
+        raise TrainingError(f"best_val_loss 须为 null 或有限数值 ({path})")
+    return TransformerCheckpoint(
+        ckpt_format_version=TRANSFORMER_CKPT_FORMAT_VERSION,
+        model_state_dict=state_dict,
+        d_model=dims["d_model"],
+        nhead=dims["nhead"],
+        num_layers=dims["num_layers"],
+        dim_feedforward=dims["dim_feedforward"],
+        dropout=float(dropout),
+        head_hidden_dims=head,
+        contract=contract,
+        preprocessing=state,
+        seed=seed,
+        config=config,
+        dataset_meta_relpath=str(payload["dataset_meta_relpath"]),
+        dataset_meta_sha256=str(payload["dataset_meta_sha256"]),
+        split_sha256=str(payload["split_sha256"]),
+        best_val_loss=float(loss) if loss is not None else None,
+        git_sha=payload.get("git_sha"),
+        git_dirty=payload.get("git_dirty"),
+        torch_version=str(payload.get("torch_version", "")),
+        numpy_version=str(payload.get("numpy_version", "")),
+    )
+
+
+def load_transformer_checkpoint(path: Path) -> TransformerCheckpoint:
+    """Read only explicit Transformer v1 payloads in safe CPU mode."""
+    return _transformer_checkpoint_from_payload(_read_checkpoint_payload(path), path)
+
+
+def save_transformer_checkpoint(path: Path, ckpt: TransformerCheckpoint) -> None:
+    """Validate before mkdir/write; tensors are detached CPU copies, never overwrite."""
+    if not isinstance(ckpt, TransformerCheckpoint):
+        raise TrainingError(f"save_transformer_checkpoint 需要 TransformerCheckpoint ({path})")
+    if path.exists():
+        raise FileExistsError(f"checkpoint 已存在，拒绝覆盖: {path}")
+    try:
+        _validate_cnn_contract(ckpt.contract, path)
+        _validate_cnn_preprocessing(ckpt.preprocessing, path)
+        state_dict = _cnn_state_dict_structure(ckpt.model_state_dict, path)
+        payload = {
+            field: getattr(ckpt, field)
+            for field in (
+                "ckpt_format_version",
+                "seed",
+                "best_val_loss",
+                "git_sha",
+                "git_dirty",
+                *_TRANSFORMER_STRUCTURE_FIELDS,
+                *_TRANSFORMER_SEMANTICS,
+            )
+        }
+        payload.update(
+            model_kind="transformer",
+            model_state_dict={
+                name: value.detach().to("cpu").clone() for name, value in state_dict.items()
+            },
+            head_hidden_dims=list(ckpt.head_hidden_dims),
+            contract=_contract_to_dict(ckpt.contract),
+            preprocessing=preprocessing.state_to_mapping(ckpt.preprocessing),
+            config=training_config.config_to_mapping(ckpt.config),
+            dataset_meta_relpath=str(ckpt.dataset_meta_relpath),
+            dataset_meta_sha256=str(ckpt.dataset_meta_sha256),
+            split_sha256=str(ckpt.split_sha256),
+            torch_version=str(ckpt.torch_version),
+            numpy_version=str(ckpt.numpy_version),
+        )
+        _transformer_checkpoint_from_payload(payload, path)
+    except (ConfigError, PreprocessingError, TypeError, ValueError, OverflowError) as exc:
+        raise TrainingError(f"Transformer checkpoint 损坏 ({path}): {exc}") from exc
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
 
 
 def _contract_to_dict(contract: InputContract) -> dict[str, Any]:

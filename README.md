@@ -92,8 +92,14 @@ run.log 仍由原机制写入。无 CLI 参数、无 plan/resume、无「目录�
 
 - 模拟 pipeline（vertical slice）已实现（批量脚本 `generate_dataset.py`
   为唯一模拟执行入口，单份配置 CLI 已删除）；首版「样本准备 → 训练 →
-  独立评估」工程已实现（见 `train.md`），**但未在正式研究数据上训练，
+  独立评估」工程已实现，支持 MLP、CNN1D 与 Temporal Transformer
+  （见 `train.md`），**但未在正式研究数据上训练，
   不存在可靠科研结果或研究结论**。
+- `results/mlp.md`、`results/cnn.md`、`results/compare.md` 保留了历史
+  MLP/CNN 合成 benchmark 的 val 报告；val 用于 best 选择，报告不构成
+  独立 test 泛化或可靠科研结论。本轮未复核完整 1024 组数据、冻结 split
+  与历史 run 产物；本地缺少产物不否认历史运行。上文截至 2026-09-09 的
+  未运行声明仅为当时记录。
 - **CNN1D 分支（P1–P4 训练链已接通）**：P1 配置层、P2 模型与 P3 独立
   checkpoint/工厂/评估已实现（`model.kind` 判别 + CNN 四字段
   `channels`/`kernel_sizes`/`pool_bins`/`head_hidden_dims` 严格校验，YAML 与
@@ -106,38 +112,55 @@ run.log 仍由原机制写入。无 CLI 参数、无 plan/resume、无「目录�
   P4 已把共享编排 `training.run(config_path, *, expected_kind)` 落在既有
   `training.py`（**不新增 runner 模块**），`scripts/train_mlp.py` /
   `scripts/train_cnn1d.py` 为薄入口（`--config` 必填，kind 错配在读数据/建目录
-  前早拒），`training.train_model` 支持两类模型，`save_model_checkpoint` 按
+  前早拒），`training.train_model` 现已扩展支持三类模型，`save_model_checkpoint` 按
   checkpoint 类别 dispatch；CNN 产物写入
   `output_root()/training/cnn1d/<dataset_name>/<run_name>`（`output_dir` 可
   显式覆盖）。CNN 与 MLP 只共用同一 dataset 与冻结 split，checkpoint/产物/
   预处理统计**完全独立**，每个 run 自行做 train-only 拟合。
-  **验证范围仅为 CPU + tmp 合成数据 + 小 `max_epochs` 的离线测试；未在正式
-  研究数据上训练，无超参搜索，不存在可靠科研结果。**
+  **工程测试使用 CPU + tmp 合成数据 + 小 `max_epochs`；历史合成 val
+  报告范围见上，不代表正式研究训练或可靠科研结果。**
   `configs/training/cnn1d.yaml` 仍是**全注释占位、无研究超参**，**不能直接
   执行**——须用户逐字段审定并显式填写 `model` 结构与
   `dataset_name`/`run_name` 后才可加载。
+- **Temporal Transformer 主方案已实现**：外部输入仍为 `[B,P,T,3]`，内部为
+  `[B,T,3P]` 时间 token；线性投影 + 固定 index sinusoidal PE（base 10000）+
+  pre-LayerNorm Encoder + final LayerNorm + 时间 mean + GELU 回归头。
+  主结构 `P=1,T=401,d_model=64,nhead=4,num_layers=2,dim_feedforward=128,
+  dropout=0.1,head_hidden_dims=[32]`，参数量 **69,474**；旧 MLP/CNN
+  checkpoint 保留，Transformer 独立 v1。**本轮批准仅含代码实现，未批准
+  真实训练；尚未训练 Transformer，也未开展轻量版实验。**
 - 已完成的部分 QC：offline vertical slice 测试（31 passed）、2026-09-02
   test-only pilot 执行链冒烟、Pilot v1 哨兵轮轨迹层检查（历史协议）。
 - **未证明**：连续模型网格收敛、Relax 收敛鲁棒性、EdgeSmooth 选择的
   系统论证、批量可复现性、OVF/物理级 QC、真实器件有效性、正向回代验证、
   训练侧科研有效性（未在正式研究数据上训练）。
 
-### 训练入口（首版工程，仅 CPU 合成验证）
+### 训练与独立评估入口（使用前须获相应执行批准）
 
-两模型共用同一份 prepared dataset 与冻结 split，各写独立目录
-（`training/mlp/...` 与 `training/cnn1d/...`），各自做 train-only 拟合：
+三模型共用同一份 prepared dataset 与冻结 split，各写独立目录
+（`training/mlp/...`、`training/cnn1d/...`、`training/transformer/...`），
+各自做 train-only 拟合。以下为入口用法，不代表本轮执行训练：
 
 ```bash
 uv run python scripts/train_mlp.py   --config configs/training/mlp.yaml
 uv run python scripts/train_cnn1d.py --config configs/training/cnn1d.yaml
+uv run python scripts/train_transformer.py --config configs/training/transformer.yaml
+uv run python scripts/evaluate_model.py --run RUN_DIR --split val
 uv run python scripts/evaluate_model.py --run RUN_DIR
 ```
 
-`--config` 为必填；kind 与入口不匹配会在读数据、建目录前报错退出。两份配置
-当前都**不能直接照抄运行**：`mlp.yaml` 的 `dataset_name`/`run_name` 为占位符；
+`--config` 为必填；kind 与入口不匹配会在读数据、建目录前报错退出。
+`mlp.yaml` 的 `dataset_name`/`run_name` 为占位符；
 `cnn1d.yaml` 是**全注释占位、无模型研究超参**，须用户逐字段审定并显式填写
-`model` 结构与 `dataset_name`/`run_name` 后才可加载。详细流程与产物见
-`train.md`。
+`model` 结构与 `dataset_name`/`run_name` 后才可加载。Transformer 使用
+`configs/training/transformer.yaml` 的已审定主结构，运行前须核对实际
+dataset/run 配置并取得执行批准。
+
+独立评估支持 `--split val|test`，默认 `test`；val 写
+`val_metrics.json` / `val_predictions.csv`，test 保留
+`test_metrics.json` / `test_predictions.csv`，已有产物拒绝覆盖。
+评估绑定 run 内冻结 split 与 checkpoint，不重新拟合预处理；val 具有
+best checkpoint 选择偏差，test 不得用于调参或模型选择。详细流程见 `train.md`。
 
 ## 物理模型概述
 
@@ -402,7 +425,8 @@ runs/cache 不入库；`data/README.md` 可跟踪，`data/samples/` 在白名单
 src/micromagnetic_parameter_inversion/   # 包（runtime / external / paths）
                                          # + mumax3 vertical slice（config / script / results / pipeline）
                                          # + 训练/评估（training_config / training_data / preprocessing /
-                                         #   models/mlp / models/cnn1d / training / evaluation）
+                                         #   models/mlp / models/cnn1d / models/transformer /
+                                         #   training / evaluation）
 scripts/check_environment.py             # 环境诊断
 scripts/generate_dataset.py              # 唯一模拟执行入口：生成批量实验 YAML 并
                                          # 运行模拟（内置 Protocol B 固定配置与 Sobol
@@ -411,13 +435,15 @@ scripts/generate_dataset.py              # 唯一模拟执行入口：生成批�
 scripts/prepare_training_samples.py      # raw → data/samples npz/meta/split（train.md §2）
 scripts/train_mlp.py                     # MLP 训练入口（training.run 薄封装）
 scripts/train_cnn1d.py                   # CNN1D 训练入口（training.run 薄封装）
-scripts/evaluate_model.py                # 独立 test 评估入口（train.md）
+scripts/train_transformer.py             # Temporal Transformer 训练入口（--config 必填）
+scripts/evaluate_model.py                # 独立 val/test 评估入口（默认 test；train.md）
 configs/base.yaml                        # 通用设置（seed、device=auto）
 configs/experiments/mumax3_simulation.yaml
                                          # 实验配置模板（Protocol B 固定值；
                                          # 仅 dataset_name/alpha/Ku 三处待填）
 configs/training/mlp.yaml                # MLP 训练配置（dataset/run_name 占位待填）
 configs/training/cnn1d.yaml              # CNN 配置：全注释占位，须审定填写
+configs/training/transformer.yaml        # Transformer 已审定主结构配置；未执行训练
 train.md                                 # 首版训练/评估实现说明
 simulations/mumax3/                      # MuMax3 脚本模板（.mx3.in）与说明
 tests/                                   # pytest（无需 GPU/MuMax3）

@@ -38,11 +38,13 @@ from micromagnetic_parameter_inversion.training_config import (
     SplitConfig,
     SplitMinCounts,
     SplitRatios,
+    TransformerModelConfig,
     load_config,
 )
 
 _SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_mlp.py"
 _CNN_SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_cnn1d.py"
+_TRANSFORMER_SCRIPT_PATH = paths.PROJECT_ROOT / "scripts" / "train_transformer.py"
 
 # 共享 run（training.run，expected_kind 早拒）与两个薄入口；CNN 只复用本文件
 # 合成数据 helper，不读取也不复用 MLP 的权重/统计/产物。
@@ -661,12 +663,316 @@ def test_entry_kind_mismatch_early_reject_before_data_root(
         script.run(config_path)
     assert calls["data_root"] == 0
     assert not (out_root / "training").exists()
-
     # CLI 同样友好失败：exit 2、错误信息点明期望/实际 kind、无输出目录
     assert script.main(["--config", str(config_path)]) == 2
     assert match in capsys.readouterr().err
     assert calls["data_root"] == 0
     assert not (out_root / "training").exists()
+
+
+def _transformer_config(dataset: str = "transformer_unit") -> ExperimentConfig:
+    raw = yaml.safe_load(_config_text(dataset, "transformer_unit"))
+    raw["model"] = {
+        "kind": "transformer",
+        "d_model": 8,
+        "nhead": 2,
+        "num_layers": 1,
+        "dim_feedforward": 16,
+        "dropout": 0.1,
+        "head_hidden_dims": [4],
+    }
+    return training_config.config_from_mapping(raw)
+
+
+def _build_transformer_checkpoint(data_root: Path) -> training.TransformerCheckpoint:
+    config = _transformer_config()
+    samples_dir = _write_prepared_samples(data_root, config.dataset_name)
+    contract, state = _cnn_contract_state(samples_dir, config)
+    model = training.build_transformer_model(
+        contract,
+        d_model=8,
+        nhead=2,
+        num_layers=1,
+        dim_feedforward=16,
+        dropout=0.1,
+        head_hidden_dims=(4,),
+    )
+    return training.TransformerCheckpoint(
+        ckpt_format_version=1,
+        model_state_dict=model.state_dict(),
+        d_model=8,
+        nhead=2,
+        num_layers=1,
+        dim_feedforward=16,
+        dropout=0.1,
+        head_hidden_dims=(4,),
+        contract=contract,
+        preprocessing=state,
+        config=config,
+        seed=11,
+        dataset_meta_relpath="dataset_meta.yaml",
+        dataset_meta_sha256="meta",
+        split_sha256="split",
+        best_val_loss=0.5,
+    )
+
+
+def _transformer_predict(ckpt: training.TransformerCheckpoint) -> torch.Tensor:
+    model = training.build_transformer_model(
+        ckpt.contract,
+        d_model=ckpt.d_model,
+        nhead=ckpt.nhead,
+        num_layers=ckpt.num_layers,
+        dim_feedforward=ckpt.dim_feedforward,
+        dropout=ckpt.dropout,
+        head_hidden_dims=ckpt.head_hidden_dims,
+    )
+    model.load_state_dict(dict(ckpt.model_state_dict), strict=True)
+    model.eval()
+    with torch.no_grad():
+        return model(
+            torch.arange(3 * math.prod(ckpt.contract.input_shape), dtype=torch.float32).reshape(
+                3, *ckpt.contract.input_shape
+            )
+            / 100
+        )
+
+
+def test_transformer_checkpoint_roundtrip_authority_and_single_safe_load(
+    env: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _ = env
+    ckpt = _build_transformer_checkpoint(root)
+    assert isinstance(ckpt.config.model, TransformerModelConfig)
+    # nhead has no weight shape effect: metadata must still restore the original value.
+    ckpt = replace(ckpt, config=replace(ckpt.config, model=replace(ckpt.config.model, nhead=4)))
+    path = root / "transformer.pt"
+    training.save_model_checkpoint(path, ckpt)
+    original = torch.load
+    calls: list[dict[str, Any]] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", spy)
+    loaded = training.load_any_checkpoint(path)
+    assert calls == [{"map_location": "cpu", "weights_only": True}]
+    assert isinstance(loaded, training.TransformerCheckpoint)
+    assert isinstance(loaded.config.model, TransformerModelConfig)
+    assert loaded.nhead == 2 and loaded.config.model.nhead == 4
+    assert torch.equal(_transformer_predict(ckpt), _transformer_predict(loaded))
+    with pytest.raises(FileExistsError):
+        training.save_transformer_checkpoint(path, ckpt)
+    for loader in (training.load_checkpoint, training.load_cnn_checkpoint):
+        with pytest.raises(training.TrainingError):
+            loader(path)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_kind", "unknown"),
+        ("model_kind", None),
+        ("ckpt_format_version", 2),
+        ("ckpt_format_version", True),
+        ("d_model", True),
+        ("d_model", 7),
+        ("nhead", 3),
+        ("num_layers", 0),
+        ("dim_feedforward", float("nan")),
+        ("dropout", True),
+        ("dropout", float("nan")),
+        ("dropout", 1.0),
+        ("head_hidden_dims", [True]),
+        ("activation", "relu"),
+        ("position_encoding", "learned"),
+        ("position_encoding_base", True),
+        ("pooling", "cls"),
+        ("norm_first", 1),
+        ("token_layout", "pulse_time_component"),
+        ("hidden_dims", [4]),
+        ("channels", [4]),
+        ("seed", True),
+        ("best_val_loss", float("nan")),
+        ("model_state_dict", {}),
+    ],
+)
+def test_transformer_checkpoint_corrupt_payload(
+    field: str,
+    value: Any,
+    env: tuple[Path, Path],
+) -> None:
+    root, _ = env
+    path = root / "valid.pt"
+    training.save_transformer_checkpoint(path, _build_transformer_checkpoint(root))
+    payload = torch.load(path, weights_only=True, map_location="cpu")
+    payload[field] = value
+    bad = root / "bad.pt"
+    torch.save(payload, bad)
+    for loader in (training.load_any_checkpoint, training.load_transformer_checkpoint):
+        with pytest.raises(training.TrainingError):
+            loader(bad)
+
+
+def test_transformer_missing_kind_and_cross_format_contamination(env: tuple[Path, Path]) -> None:
+    root, _ = env
+    ckpt = _build_transformer_checkpoint(root)
+    path = root / "transformer.pt"
+    training.save_transformer_checkpoint(path, ckpt)
+    payload = torch.load(path, weights_only=True, map_location="cpu")
+    del payload["model_kind"]
+    torch.save(payload, path)
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(path)
+    cnn_path, _ = _build_cnn_checkpoint(root, "cnn_legacy")
+    with pytest.raises(training.TrainingError):
+        training.load_transformer_checkpoint(cnn_path)
+    cnn_payload = torch.load(cnn_path, weights_only=True, map_location="cpu")
+    cnn_payload["nhead"] = 2
+    torch.save(cnn_payload, cnn_path)
+    with pytest.raises(training.TrainingError):
+        training.load_cnn_checkpoint(cnn_path)
+    for field in ("d_model", "nhead", "position_encoding", "token_layout"):
+        # Even otherwise valid legacy MLP payloads must reject Transformer residue.
+        mlp = training.Checkpoint(
+            ckpt_format_version=training.CKPT_FORMAT_VERSION,
+            model_state_dict=training.build_model(ckpt.contract, (4,)).state_dict(),
+            hidden_dims=(4,),
+            activation="relu",
+            contract=ckpt.contract,
+            preprocessing=ckpt.preprocessing,
+            seed=11,
+            config=replace(ckpt.config, model=ModelConfig(hidden_dims=(4,))),
+            dataset_meta_relpath="dataset_meta.yaml",
+            dataset_meta_sha256="meta",
+            split_sha256="split",
+            best_val_loss=0.5,
+        )
+        mlp_path = root / f"mlp_{field}.pt"
+        training.save_checkpoint(mlp_path, mlp)
+        with pytest.raises(training.TrainingError):
+            training.load_transformer_checkpoint(mlp_path)
+        raw = torch.load(mlp_path, weights_only=True, map_location="cpu")
+        raw[field] = 2
+        torch.save(raw, mlp_path)
+        with pytest.raises(training.TrainingError):
+            training.load_any_checkpoint(mlp_path)
+
+
+def test_transformer_cpu_synthetic_training_and_entry_early_rejection(
+    env: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, out = env
+    monkeypatch.setattr(training, "_git_info", lambda: (None, None))
+    config = _transformer_config()
+    _write_prepared_samples(root, config.dataset_name)
+    path = _write_config(root, yaml.safe_dump(training_config.config_to_mapping(config)))
+    script = _load_script(_TRANSFORMER_SCRIPT_PATH, "train_transformer_script")
+    run_dir = script.run(path)
+    assert run_dir == out / "training" / "transformer" / config.dataset_name / config.run_name
+    for name in ("best.pt", "final.pt"):
+        loaded = training.load_any_checkpoint(run_dir / name)
+        assert isinstance(loaded, training.TransformerCheckpoint)
+        assert torch.isfinite(_transformer_predict(loaded)).all()
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    assert metrics["stop_reason"] == "max_epochs" and len(metrics["history"]) == 2
+    wrong = _write_config(root, _config_text("missing", "wrong"), "wrong.yaml")
+    monkeypatch.setattr(paths, "data_root", lambda: pytest.fail("kind must reject before data"))
+    with pytest.raises(ConfigError):
+        script.run(wrong)
+
+
+def test_transformer_main_config_is_parseable() -> None:
+    config = load_config(paths.PROJECT_ROOT / "configs/training/transformer.yaml")
+    assert isinstance(config.model, TransformerModelConfig)
+    assert config.model.d_model == 64 and config.model.nhead == 4
+    assert config.training.seed == 42 and config.label.transform == "identity"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda p: p["contract"].update(n_time_steps=True),
+        lambda p: p["contract"].update(component_order=["mz", "my", "mx"]),
+        lambda p: p["contract"].update(t_s=[0.0] * 8),
+        lambda p: p["preprocessing"]["x_stats"].update(mean=[[[float("nan")] * 3]] * 2),
+        lambda p: p["config"].update(model={"hidden_dims": [4]}),
+    ],
+)
+def test_transformer_nested_payload_damage(
+    env: tuple[Path, Path],
+    damage: Callable[[Any], None],
+) -> None:
+    root, _ = env
+    path = root / "transformer.pt"
+    training.save_transformer_checkpoint(path, _build_transformer_checkpoint(root))
+    payload = torch.load(path, weights_only=True, map_location="cpu")
+    bad = _saved_damage(root, payload, damage)
+    with pytest.raises(training.TrainingError):
+        training.load_any_checkpoint(bad)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("d_model", True),
+        ("nhead", 3),
+        ("dropout", float("nan")),
+        ("position_encoding_base", True),
+        ("norm_first", 1),
+        ("activation", "relu"),
+    ],
+)
+def test_transformer_save_rejects_before_mkdir(
+    env: tuple[Path, Path],
+    field: str,
+    value: Any,
+) -> None:
+    root, _ = env
+    ckpt = replace(_build_transformer_checkpoint(root), **{field: value})
+    path = root / "must_not_exist" / "bad.pt"
+    with pytest.raises(training.TrainingError):
+        training.save_transformer_checkpoint(path, ckpt)
+    assert not path.parent.exists()
+
+
+@pytest.mark.parametrize("first_epoch", [True, False])
+def test_transformer_numerical_failure_keeps_only_completed_epochs(
+    env: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    first_epoch: bool,
+) -> None:
+    root, out = env
+    monkeypatch.setattr(training, "_git_info", lambda: (None, None))
+    config = _transformer_config()
+    _write_prepared_samples(root, config.dataset_name)
+    path = _write_config(root, yaml.safe_dump(training_config.config_to_mapping(config)))
+    actual = training._train_one_epoch
+    calls = 0
+
+    def fail(*args: Any, **kwargs: Any) -> float | None:
+        nonlocal calls
+        calls += 1
+        return None if first_epoch or calls == 2 else actual(*args, **kwargs)
+
+    monkeypatch.setattr(training, "_train_one_epoch", fail)
+    with pytest.raises(training.TrainingError):
+        training.run(path, expected_kind="transformer")
+    run_dir = out / "training" / "transformer" / config.dataset_name / config.run_name
+    metrics = json.loads((run_dir / "metrics.json").read_text())
+    assert metrics["stop_reason"] == "numerical_failure"
+    assert len(metrics["history"]) == (0 if first_epoch else 1)
+    assert (run_dir / "best.pt").exists() is not first_epoch
+    if not first_epoch:
+        best = training.load_transformer_checkpoint(run_dir / "best.pt")
+        final = training.load_transformer_checkpoint(run_dir / "final.pt")
+        assert all(
+            torch.equal(value, final.model_state_dict[name])
+            for name, value in best.model_state_dict.items()
+        )
 
 
 def test_run_invalid_expected_kind_rejected_before_data_root(

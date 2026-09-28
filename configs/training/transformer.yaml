@@ -1,0 +1,30 @@
+# 用户批准的主模型配置；尚未正式训练，不代表已验证科研结果。
+# dataset 指已有报告的数据集；当前工作区缺失其样本，运行前须恢复真实数据
+# 及原冻结 split。不得为运行此配置伪造数据或重新划分。
+dataset_name: cofeb_protocol_b_a2_sobol1024_v1
+run_name: transformer_d64_h4_l2_identity_seed42_v1
+data:
+  pulse_order: null
+model:
+  kind: transformer
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 128
+  dropout: 0.1
+  head_hidden_dims: [32]
+label: {transform: identity}  # logalpha 需另建独立 run，不能混写本次产物
+preprocessing: {std_eps: 1.0e-8}
+training:
+  seed: 42
+  device: auto
+  batch_size: 32
+  max_epochs: 500
+  learning_rate: 1.0e-3
+  weight_decay: 0.0
+  early_stopping: {patience: 50, min_delta: 0.0}
+split:  # 仅 prepare 使用；训练消费已有冻结 split，不重切
+  seed: 42
+  ratios: {train: 0.7, val: 0.15, test: 0.15}
+  min_per_split: {train: 2, val: 1, test: 1}
+output_dir: null  # output_root()/training/transformer/<dataset_name>/<run_name>

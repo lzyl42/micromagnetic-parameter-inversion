@@ -73,6 +73,7 @@ def _write_prepared_samples(
     n_pulses: int = 2,
     n_steps: int = 8,
     with_zero_ku: bool = False,
+    with_zero_alpha: bool = False,
     seed: int = 0,
 ) -> Path:
     """直接合成 npz + dataset_meta.yaml + split.yaml（与训练测试同构但自带）。"""
@@ -84,7 +85,7 @@ def _write_prepared_samples(
     for i, psid in enumerate(psids):
         x = rng.normal(size=(n_pulses, n_steps, 3)).astype(np.float32)
         t_s = np.arange(n_steps, dtype=np.float64) * 1.0e-9
-        alpha = 0.01 * (i + 1)
+        alpha = 0.0 if (with_zero_alpha and i == 0) else 0.01 * (i + 1)
         ku = 0.0 if (with_zero_ku and i == 0) else 1.0e4 * (i + 1)
         samples.append(
             training_data.Sample(
@@ -188,8 +189,11 @@ def test_metrics_values_empty_and_nonfinite() -> None:
     assert metrics.rmse_alpha == pytest.approx(math.sqrt(0.5))
     assert metrics.mae_ku == pytest.approx(1.0)
     assert metrics.rmse_ku == pytest.approx(math.sqrt(2.0))
+    assert metrics.mape_percent_alpha == pytest.approx(50.0)
+    assert metrics.mape_percent_ku == pytest.approx(25.0)
 
     empty = compute_subset_metrics([], [])
+    assert empty.mape_percent_alpha is None and empty.mape_percent_ku is None
     assert (empty.n, empty.mae_alpha, empty.rmse_alpha, empty.mae_ku, empty.rmse_ku) == (
         0,
         None,
@@ -219,6 +223,128 @@ def test_export_csv_lf_and_refuses_overwrite(tmp_path: Path) -> None:
     assert target.read_bytes().count(b"\n") == 3  # 表头 + 2 行，LF
     with pytest.raises(FileExistsError, match="拒绝覆盖"):
         export_test_predictions(target, rows)
+
+
+def test_relative_metrics_zero_alpha_ku_and_negative_general_values() -> None:
+    """零分母列 MAPE 为 null（alpha/Ku 对称）；通用指标不拒绝零/负物理值。"""
+    # 正 alpha + 零 Ku：仅 Ku MAPE null，alpha MAPE 照常
+    metrics = compute_subset_metrics([[0.1, 0.0], [0.2, 100.0]], [[0.2, 5.0], [0.1, 110.0]])
+    assert metrics.mape_percent_alpha == pytest.approx(75.0)
+    assert metrics.mape_percent_ku is None
+    assert metrics.mae_ku == pytest.approx(7.5)
+
+    # alpha=0（identity 合法）：仅 alpha MAPE null，MAE/RMSE 与 Ku 指标照常
+    zero = compute_subset_metrics([[0.0, 100.0]], [[0.1, 110.0]])
+    assert zero.n == 1
+    assert zero.mape_percent_alpha is None
+    assert zero.mae_alpha == pytest.approx(0.1)
+    assert zero.rmse_alpha == pytest.approx(0.1)
+    assert zero.mape_percent_ku == pytest.approx(10.0)
+
+    # 混合零/非零 alpha：任一真实值为 0 → 整列 MAPE null，不剔除样本、不重切
+    mixed = compute_subset_metrics([[0.0, 100.0], [0.2, 200.0]], [[0.1, 110.0], [0.1, 210.0]])
+    assert mixed.n == 2
+    assert mixed.mape_percent_alpha is None
+    assert mixed.mae_alpha == pytest.approx(0.1)
+    assert mixed.rmse_alpha == pytest.approx(0.1)
+    assert mixed.mape_percent_ku == pytest.approx(7.5)
+
+    # 负非零通用指标输入：分母取 abs 照常计算（不在通用 metrics 加物理域限制）
+    negative = compute_subset_metrics([[-0.1, -100.0]], [[-0.2, -110.0]])
+    assert negative.mape_percent_alpha == pytest.approx(100.0)
+    assert negative.mape_percent_ku == pytest.approx(10.0)
+    assert negative.mae_alpha == pytest.approx(0.1)
+
+    # 空子集语义不因零/负值支持而变化
+    empty = compute_subset_metrics([], [])
+    assert empty.n == 0 and empty.mape_percent_alpha is None and empty.mae_alpha is None
+
+
+def test_legacy_mlp_identity_zero_alpha_end_to_end(env: tuple[Path, Path]) -> None:
+    """旧 MLP（payload 无 model_kind）+ identity：test 含 alpha=0 样本照常评估。
+
+    alpha MAPE 仅该列为 null；MAE/RMSE 与 Ku 指标照常；val/test 隔离照旧。
+    """
+    data_root, _ = env
+    samples_dir = _write_prepared_samples(data_root, "ds_zero_alpha", with_zero_alpha=True)
+    # ps0000 的 alpha=0 且 Ku>0（主域）；test 同时含普通主域成员，control 为空
+    _rewrite_split(samples_dir, ["ps0001", "ps0002"], ["ps0003"], ["ps0000", "ps0004", "ps0005"])
+    config_path = data_root / "cfg_zero_alpha.yaml"
+    config_path.write_text(_train_config_text("ds_zero_alpha", "r1"), encoding="utf-8")
+    run_dir = _load_script(_TRAIN_SCRIPT, "train_mlp_script").run(config_path)
+
+    # 旧 MLP 磁盘 payload 无 model_kind（legacy 路由）且 label 变换为 identity
+    payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    assert "model_kind" not in payload
+    assert payload["preprocessing"]["y_stats"]["transform"] == "identity"
+
+    # split 隔离：val 无零 alpha 样本，alpha MAPE 为有限数，且不产出 test 产物
+    val_report, val_rows = evaluation.run_evaluation(run_dir, split="val")
+    assert val_report.provenance.split == "val"
+    assert [row.parameter_set_id for row in val_rows] == ["ps0003"]
+    assert val_report.main.mape_percent_alpha is not None
+    assert math.isfinite(val_report.main.mape_percent_alpha)
+    assert not (run_dir / "test_metrics.json").exists()
+
+    script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
+    assert script.run(run_dir) == run_dir
+    metrics = json.loads((run_dir / "test_metrics.json").read_text(encoding="utf-8"))
+    assert metrics["main"]["n"] == 3
+    assert metrics["control"]["n"] == 0
+    assert metrics["main"]["mape_percent_alpha"] is None  # ps0000 的 alpha=0
+    assert metrics["main"]["mae_alpha"] is not None
+    assert math.isfinite(metrics["main"]["mae_alpha"])
+    assert metrics["main"]["rmse_alpha"] is not None
+    assert math.isfinite(metrics["main"]["rmse_alpha"])
+    assert metrics["main"]["mape_percent_ku"] is not None
+    assert metrics["control"]["mape_percent_alpha"] is None
+    assert metrics["control"]["mae_alpha"] is None
+
+    lines = (run_dir / "test_predictions.csv").read_text(encoding="utf-8").splitlines()
+    zero_row = next(line for line in lines[1:] if line.startswith("ps0000,"))
+    assert float(zero_row.split(",")[2]) == 0.0
+
+
+def test_val_test_isolation_and_artifacts(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, samples_dir, _, _ = cnn_run
+    script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
+    split = training_data.load_split(samples_dir, training_data.load_dataset_meta(samples_dir))
+    loaded: list[str] = []
+    real_load = training_data.load_sample
+
+    def spy_load(samples_dir: Path, psid: str, contract: Any = None) -> training_data.Sample:
+        loaded.append(psid)
+        return real_load(samples_dir, psid, contract)
+
+    monkeypatch.setattr(training_data, "load_sample", spy_load)
+    assert script.main(["--run", str(run_dir), "--split", "val"]) == 0
+    assert loaded == list(split.val)
+    assert not (run_dir / "test_metrics.json").exists()
+    val_bytes = (run_dir / "val_metrics.json").read_bytes()
+    assert json.loads(val_bytes)["provenance"]["split"] == "val"
+    val_lines = (run_dir / "val_predictions.csv").read_text().splitlines()[1:]
+    assert [line.split(",")[0] for line in val_lines] == list(split.val)
+    assert all(line.split(",")[1] == "val" for line in val_lines)
+    loaded.clear()
+    assert script.run(run_dir) == run_dir
+    assert loaded == list(split.test)
+    assert (run_dir / "val_metrics.json").read_bytes() == val_bytes
+    metrics = json.loads((run_dir / "test_metrics.json").read_text())
+    assert metrics["provenance"]["split"] == "test"
+    assert metrics["control"]["mape_percent_ku"] is None
+    assert metrics["control"]["mape_percent_alpha"] is not None
+    assert script.main(["--run", str(run_dir), "--split", "val"]) == 2
+
+
+def test_train_evaluation_option_rejected(tmp_path: Path) -> None:
+    script = _load_script(_EVAL_SCRIPT, "evaluate_model_script")
+    with pytest.raises(SystemExit) as exc:
+        script.main(["--run", str(tmp_path), "--split", "train"])
+    assert exc.value.code == 2
+    with pytest.raises(EvaluationError, match="split"):
+        evaluation.run_evaluation(tmp_path, split="train")  # type: ignore[arg-type]
 
 
 def test_split_sha_mismatch_rejected(
@@ -832,3 +958,123 @@ def test_cnn_bad_preprocessing_state_rejected(
     assert "error:" in capsys.readouterr().err
     assert not (run_dir / "test_metrics.json").exists()
     assert not (run_dir / "test_predictions.csv").exists()
+
+
+@pytest.fixture()
+def transformer_run(
+    cnn_run: tuple[Path, Path, training.CNNCheckpoint, Any],
+) -> tuple[Path, Path, training.TransformerCheckpoint]:
+    """极小随机权重 Transformer；复用合成数据和 train-only 统计，不训练。"""
+    run_dir, samples_dir, source, _ = cnn_run
+    config_mapping = {
+        "dataset_name": source.config.dataset_name,
+        "run_name": "transformer_eval",
+        "model": {
+            "kind": "transformer",
+            "d_model": 4,
+            "nhead": 2,
+            "num_layers": 1,
+            "dim_feedforward": 8,
+            "dropout": 0.0,
+            "head_hidden_dims": [3],
+        },
+        "training": {"seed": 11, "device": "cpu", "batch_size": 2, "max_epochs": 1},
+    }
+    config = training_config.config_from_mapping(config_mapping)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(7)
+        model = training.build_transformer_model(
+            source.contract,
+            d_model=4,
+            nhead=2,
+            num_layers=1,
+            dim_feedforward=8,
+            dropout=0.0,
+            head_hidden_dims=(3,),
+        )
+    ckpt = training.TransformerCheckpoint(
+        ckpt_format_version=training.TRANSFORMER_CKPT_FORMAT_VERSION,
+        model_state_dict=dict(model.state_dict()),
+        d_model=4,
+        nhead=2,
+        num_layers=1,
+        dim_feedforward=8,
+        dropout=0.0,
+        head_hidden_dims=(3,),
+        contract=source.contract,
+        preprocessing=source.preprocessing,
+        seed=source.seed,
+        config=config,
+        dataset_meta_relpath=source.dataset_meta_relpath,
+        dataset_meta_sha256=source.dataset_meta_sha256,
+        split_sha256=source.split_sha256,
+        best_val_loss=0.5,
+    )
+    transformer_dir = run_dir.parent / "run_transformer"
+    transformer_dir.mkdir()
+    (transformer_dir / "split.yaml").write_bytes((run_dir / "split.yaml").read_bytes())
+    run_dir = transformer_dir
+    training.save_transformer_checkpoint(run_dir / "best.pt", ckpt)
+    return run_dir, samples_dir, ckpt
+
+
+@pytest.mark.parametrize("split", ["val", "test"])
+def test_transformer_evaluation_roundtrip(
+    transformer_run: tuple[Path, Path, training.TransformerCheckpoint], split: Any
+) -> None:
+    run_dir, samples_dir, ckpt = transformer_run
+    report, rows = evaluation.run_evaluation(run_dir, split=split)
+    members = yaml.safe_load((run_dir / "split.yaml").read_text())[split]
+    assert [row.parameter_set_id for row in rows] == members
+    assert all(row.split == split for row in rows)
+    assert report.provenance.split == split
+    assert report.provenance.checkpoint_sha256 == training_data.sha256_file(run_dir / "best.pt")
+    model = training.build_transformer_model(
+        ckpt.contract,
+        d_model=ckpt.d_model,
+        nhead=ckpt.nhead,
+        num_layers=ckpt.num_layers,
+        dim_feedforward=ckpt.dim_feedforward,
+        dropout=ckpt.dropout,
+        head_hidden_dims=ckpt.head_hidden_dims,
+    )
+    model.load_state_dict(dict(ckpt.model_state_dict), strict=True)
+    model.eval()
+    for row in rows:
+        sample = training_data.load_sample(samples_dir, row.parameter_set_id, ckpt.contract)
+        x = preprocessing.transform_x(ckpt.preprocessing, sample.x[None])
+        with torch.no_grad():
+            expected = preprocessing.inverse_transform_y(
+                ckpt.preprocessing, model(torch.from_numpy(x)).numpy()
+            )[0]
+        assert [row.alpha_pred, row.ku_pred] == pytest.approx(expected, rel=1e-5, abs=1e-6)
+
+
+@pytest.mark.parametrize("corruption", ["missing_key", "extra_key", "wrong_shape"])
+def test_transformer_strict_weights(
+    transformer_run: tuple[Path, Path, training.TransformerCheckpoint],
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    run_dir, _, ckpt = transformer_run
+    payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    payload["model_state_dict"] = _corrupt_state_dict(ckpt.model_state_dict, corruption)
+    corrupt = tmp_path / "corrupt.pt"
+    torch.save(payload, corrupt)
+    with pytest.raises(EvaluationError, match="权重"):
+        evaluation.run_evaluation(run_dir, corrupt)
+
+
+def test_transformer_uses_checkpoint_top_level_structure(
+    transformer_run: tuple[Path, Path, training.TransformerCheckpoint], tmp_path: Path
+) -> None:
+    run_dir, _, _ = transformer_run
+    _, expected = evaluation.run_evaluation(run_dir)
+    payload = torch.load(run_dir / "best.pt", weights_only=True, map_location="cpu")
+    payload["config"]["model"].update(
+        d_model=8, nhead=4, num_layers=2, dim_feedforward=16, dropout=0.5, head_hidden_dims=[7]
+    )
+    altered = tmp_path / "different_nested_config.pt"
+    torch.save(payload, altered)
+    _, actual = evaluation.run_evaluation(run_dir, altered)
+    assert actual == expected

@@ -7,12 +7,17 @@
   Temporal Transformer）。项目目标与设计以仓库内 `README.md` 与代码为准。
 - **当前实现状态**：MuMax3 vertical slice 模拟 pipeline 已实现（单份配置
   CLI 已删除，`scripts/generate_dataset.py` 为唯一模拟执行入口）；
-  首版「样本准备 → 训练 → 独立评估」工程已实现（见 `train.md`），但未在
+  首版「样本准备 → 训练 → 独立评估」工程已实现，支持 MLP / CNN1D /
+  Temporal Transformer（见 `train.md`），但未在
   正式研究数据上训练，不存在可靠科研结果或研究结论。不得虚构或声称已有
-  正式研究训练或可靠科研结论。可执行脚本包括：
+  正式研究训练或可靠科研结论。`results/` 已有历史 MLP/CNN 合成 benchmark
+  val 报告，不构成独立 test 泛化或可靠科研结论；本轮未复核完整 1024 组
+  数据、冻结 split 与历史 run 产物，本地缺产物不否认历史运行。Transformer
+  主方案仅获批代码实现，尚未真实训练，也未开展轻量版实验。可执行脚本包括：
   `scripts/check_environment.py`、`scripts/generate_dataset.py`、
   `scripts/prepare_training_samples.py`、`scripts/train_mlp.py`、
-  `scripts/evaluate_model.py`。
+  `scripts/train_cnn1d.py`、`scripts/train_transformer.py`、
+  `scripts/evaluate_model.py`（`--split val|test`，默认 test）。
 - **工作范围严格限于本仓库**：不得读取/编辑仓库外目录（`external_directory`
   已全局 deny），不引用仓库外研究计划路径；外部资料调研只走官方文档/论文。
 
@@ -57,8 +62,16 @@
   `PARAMETERS` 只留尚未执行目标）。
 - 训练/评估首版模块（见 `train.md`）：`training_config.py`（严格 YAML
   加载/校验）、`training_data.py`（npz/dataset_meta/split/Dataset）、
-  `preprocessing.py`、`models/mlp.py`、`training.py`（训练循环/early
-  stopping/ckpt 读写）、`evaluation.py`（独立 test 评估）。
+  `preprocessing.py`、`models/mlp.py`、`models/cnn1d.py`、
+  `models/transformer.py`、`training.py`（训练循环/early stopping/ckpt 读写，
+  三类模型共享 `run` 编排、checkpoint 各自独立；旧 MLP/CNN 格式保留，
+  Transformer 独立 v1）、`evaluation.py`（独立 val/test 评估）。三个训练
+  脚本均要求 `--config`；Transformer 配置为 `configs/training/transformer.yaml`。
+  主结构为 d64/h4/L2/FFN128/dropout0.1/head32，P1T401 时 69,474 参数；
+  固定 index sinusoidal PE、pre-LN + final-LN、mean pooling，外部输入仍为
+  `[B,P,T,3]`。各 run 复用冻结 split、自行 train-only 拟合。val 评估写
+  `val_metrics.json`/`val_predictions.csv`，默认 test 文件名保留；val 有 best
+  选择偏差，test 不用于调参或模型选择。
 - 可复用代码放 `src/micromagnetic_parameter_inversion/`；notebook 仅用于探索
   （notebook 纪律：用项目 `.venv` 内核、不提交大数据/checkpoint 输出、不出现
   机器绝对路径）。
