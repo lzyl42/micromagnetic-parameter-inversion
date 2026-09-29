@@ -1,0 +1,38 @@
+dataset_name: cofeb_protocol_b_a2_sobol1024_v1
+run_name: transformer_d64_h4_l2_logalpha_seed44_dropout0_v1
+data:
+  pulse_order: null
+model:
+  kind: transformer
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 128
+  dropout: 0.0
+  head_hidden_dims:
+  - 32
+label:
+  transform: logalpha
+preprocessing:
+  std_eps: 1.0e-08
+training:
+  seed: 44
+  device: auto
+  batch_size: 32
+  max_epochs: 500
+  learning_rate: 0.001
+  weight_decay: 0.0
+  early_stopping:
+    patience: 50
+    min_delta: 0.0
+split:
+  seed: 42
+  ratios:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+  min_per_split:
+    train: 2
+    val: 1
+    test: 1
+output_dir: null
