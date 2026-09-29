@@ -1,34 +1,14 @@
 # micromagnetic-parameter-inversion
 
 Invert the Gilbert damping coefficient $\alpha$ and the uniaxial anisotropy constant
-$K_u$ from MuMax3 magnetization dynamics. The current implementation is a **single-
-excitation baseline**: a $2\,\mathrm{mT}$ / $50\,\mathrm{ps}$ short pulse along y,
-recording the spatially
-averaged magnetization trajectory $(m_x, m_y, m_z)$ after the field is switched off,
-and regressing $(\alpha, K_u)$ with an MLP, a 1D CNN, or a Temporal Transformer;
-multiple excitations (pulses in different directions to reduce parameter ambiguity)
-are a long-term project goal and are not enabled yet.
+$K_u$ from single-pulse magnetization dynamics with CoFeB parameter settings. This
+stage compares three regression models — MLP, CNN1D, and Temporal Transformer — on
+synthetic single-pulse data, and completes a same-protocol forward re-simulation of
+the inverted parameters.
 
-**Project status**: the pipeline stages -- MuMax3 simulation generation, sample
-preparation, MLP / CNN1D / Temporal Transformer training, and independent val/test
-evaluation -- are implemented (entry points and usage below). Recorded results on the
-fixed synthetic benchmark exist for all three model families under both the `identity`
-and `logalpha` label conditions (5 seeds each, seeds $42$–$46$):
-historical validation-only reports for the single-excitation MLP and 1D CNN baselines
-in [results/mlp.md](results/mlp.md) and [results/cnn.md](results/cnn.md), the Temporal
-Transformer report with validation and test tables in
-[results/transformer.md](results/transformer.md), and the complete three-model
-comparison (val 154 / test 153) in [results/compare.md](results/compare.md).
-Validation takes part in best-checkpoint selection and therefore carries a selection
-bias; test is reported after the freeze and is not used for tuning or model selection.
-These recorded numbers are synthetic-benchmark measurements only: they make no claim
-of device validity, noise robustness, extrapolation, multi-excitation transfer,
-statistical significance, or MuMax3 forward re-validation.
+## Physical model and protocol
 
-## Physical model and fixed protocol
-
-MuMax3 solves the Landau-Lifshitz-Gilbert equation at 0 K (explicit Gilbert form,
-consistent with the MuMax3 kernel convention):
+MuMax3 integrates the Landau–Lifshitz–Gilbert equation at 0 K (explicit Gilbert form):
 
 $$
 \frac{\mathrm{d}\mathbf{m}}{\mathrm{d}t}
@@ -37,347 +17,147 @@ $$
     + \alpha\,\mathbf{m}\times(\mathbf{m}\times\mathbf{B}_\mathrm{eff})\right]
 $$
 
-Here $\alpha$ is the Gilbert damping coefficient to be inverted (the `alpha` field of
-the simulation configuration), $\gamma_\mathrm{LL}$ (`GammaLL`) uses the MuMax3 default
-positive-value convention $1.7595\times10^{11}\,\mathrm{rad/(T\cdot s)}$, and
-$\mathbf{B}_\mathrm{eff}$ is the effective field (in T) with four terms: exchange,
-uniaxial anisotropy, demagnetizing, and external field; 0 K, with no thermal-noise
-term. A single uniform effective medium, synthetic
-CoFeB-inspired baseline; no claim of reproducing any specific material stack; no
-DMI / STT / static bias field, open boundaries (`SetPBC(0, 0, 0)`, `EnableDemag = true`).
+where $\mathbf{B}_\mathrm{eff}$ collects exchange, uniaxial anisotropy, demagnetizing,
+and external-field terms (no thermal-noise term), and $\gamma_\mathrm{LL}$ uses the
+MuMax3 default value $1.7595 \times 10^{11}\,\mathrm{rad/(T \cdot s)}$.
 
-- Geometry: flat triaxial ellipsoid (not a constant-thickness elliptical cylinder),
-  with the three full diameters of `SetGeom(Ellipsoid(dx, dy, dz))` equal to
-  $100\times50\times2\,\mathrm{nm}$ (i.e. the `size_m` bounding-box size), and
-  `cells = [40, 20, 4]`; the easy axis and the initial magnetization are both along $+x$.
-- Fixed material/numerical parameters: $M_s = 1.25\times10^6\,\mathrm{A/m}$,
-  $A_\mathrm{ex} = 15\times10^{-12}\,\mathrm{J/m}$,
-  `EdgeSmooth = 12` (set before `SetGeom`), `solver = 5`, `MaxErr = 1e-5`,
-  `MaxDt = 1e-11 s`, `RelaxTorqueThreshold = -1` (official default).
-- Excitation and sampling: for each $(\alpha, K_u)$ parameter set, first run
-  [equilibrium.mx3.in](simulations/mumax3/equilibrium.mx3.in) once (zero field,
-  `Relax()`, producing the equilibrium state shared by all pulses); then
-  [simulation.mx3.in](simulations/mumax3/simulation.mx3.in) loads that equilibrium
-  state, sets the true $\alpha$, applies a $2\,\mathrm{mT}$ / $50\,\mathrm{ps}$
-  rectangular pulse along y, and
-  switches the field off exactly (`B_ext = 0`), recording the spatially averaged
-  magnetization $(m_x, m_y, m_z)$ every $10\,\mathrm{ps}$ from the switch-off instant,
-  401 points in total ($0\text{--}4\,\mathrm{ns}$ after switch-off).
-- Inversion targets: $\alpha \in [0.004, 0.020]$ (log-space sampling),
-  $K_u \in [2000, 30000]\,\mathrm{J/m^3}$ (linear-space sampling), 1024 Sobol points
-  (`scramble=True, rng=42`); $K_u = 0$ serves only as a physical control and is
-  excluded from the main-domain error.
-- The above are **fixed discretization conventions**: neither mesh convergence nor
-  real-device validity has been verified, and they do not represent convergence
-  conclusions.
+- Geometry: triaxial ellipsoid, full diameters $100 \times 50 \times 2\,\mathrm{nm}$,
+  cells `[40, 20, 4]`, easy axis and initial magnetization along $+x$; open boundaries
+  with demagnetization enabled.
+- Material: $M_s = 1.25 \times 10^6\,\mathrm{A/m}$,
+  $A_\mathrm{ex} = 15 \times 10^{-12}\,\mathrm{J/m}$; `EdgeSmooth = 12`, `solver = 5`,
+  `MaxErr = 1e-5`, `MaxDt = 1e-11 s`.
+- Excitation: one rectangular $2\,\mathrm{mT}$ / $50\,\mathrm{ps}$ pulse along $+y$,
+  after which the field is switched off exactly; the spatially averaged magnetization
+  $(m_x, m_y, m_z)$ is sampled every $10\,\mathrm{ps}$ over $0$–$4\,\mathrm{ns}$
+  (401 points).
+- Targets: $\alpha \in [0.004, 0.020]$ (logarithmic sampling),
+  $K_u \in [2000, 30000]\,\mathrm{J/m^3}$.
 
-The single source of truth for protocol values is
-[scripts/generate_dataset.py](scripts/generate_dataset.py) (`FIXED_CONFIGS` /
-`PARAMETERS`); the YAML validation and $\mathrm{mT}\to\mathrm{T}$ unit-conversion
-boundary are in
-[src/micromagnetic_parameter_inversion/mumax3_config.py](src/micromagnetic_parameter_inversion/mumax3_config.py);
-template rendering (the only renderer for the shared model section and the ellipsoid
-geometry/material parameters) is in
-[src/micromagnetic_parameter_inversion/mumax3_script.py](src/micromagnetic_parameter_inversion/mumax3_script.py);
-simulation orchestration and trajectory export are in
-[src/micromagnetic_parameter_inversion/mumax3_pipeline.py](src/micromagnetic_parameter_inversion/mumax3_pipeline.py)
-and
-[src/micromagnetic_parameter_inversion/mumax3_results.py](src/micromagnetic_parameter_inversion/mumax3_results.py);
-the protocol template and field descriptions are in
-[configs/experiments/mumax3_simulation.yaml](configs/experiments/mumax3_simulation.yaml).
+## Data
 
-## Model architectures and training (highlights)
+1024 parameter combinations: $\alpha \in [0.004, 0.020]$ on a logarithmic scale and
+$K_u \in [2000, 30000]\,\mathrm{J/m^3}$, drawn by fixed-seed Sobol sampling. Each
+sample is the magnetization-response trajectory of the single `pulse_A2` excitation
+above, covering $0$–$4\,\mathrm{ns}$ with 401 samples at $10\,\mathrm{ps}$ spacing,
+shape `[1, 401, 3]` (mx/my/mz). The parameter combinations are split
+train/val/test = 717/154/153, with no combination crossing groups. The data are a
+synthetic MuMax3 benchmark, not real experimental data.
 
-Three model families are implemented. All consume the same prepared dataset and frozen
-split, but keep independent weights, checkpoints, and train-only preprocessing
-statistics (an MLP, CNN1D, or Transformer checkpoint is not interchangeable with
-another kind, and no loader falls back to another kind).
+Run records are kept in `results/public_release/mlp.yaml`, `cnn1d.yaml`, and
+`transformer.yaml`; dataset metadata and the split are in
+`results/public_release/data/dataset_meta.yaml` and `split.yaml`. The 1024 prepared
+sample files and the model checkpoints are kept outside Git (local artifacts /
+release attachments).
 
-### MLP regressor
+## Models
 
-The baseline model is a pure MLP regressor
-([src/micromagnetic_parameter_inversion/models/mlp.py](src/micromagnetic_parameter_inversion/models/mlp.py)):
+### Architectures
 
-- Input contract: one sample is the raw time-domain trajectory `[P, T, 3]` of all
-  pulses for a parameter set (batch `[N, P, T, 3]`, channels mx/my/mz); no per-pulse
-  splitting, hand-crafted statistical features, or downsampling. The current
-  protocol has $P = 1$ (only `pulse_A2`) and $T = 401$, so the flattened dimension is
-  $D = P\cdot T\cdot 3 = 1203$.
-- Network: `Flatten` followed by a hidden-layer sequence (default `64 → 32 → 32`,
-  each layer `Linear + ReLU`), with a final `Linear` layer producing two outputs
-  $(\alpha, K_u)$ in **standardized label space** (z-score space, not physical units).
-  `hidden_dims` is configured in
-  [configs/training/mlp.yaml](configs/training/mlp.yaml) as an engineering candidate,
-  not a validated research parameter.
-- Preprocessing
-  ([src/micromagnetic_parameter_inversion/preprocessing.py](src/micromagnetic_parameter_inversion/preprocessing.py)):
-  input statistics are fit on the train split only and aggregated over the sample and
-  time axes into per-pulse-position, per-magnetization-component mean/std (shape
-  `[P, 1, 3]`, broadcast over the full trajectory; positions with
-  `std <= std_eps` (default `1e-8`) use a divisor of 1). The label transform defaults
-  to `identity`; the optional `logalpha` takes $\log_{10}$ of the $\alpha$ column only
-  (computed in float64, requires $\alpha > 0$; not the natural logarithm), followed by
-  per-output z-scoring.
-- Training
-  ([src/micromagnetic_parameter_inversion/training.py](src/micromagnetic_parameter_inversion/training.py)):
-  Adam (defaults `lr = 1e-3`, `weight_decay = 0`), MSE loss in standardized label
-  space, `batch_size = 32`, `max_epochs = 500`, `seed = 42`; early stopping
-  (`patience = 50`, `min_delta = 0`) uses an independent reference, separated from the
-  absolute best; the absolute-best val-loss weights are written to `best.pt`, and the
-  weights of the last completed epoch to `final.pt`; non-finite loss/grad/pred stops
-  immediately and no bad weights are saved.
-- Evaluation
-  ([src/micromagnetic_parameter_inversion/evaluation.py](src/micromagnetic_parameter_inversion/evaluation.py)):
-  network structure, preprocessing, and label transform are all restored from the
-  checkpoint (not from the current YAML); predictions are inverse-transformed back to
-  physical units before reporting $\alpha$ / $K_u$ MAE/RMSE ($K_u$ in
-  $\mathrm{J/m^3}$); the main domain excludes the $K_u = 0$ control, which is reported
-  separately.
+- Common input: the raw time-domain trajectory `[P, T, 3]` (pulses × time ×
+  magnetization components); for this protocol `P = 1` and `T = 401`, so the
+  flattened dimension is 1203.
+- MLP: flatten, hidden layers `64 → 32 → 32` with ReLU, output layer `2`.
+- CNN1D: pulses and components folded into channels (`[N, P, 3, T]`), `Conv1d`
+  layers `8 → 16` (kernel 5) with ReLU, `AdaptiveAvgPool1d(16)`, head
+  `256 → 16 → 2`.
+- Transformer: time tokens `[N, T, 3P]`, linear projection to `d_model = 64`, fixed
+  sinusoidal positional encoding, 2 pre-LN encoder layers (4 heads, FFN 128,
+  dropout 0), final LayerNorm, mean pooling, head `64 → 32 → 2`.
 
-### CNN1D regressor
+### Test metrics
 
-The 1D CNN model
-([src/micromagnetic_parameter_inversion/models/cnn1d.py](src/micromagnetic_parameter_inversion/models/cnn1d.py))
-shares the same input contract `[N, P, T, 3]` and the same prepared dataset and frozen
-split as the other model families, but keeps its own weights, checkpoints, and
-train-only preprocessing statistics:
+| Model | Architecture | Parameters | test MAPE $\alpha$ | test MAPE $K_u$ |
+|---|---|---:|---:|---:|
+| MLP | 1203→64→32→32→2 (ReLU) | 80258 | 0.46% | 0.92% |
+| CNN1D | 3→8→16 (k5, pool16), head 256→16→2 | 4930 | 0.19% | 0.41% |
+| Transformer | d64/h4/L2/FF128, mean pool, head 64→32→2, dropout 0 | 69474 | 0.20% | 0.40% |
 
-- Data flow: the pulse and magnetization-component axes are folded into the channel
-  axis in a fixed pulse-major / component-minor order, i.e. `[N, P, T, 3]` is permuted
-  to `[N, P, 3, T]` and reshaped to `[N, 3P, T]` (pulses stay separate, time is never
-  concatenated). For the current protocol $3P = 3$.
-- Structure: `Conv1d(stride = 1, dilation = 1, padding = (k-1)//2) + ReLU` layers,
-  followed by `AdaptiveAvgPool1d(pool_bins)` over the time axis, then a `Flatten` head
-  of `Linear + ReLU` layers and a final `Linear` layer producing two outputs
-  $(\alpha, K_u)$ in **standardized label space** (z-score space, not physical units).
-- The architecture is **configurable with no constructor defaults**: `channels`,
-  `kernel_sizes`, `pool_bins`, and `head_hidden_dims` are mandatory schema arguments
-  and are supplied explicitly in the config rather than acquired as model-constructor
-  defaults. Validation requires `channels` and `kernel_sizes` to be non-empty,
-  equal-length positive-integer sequences with all-odd kernels, `pool_bins` to satisfy
-  `1 <= pool_bins <= T`, and `head_hidden_dims` to be a (possibly empty) sequence of
-  positive integers. [configs/training/cnn1d.yaml](configs/training/cnn1d.yaml) is a
-  valid template that uses the baseline architecture reported in
-  [results/cnn.md](results/cnn.md); see the validation rules in
-  [src/micromagnetic_parameter_inversion/training_config.py](src/micromagnetic_parameter_inversion/training_config.py).
-- Training uses the shared orchestration in
-  [src/micromagnetic_parameter_inversion/training.py](src/micromagnetic_parameter_inversion/training.py)
-  (`training.run(config_path, expected_kind = "cnn1d")`); the entry point rejects a
-  config whose `model.kind` does not match before reading data or creating
-  directories. The default output directory is
-  `artifacts/training/cnn1d/<dataset_name>/<run_name>/`, separate from
-  `artifacts/training/mlp/...`.
-- Evaluation
-  ([src/micromagnetic_parameter_inversion/evaluation.py](src/micromagnetic_parameter_inversion/evaluation.py))
-  routes on the checkpoint kind: a CNN checkpoint rebuilds `CNN1DRegressor` from the
-  checkpoint's explicit structure fields, an MLP checkpoint rebuilds `MLPRegressor`
-  from `hidden_dims`, and a Transformer checkpoint rebuilds
-  `TemporalTransformerRegressor` from its explicit structure fields (including the
-  recorded `dropout`); an unknown or corrupt checkpoint raises an error rather than
-  falling back.
+All three models apply log10 to $\alpha$, then standardize both labels by
+training-set statistics; the network output is inverse-transformed back to physical
+units of $\alpha$ and $K_u$. The input is the single-pulse magnetization trajectory
+(401×3), and the preprocessing statistics are fit on the training set only and stored
+with the checkpoints. The included models were selected by the validation-set rule;
+the table gives each representative checkpoint's metrics on the test set (n=153), not
+a 5-seed group mean, and this selection did not use test results. All three test
+MAPEs are below 1%; parameter count does not represent inference speed or efficiency. Complete per-model and cross-model val/test results are in [results/README.md](results/README.md).
 
-### Temporal Transformer regressor
+## Forward validation
 
-The Temporal Transformer model
-([src/micromagnetic_parameter_inversion/models/transformer.py](src/micromagnetic_parameter_inversion/models/transformer.py))
-shares the same input contract `[N, P, T, 3]`, prepared dataset, and frozen split as
-the other two families, but keeps its own weights, checkpoints, and train-only
-preprocessing statistics:
+The inverted parameters are re-relaxed and re-simulated under the original protocol
+and compared with the observed trajectory at every time step. The table lists the
+magnetization vector RMSE (dimensionless, lower is better) at four ground-truth
+points. The in-domain point is the first parameter combination of the frozen test
+list; A varies only $\alpha$, B only $K_u$, and C takes both at 1.1× the respective
+training upper limits. Apart from the inverted parameters, all physical and numerical
+settings follow the original protocol.
 
-- Data flow: the input is permuted to `[N, T, P, 3]` and reshaped into the time-token
-  sequence `[N, T, 3P]` (token semantics: time–pulse–component; pulses and components
-  are folded into the feature axis, time is never concatenated). For the current
-  protocol $P = 1$ and $T = 401$, so the token input is `[N, 401, 3]`.
-- Structure: a linear input projection to $d_\mathrm{model} = 64$, a fixed sinusoidal
-  positional encoding over indices $0..T-1$ (base 10000, registered as a
-  non-persistent buffer), a pre-LayerNorm `nn.TransformerEncoderLayer` stack with
-  `activation = "gelu"` (4 attention heads, 2 layers, FFN width 128, `dropout = 0.0`
-  in the recorded configuration), a final `LayerNorm`, mean pooling over the time
-  axis, and a GELU regression head (`Linear + GELU` of width 32, then a final `Linear`
-  producing two outputs). For `P = 1`, `T = 401`, `d_model = 64`, `nhead = 4`,
-  `num_layers = 2`, `dim_feedforward = 128`, `head_hidden_dims = [32]`, the model has
-  **69474** parameters.
-- The architecture is **configurable with no constructor defaults**: `d_model`,
-  `nhead`, `num_layers`, `dim_feedforward`, `dropout`, and `head_hidden_dims` are
-  mandatory schema fields supplied explicitly in the config. Validation requires
-  `d_model` to be even and divisible by `nhead`, and `0 <= dropout < 1`; the recorded
-  results use `dropout = 0` and the code remains configurable.
-  [configs/training/transformer.yaml](configs/training/transformer.yaml) is the
-  template for this architecture.
-- Training uses the shared orchestration in
-  [src/micromagnetic_parameter_inversion/training.py](src/micromagnetic_parameter_inversion/training.py)
-  (`training.run(config_path, expected_kind = "transformer")`); the entry point
-  rejects a config whose `model.kind` does not match before reading data or creating
-  directories. The default output directory is
-  `artifacts/training/transformer/<dataset_name>/<run_name>/`, separate from the MLP
-  and CNN1D directories. Transformer checkpoints form an independent v1 format with
-  `model_kind = "transformer"`; the existing MLP checkpoint layout/version and CNN
-  checkpoint format are preserved unchanged, and checkpoint loading routes by the
-  recorded kind with no fallback.
+| Point | Ground truth (α, Ku) | MLP | CNN1D | Transformer |
+|---|---|---:|---:|---:|
+| In-domain | 0.013578, 23618.065 | 3.40e-05 | 1.47e-04 | 1.61e-05 |
+| A α upper extrapolation | 0.02200, 16000 | 5.32e-04 | 9.53e-04 | 1.90e-04 |
+| B Ku upper extrapolation | 0.01000, 33000 | 1.18e-02 | 6.07e-04 | 5.80e-03 |
+| C both upper extrapolation | 0.02200, 33000 | 6.58e-03 | 3.34e-03 | 3.69e-03 |
 
-## Installation and prerequisites
+All three models have a lower in-domain vector RMSE than at their extrapolation
+points. The forward runs use simulated synthetic data and the same pulse protocol;
+the three extrapolation points A/B/C are not sufficient to represent the models'
+general extrapolation capability.
 
-- Python 3.13 (`>=3.13,<3.14`), managed by [uv](https://docs.astral.sh/uv/); run
-  `uv sync` in the repository root to create `.venv` and install dependencies.
-  PyTorch comes from the official CUDA 12.8 wheel index (x86_64 Linux / Windows, see
-  `pyproject.toml`).
-- A GPU driver and [MuMax3](https://mumax.github.io/) are external prerequisites; this
-  project does not install or bundle them: add MuMax3 to `PATH` or set `MUMAX3_BIN`.
-- Environment diagnostics:
+Each section below compares the observed and forward-simulated magnetization
+trajectories at the corresponding test point; columns are MLP, CNN1D, and
+Transformer.
 
-  ```bash
-  uv run python scripts/check_environment.py
-  ```
+### In-domain (α=0.013578, Ku=23618.065)
 
-  Reports Python, package versions, CUDA availability and device, MuMax3 status, and
-  data/output paths; it still exits 0 when CUDA or MuMax3 is missing, so read the
-  report content rather than relying on the exit code.
+| MLP | CNN1D | Transformer |
+|---|---|---|
+| ![MLP](results/public_release/figures/in_domain_mlp.png) | ![CNN1D](results/public_release/figures/in_domain_cnn1d.png) | ![Transformer](results/public_release/figures/in_domain_transformer.png) |
 
-## Workflow (four entry points)
+### A: α upper extrapolation (α=0.02200, Ku=16000)
 
-All commands below are run from the repository root; arguments follow each script's
-actual CLI.
+| MLP | CNN1D | Transformer |
+|---|---|---|
+| ![MLP](results/public_release/figures/alpha_upper_mlp.png) | ![CNN1D](results/public_release/figures/alpha_upper_cnn1d.png) | ![Transformer](results/public_release/figures/alpha_upper_transformer.png) |
 
-### 1. Generate raw data
+### B: Ku upper extrapolation (α=0.01000, Ku=33000)
+
+| MLP | CNN1D | Transformer |
+|---|---|---|
+| ![MLP](results/public_release/figures/ku_upper_mlp.png) | ![CNN1D](results/public_release/figures/ku_upper_cnn1d.png) | ![Transformer](results/public_release/figures/ku_upper_transformer.png) |
+
+### C: both upper extrapolation (α=0.02200, Ku=33000)
+
+| MLP | CNN1D | Transformer |
+|---|---|---|
+| ![MLP](results/public_release/figures/both_upper_mlp.png) | ![CNN1D](results/public_release/figures/both_upper_cnn1d.png) | ![Transformer](results/public_release/figures/both_upper_transformer.png) |
+
+## How to run
 
 ```bash
+uv sync
+uv run python scripts/check_environment.py
 uv run python scripts/generate_dataset.py
-```
-
-- No CLI arguments: the fixed protocol fields and 1024 Sobol parameter points are
-  written in the script (`FIXED_CONFIGS` / `PARAMETERS`), and **no external
-  YAML/manifest is read**; `configs/experiments/mumax3_simulation.yaml` is only the
-  protocol template and schema reference, not the generation entry point.
-- Prerequisite: MuMax3 available; the target output directory
-  `data/raw/<dataset_name>/<psid>/` does not exist (an existing one is refused, not
-  overwritten or cleaned).
-- Concurrency is controlled by the script constant `MAX_WORKERS` (`1` = serial); there
-  is no resume/skip; for a single point or a gap-filling rerun, keep only the not-yet-
-  run targets in `PARAMETERS` inside the script.
-- Generated configs are written under `artifacts/generated_configs/<dataset_name>/`.
-  Batch execution occupies the GPU for a long time; assess local GPU resources and
-  expected runtime before running.
-
-### 2. Prepare training samples
-
-```bash
-uv run python scripts/prepare_training_samples.py \
-  --config configs/training/mlp.yaml --parameter-set-ids all
-```
-
-- Prerequisite: replace the `dataset_name` placeholder in
-  `configs/training/mlp.yaml` with the actual dataset; `--config` and
-  `--parameter-set-ids` are both required (the latter is an explicit psid list or
-  `all`, and `all` expands only the selected dataset directory).
-- Output `data/samples/<dataset_name>/`: one `<psid>.npz` per parameter set, plus
-  `dataset_meta.yaml` and `split.yaml`; pre-checks run before writing and existing
-  files are refused; a failure may leave partial products that must be cleaned up
-  manually before rerunning.
-
-### 3. Training (train/val only)
-
-```bash
-uv run python scripts/train_mlp.py         --config configs/training/mlp.yaml
-uv run python scripts/train_cnn1d.py       --config configs/training/cnn1d.yaml
+uv run python scripts/prepare_training_samples.py --config configs/training/mlp.yaml --parameter-set-ids all
+uv run python scripts/train_mlp.py --config configs/training/mlp.yaml
+uv run python scripts/train_cnn1d.py --config configs/training/cnn1d.yaml
 uv run python scripts/train_transformer.py --config configs/training/transformer.yaml
+uv run python scripts/evaluate_model.py --run <RUN_DIR> --split test
+uv run python scripts/validate_forward.py --checkpoint <CKPT> --sample-dir data/raw/<DATASET>/<PSID> --output <NEW_DIR>
 ```
 
-- All three entry points are thin wrappers around the shared `training.run`
-  orchestration and differ only in the required `model.kind` (`mlp` / `cnn1d` /
-  `transformer`); `--config` is mandatory, and a kind mismatch is rejected before
-  reading data or creating directories. They share the same prepared dataset and
-  frozen split but write independent run directories and never reuse each other's
-  weights, checkpoints, or preprocessing statistics.
-- Prerequisites: replace the `dataset_name`/`run_name` placeholders; the output
-  directory must not exist. All three templates are usable once the placeholders are
-  replaced. The CNN template structurally mirrors the MLP config, reports the CNN1D
-  baseline architecture documented in [results/cnn.md](results/cnn.md), and supplies
-  the mandatory CNN schema fields (`kind: cnn1d`, `channels`, `kernel_sizes`,
-  `pool_bins`, `head_hidden_dims`) explicitly in the config rather than as
-  model-constructor defaults; the Transformer template does the same for its fields
-  (`kind: transformer`, `d_model`, `nhead`, `num_layers`, `dim_feedforward`,
-  `dropout`, `head_hidden_dims`) and reports the architecture of the recorded results
-  with `dropout: 0.0` (still configurable). The strict schema in
-  [src/micromagnetic_parameter_inversion/training_config.py](src/micromagnetic_parameter_inversion/training_config.py)
-  rejects missing or cross-kind fields. Replace the `dataset_name`/`run_name`
-  placeholders before use.
-- Standardization/label statistics are fit on the train split only; `test` takes no
-  part in tuning or model selection.
-- The default output directories are `artifacts/training/mlp/<dataset>/<run_name>/`,
-  `artifacts/training/cnn1d/<dataset>/<run_name>/`, and
-  `artifacts/training/transformer/<dataset>/<run_name>/`.
-- **Output/checkpoint distinction**: `best.pt` (absolute-best validation-loss weights)
-  and `final.pt` (last completed epoch) are self-contained model checkpoints; each
-  restores the model weights, structure, input contract, and preprocessing/label state,
-  and is sufficient for inference together with an npz sample. The other files in a run
-  directory -- `metrics.json`, `split.yaml`, and, after evaluation,
-  `<split>_metrics.json` / `<split>_predictions.csv` for `val` or `test` -- are run
-  records and artifacts, not model checkpoints.
-
-### 4. Val/test evaluation
-
-```bash
-uv run python scripts/evaluate_model.py --run <RUN_DIR>
-uv run python scripts/evaluate_model.py --run <RUN_DIR> --split val
-```
-
-- `--checkpoint` is optional (default `<RUN_DIR>/best.pt`); the checkpoint is bound by
-  SHA to the split copy inside the run.
-- `--split val|test` selects the members of the run's bound split copy; the default is
-  `test`. Works for MLP, CNN1D, and Transformer runs: the model kind is routed from the
-  checkpoint itself (never from the current YAML), and an unknown or corrupt
-  checkpoint raises an error rather than falling back.
-- Writes `<split>_metrics.json` (main/control MAE/RMSE/MAPE in physical units) and
-  `<split>_predictions.csv` into the run directory; existing products are refused.
-  `test` writes the default `test_metrics.json` / `test_predictions.csv`; `val` writes
-  `val_metrics.json` / `val_predictions.csv`.
-- Validation metrics carry best-checkpoint selection bias (validation participates in
-  selecting `best.pt`); test is reported after the freeze and must not be used for
-  tuning or model selection.
-
-## Data and outputs
-
-- `data/raw/`: raw MuMax3 output; `data/samples/`: preprocessed samples; `artifacts/`:
-  run products and checkpoints. Raw data, samples, and artifacts are not committed to
-  Git; the public repository contains only code and documentation.
-- Data and output paths can be overridden with environment variables:
-  `MICROMAG_DATA_ROOT`, `MICROMAG_OUTPUT_ROOT` (see
-  [src/micromagnetic_parameter_inversion/paths.py](src/micromagnetic_parameter_inversion/paths.py));
-  the MuMax3 executable uses `MUMAX3_BIN` (see
-  [src/micromagnetic_parameter_inversion/external.py](src/micromagnetic_parameter_inversion/external.py)),
-  and when unset it is looked up in `PATH` under the platform default name.
-- **`.env` is not loaded automatically** (the code does not call `load_dotenv`):
-  inject environment variables explicitly from the shell or runtime environment; do
-  not assume that placing a `.env` file is sufficient. `.env` is excluded by
-  `.gitignore` and never enters the repository.
-- No open-source license has been chosen yet (no LICENSE added).
-
-## Research-integrity conventions
-
-- Data splits are grouped by parameter combination $(\alpha, K_u)$: all excitation
-  trajectories of the same combination must stay in the same split (train/val/test)
-  to prevent cross-group leakage.
-- Standardization and label statistics are fit on the training split only; test is
-  evaluated independently; the training seed comes from `training.seed` in
-  `configs/training/mlp.yaml` / `configs/training/cnn1d.yaml` /
-  `configs/training/transformer.yaml`, the data-generation
-  Sobol seed is fixed in `scripts/generate_dataset.py`; dependencies are pinned in
-  `uv.lock`, and parameter ranges are not invented.
-- Reported model results ([results/mlp.md](results/mlp.md),
-  [results/cnn.md](results/cnn.md), [results/transformer.md](results/transformer.md),
-  [results/compare.md](results/compare.md)) are recorded measurements on the fixed
-  synthetic benchmark: the MLP/CNN1D files are historical val-154-only reports, and
-  [results/compare.md](results/compare.md) carries the complete three-model val-154 +
-  test-153 tables (5 seeds per model and label configuration, seeds $42$–$46$).
-  Validation participates in best-checkpoint selection (selection bias); test is
-  reported after the freeze and was not used for tuning or model selection. The
-  recorded numbers do not establish device validity, noise robustness, extrapolation,
-  multi-excitation transfer, statistical significance, or forward re-validation.
-- Final conclusions require MuMax3 forward re-validation (inverted parameters →
-  forward simulation → comparison with observations), which has not been performed
-  yet.
-- **Not yet verified**: mesh convergence, the Relax convergence threshold and its
-  robustness, systematic justification of the EdgeSmooth choice, batch
-  reproducibility, physical-level OVF QC, real-device validity, forward
-  re-validation, and training effectiveness on formal research data (the recorded
-  runs are synthetic-benchmark runs).
+- Python 3.13 with `uv`; MuMax3 and a GPU driver are external prerequisites
+  (`MUMAX3_BIN`, or the executable on `PATH`). `check_environment.py` reports
+  CUDA/MuMax3 status and still exits 0 when they are missing.
+- `generate_dataset.py` takes no arguments (the protocol and parameter points are
+  embedded in the script) and is a long GPU batch. `prepare_training_samples.py`
+  writes `data/samples/<dataset_name>/`; replace `PLACEHOLDER_DATASET_NAME` and
+  `PLACEHOLDER_RUN_NAME` in `configs/training/*.yaml` before use.
+- `evaluate_model.py` requires the run directory (default checkpoint
+  `<RUN_DIR>/best.pt`) and uses the split copy bound inside the run; the default is
+  `--split test`, and `--split val` selects the validation members.
+- `validate_forward.py` needs one checkpoint and one raw parameter-group directory
+  (`config.yaml`, `index.csv`, trajectories); `--dry-run` writes only
+  `prediction.json` and `forward_config.yaml`, without running MuMax3. `<NEW_DIR>`
+  must not already exist. Data/output roots can be overridden with
+  `MICROMAG_DATA_ROOT` / `MICROMAG_OUTPUT_ROOT`.

@@ -1,0 +1,45 @@
+{
+  "description": "Hash correspondence between the released checkpoints and their training-run checkpoints. Hashes, sizes, and the single differing metadata field only; no tensor data.",
+  "mlp": {
+    "public": {
+      "path": "results/public_release/mlp.pt",
+      "sha256": "c91b2a3bf320f108012491d62ce1b488c586f1abc585b3fdb8d6b2841f99ff4b",
+      "bytes": 329293
+    },
+    "source": {
+      "path": "artifacts/experiments/mlp_multiseed_local_v1/runs/logalpha_seed46/best.pt",
+      "sha256": "907d5466b9dfad4b6239e503a664909a8032fdbf2166c80f6ae412814663be6b",
+      "bytes": 329421
+    },
+    "relation": "semantically equivalent: identical tensors, contract, preprocessing, split/dataset hashes, training metadata, and recorded config except one field",
+    "differing_field": "config.output_dir",
+    "public_value": "checkpoints/mlp",
+    "source_value": "<redacted: absolute local path>"
+  },
+  "cnn1d": {
+    "public": {
+      "path": "results/public_release/cnn1d.pt",
+      "sha256": "a22919f2f278bb820b812e0f17c19a80a91abd350302e31ed4420c671687c6ba",
+      "bytes": 28195
+    },
+    "source": {
+      "path": "artifacts/experiments/cnn1d_multiseed_v1/runs/logalpha_seed42/best.pt",
+      "sha256": "a22919f2f278bb820b812e0f17c19a80a91abd350302e31ed4420c671687c6ba",
+      "bytes": 28195
+    },
+    "relation": "byte-identical to the training-run checkpoint"
+  },
+  "transformer": {
+    "public": {
+      "path": "results/public_release/transformer.pt",
+      "sha256": "5acb76568380be6f8ffb0cc6b774be34420a8600cf96303f0f00d15cf9be4140",
+      "bytes": 293443
+    },
+    "source": {
+      "path": "artifacts/training/transformer/cofeb_protocol_b_a2_sobol1024_v1/transformer_d64_h4_l2_logalpha_seed44_dropout0_v1/best.pt",
+      "sha256": "5acb76568380be6f8ffb0cc6b774be34420a8600cf96303f0f00d15cf9be4140",
+      "bytes": 293443
+    },
+    "relation": "byte-identical to the training-run checkpoint"
+  }
+}
