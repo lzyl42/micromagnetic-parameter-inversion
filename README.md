@@ -17,8 +17,8 @@ $$
     + \alpha\,\mathbf{m}\times(\mathbf{m}\times\mathbf{B}_\mathrm{eff})\right]
 $$
 
-where $\mathbf{B}_\mathrm{eff}$ collects exchange, uniaxial anisotropy, demagnetizing,
-and external-field terms (no thermal-noise term), and $\gamma_\mathrm{LL}$ uses the
+where $\mathbf{B}\_\mathrm{eff}$ collects exchange, uniaxial anisotropy, demagnetizing,
+and external-field terms (no thermal-noise term), and $\gamma\_\mathrm{LL}$ uses the
 MuMax3 default value $1.7595 \times 10^{11}\,\mathrm{rad/(T \cdot s)}$.
 
 - Geometry: triaxial ellipsoid, full diameters $100 \times 50 \times 2\,\mathrm{nm}$,
@@ -29,7 +29,7 @@ MuMax3 default value $1.7595 \times 10^{11}\,\mathrm{rad/(T \cdot s)}$.
   `MaxErr = 1e-5`, `MaxDt = 1e-11 s`.
 - Excitation: one rectangular $2\,\mathrm{mT}$ / $50\,\mathrm{ps}$ pulse along $+y$,
   after which the field is switched off exactly; the spatially averaged magnetization
-  $(m_x, m_y, m_z)$ is sampled every $10\,\mathrm{ps}$ over $0$–$4\,\mathrm{ns}$
+  $(m_x, m_y, m_z)$ is sampled every $10\,\mathrm{ps}$ over $0$ – $4\,\mathrm{ns}$
   (401 points).
 - Targets: $\alpha \in [0.004, 0.020]$ (logarithmic sampling),
   $K_u \in [2000, 30000]\,\mathrm{J/m^3}$.
@@ -39,7 +39,7 @@ MuMax3 default value $1.7595 \times 10^{11}\,\mathrm{rad/(T \cdot s)}$.
 1024 parameter combinations: $\alpha \in [0.004, 0.020]$ on a logarithmic scale and
 $K_u \in [2000, 30000]\,\mathrm{J/m^3}$, drawn by fixed-seed Sobol sampling. Each
 sample is the magnetization-response trajectory of the single `pulse_A2` excitation
-above, covering $0$–$4\,\mathrm{ns}$ with 401 samples at $10\,\mathrm{ps}$ spacing,
+above, covering $0$ – $4\,\mathrm{ns}$ with 401 samples at $10\,\mathrm{ps}$ spacing,
 shape `[1, 401, 3]` (mx/my/mz). The parameter combinations are split
 train/val/test = 717/154/153, with no combination crossing groups. The data are a
 synthetic MuMax3 benchmark, not real experimental data.
